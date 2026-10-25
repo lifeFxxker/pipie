@@ -2718,7 +2718,7 @@ fn glass_px(bg: &[u8], x: f32, y: f32, cx: f32, cy: f32, r: f32, dark: bool, ta:
     (c[0].clamp(0.0, 255.0), c[1].clamp(0.0, 255.0), c[2].clamp(0.0, 255.0))
 }
 
-/// 玻璃盘面的**色层缓存**：`bbox` 内每像素存未预乘 BGRA，A = 抗锯齿覆盖率。
+/// 玻璃盘面的**色层缓存**：只装盘内部（`bbox` 内整像素 BGRA，A=255；其余像素 A=0 表示「不属于这层」）。
 struct GlassDiscLayer {
     /// 生成它时的 `glass_bg` 修订号（换快照就作废）
     rev: u64,
@@ -2765,7 +2765,11 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let x1 = ((CC + ext).min(CANVAS as f32 - 1.0)) as usize;
     let lw = x1 - x0 + 1;
     let lh = y1 - y0 + 1;
+    let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
 
+    // 缓存只装**盘内部**（`cov >= 0.999`，即整像素替换）。盘沿那道抗锯齿带只有
+    // 不到 1px 宽、约 2k 像素（≈0.1ms），却依赖浮点覆盖率 —— 量化成 8 位会把整圈
+    // 盘沿改成 ±1，所以它每帧现算，跟缓存无关。
     let rev = GLASS_BG_REV.load(Ordering::Relaxed);
     let hit = GLASS_DISC_CACHE.with(|c| {
         let b = c.borrow();
@@ -2773,7 +2777,6 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             if l.rev == rev && l.r == r.to_bits() && l.dark == dark && l.px.len() == lw * lh * 4)
     });
     if !hit {
-        let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
         let mut px = vec![0u8; lw * lh * 4];
         for (row, py) in (y0..=y1).enumerate() {
             let fy = py as f32 + 0.5;
@@ -2781,8 +2784,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             for (col, pxi) in (x0..=x1).enumerate() {
                 let fx = pxi as f32 + 0.5;
                 let dx = fx - CC;
-                let cov = cov1((dx * dx + dy * dy).sqrt() - r);
-                if cov <= 0.002 {
+                if cov1((dx * dx + dy * dy).sqrt() - r) < 0.999 {
                     continue;
                 }
                 let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
@@ -2790,7 +2792,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
                 px[o] = cb as u8;
                 px[o + 1] = cg as u8;
                 px[o + 2] = cr as u8;
-                px[o + 3] = (cov * 255.0) as u8;
+                px[o + 3] = 255; // 内部：整像素替换，不是叠加（盘下压着的是纸色，混进来会发灰）
             }
         }
         GLASS_DISC_CACHE.with(|c| {
@@ -2798,7 +2800,6 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
         });
     }
 
-    // 叠到画布上：内部覆盖率=1 → 整像素**替换**（盘下压着的就是纸色，混进来会发灰）
     GLASS_DISC_CACHE.with(|c| {
         let b = c.borrow();
         let l = match b.as_ref() {
@@ -2809,16 +2810,33 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             let base = row * l.w * 4;
             for col in 0..l.w {
                 let i = base + col * 4;
-                let a = l.px[i + 3];
-                if a == 0 {
+                if l.px[i + 3] == 0 {
                     continue;
                 }
                 let o = ((l.y0 + row) * w + l.x0 + col) * 4;
-                let af = a as f32 / 255.0;
-                blend_over(buf, o, l.px[i + 2] as f32, l.px[i + 1] as f32, l.px[i] as f32, af);
+                buf[o..o + 4].copy_from_slice(&l.px[i..i + 4]);
             }
         }
     });
+
+    // 盘沿的亚像素带（`cov` 落在 0.002~0.999 之间，不到 1px 宽 ≈2k 像素）每帧现算：
+    // 覆盖率必须是浮点，量化进缓存会把整圈盘沿改成 ±1。
+    // 这里刻意扫整个 bbox —— 每像素只有一次 `sqrt` + 比较（~0.4ms），
+    // 真正贵的 `glass_px` 只会在那道带上触发。
+    for py in y0..=y1 {
+        let fy = py as f32 + 0.5;
+        let dy = fy - CC;
+        for pxi in x0..=x1 {
+            let fx = pxi as f32 + 0.5;
+            let dx = fx - CC;
+            let cov = cov1((dx * dx + dy * dy).sqrt() - r);
+            if cov <= 0.002 || cov >= 0.999 {
+                continue; // 盘外，或已由缓存整像素替换
+            }
+            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
+            blend_over(buf, (py * w + pxi) * 4, cr, cg, cb, cov);
+        }
+    }
 }
 
 unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
