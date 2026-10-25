@@ -36,6 +36,7 @@ Measured on Windows 11 (build 26200), i3-12100F (4C/8T), 16 GB RAM, release buil
 - **Two rings** — apps on the inner ring, their open windows as capsules on the outer ring, hugging the app instead of scattering around the circle.
 - **Live window previews** — DWM thumbnails, including the last frame of a minimised window. Not screenshots.
 - **Drag to pin** — shortcuts, `.exe` files, folders and files can be dropped on the inner ring; reorder, rename and remove in the same view.
+- **Up to 24 apps** — the inner ring shows 12 at a time; scroll the wheel to keep going, tiles cross-fade at the seam.
 - **One file, no dependencies** — a 745 KB `PiPie.exe`. No .NET, no runtime.
 - **Several ways to summon** — mouse side button by default; middle button, long right-press, or a recorded key combo.
 
@@ -74,6 +75,7 @@ python package.py          # -> dist/pipie-v<version>-win64.zip
 - **Pin** — drag a shortcut, `.exe`, folder or file onto an inner-ring tile.
 - **Adopt a window** — drag a window onto the ring to attach it to its app.
 - **Preview** — hover an app to fan out its windows; hover a capsule for a live thumbnail.
+- **Scroll** — once there are more apps than one screen, the wheel moves the inner ring, one tile per notch.
 - **Settings** — right-click the tray icon → Settings.
 
 ## Configuration

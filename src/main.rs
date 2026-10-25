@@ -136,8 +136,16 @@ const CHIP_FAN_MAX: f32 = 336.0;
 /// 压缝时的最小缝（px）：比 `CHIP_MIN_GAP` 小，但别真贴到一起（圆角会咬）。
 const CHIP_GAP_MIN: f32 = 2.0 * K * KC;
 
-const MAX_APPS: usize = 12;
+/// 一屏槽位数 = 盘面几何上限（`DISC_R_MAX` 封顶后再加就只能把图标压糊）。
+const RING_SLOTS: usize = 12;
+/// 内环**数据**上限。超过一屏（`RING_SLOTS`）的应用不裁掉，靠滚轮连续滚动看到。
+const MAX_APPS: usize = 24;
 const MAX_ITEMS: usize = 12; // 外环可围满一整圈
+/// 滚动每帧向目标追赶的比例（与 `app_hot` 同一档手感：0.28 ≈ 130ms 收敛）。
+const RING_SCROLL_K: f32 = 0.28;
+/// 淡出中的磁贴往盘心**内沉**的距离（画布 px）。
+/// 滚出去的图标是「退回盘里」，不是在原地变透明 —— 光有 alpha 交叉会看成两层重影。
+const SCROLL_SINK: f32 = 6.0;
 
 const WM_APP_SHOW: u32 = WM_APP + 1;
 const WM_APP_HOVER: u32 = WM_APP + 2;
@@ -195,6 +203,14 @@ const WM_APP_APPPOS: u32 = WM_APP + 32;
 /// 仅测试：直接把指定 hwnd 的缩略图弹在左上角，用来确认
 /// 「最小化窗口的 DWM 缩略图到底有没有画面」——不依赖任何 UI 定位。
 const WM_APP_THUMBSIM: u32 = WM_APP + 34;
+/// 滚轮一格（w = ±1）：内环**连续滚动**（超过一屏 `RING_SLOTS` 个应用时才生效）。
+/// 只能从低级钩子来 —— 菜单不抢焦点，`WM_MOUSEWHEEL` 到不了我们的窗口过程。
+const WM_APP_WHEEL: u32 = WM_APP + 35;
+/// 仅测试：把滚动偏移**直接**设成 w（不动画），用于「滚到第 N 页后命中/绘制是否还对」的回归。
+const WM_APP_SCROLLSIM: u32 = WM_APP + 36;
+/// 仅测试：按 (w, l) 走一遍**真实**的 hover 命中路径，返回命中的应用下标 +1（0 = 未命中）。
+/// 配合 `WM_APP_SCROLLSIM` + `WM_APP_APPPOS` 才能回归「滚过之后再点，点的是不是画出来的那个」。
+const WM_APP_HITTEST: u32 = WM_APP + 37;
 
 /// `loading.1` 用这个哨兵值表示「loading 挂在内环**应用本体**上」（图标位置），
 /// 而不是某个外环胶囊 —— 与 `commit_chip == usize::MAX`（内环提交）同一套约定。
@@ -875,10 +891,18 @@ struct State {
     face_n: u32,              // 帧计数（节流：头像 30fps 足够）
     app_anim: [f32; MAX_APPS], // 非悬停压暗渐变
     app_hot: [f32; MAX_APPS], // hover/选中动效渐变（0→1）
-    /// 每个应用**当前显示的极角**（度）。平时就是 `app_angle(i, n)`；
-    /// 拖动重排时平滑转到「预览槽位」的角度 → 图标滑开让位开缝（不是瞬间跳）。
+    /// 每个应用**拖动重排时当前显示的槽位**（连续值，不是角度 —— 角度会绕 360° 回绕，
+    /// 绕回来就没法判断这一格到底该不该淡出）。
+    /// 只在**正在拖动**时被读：平滑滑到「预览槽位」→ 图标让位开缝（不是瞬间跳）。
+    /// 平时的槽位直接由 `slot_of(st, i)` 给出（滚动偏移已经在那里面动画了）。
     /// `NAN` = 还没初始化过（首帧直接落位，不做动画）。
-    app_slot_a: [f32; MAX_APPS],
+    app_slot_s: [f32; MAX_APPS],
+    // ── 内环连续滚动（超过一屏 `RING_SLOTS` 个应用才生效）──
+    /// **当前**滚动偏移，单位 = 槽位（1.0 = 转过一格）。绘制 / 命中 / 外环锚点全走它，
+    /// 而且是唯一的动画源 —— 别再往 `app_slot_s` 上叠第二层跟随，那会变成双重拖影。
+    ring_off: f32,
+    /// 滚轮累加出来的**目标**偏移。`on_timer` 每帧把 `ring_off` 追上来（指数跟随）。
+    ring_to: f32,
     // ── 松手落位动画：只有「被拖的那一个」需要动 ──
     /// 正在落位的应用下标（`usize::MAX` = 无）
     land_app: usize,
@@ -889,7 +913,7 @@ struct State {
     chip_anim: [f32; MAX_ITEMS], // chip 出现渐变
     chip_hot: [f32; MAX_ITEMS], // chip hover 动效渐变（0→1）
     /// 每个外环胶囊**当前显示的角范围**（度）。平时就是 `chip_layout` 给的值；
-    /// 拖动重排时平滑滑到「预览布局」→ 胶囊让位开缝（与内环 `app_slot_a` 同款）。
+    /// 拖动重排时平滑滑到「预览布局」→ 胶囊让位开缝（与内环 `app_slot_s` 同款）。
     /// `NAN` = 未初始化（首帧直接落位）。
     chip_seg_a: [(f32, f32); MAX_ITEMS],
     /// 上面那组角度属于哪个应用 —— 换应用就整组重置（不同应用的条目下标没有可比性）
@@ -997,6 +1021,8 @@ struct State {
     onb_move: bool,
     /// ④ 双击改名引导已播过
     onb_edit: bool,
+    /// ⑤ 「应用多到一屏装不下 → 用滚轮滚」引导已播过（只在超过 `RING_SLOTS` 后才可能播）
+    onb_scroll: bool,
     /// 已经用 UIA 探测过「当前路径/网址」的窗口（`hwnd as isize`）。
     /// ⚠️ 这是**性能必需的**：UIA 探测实测 15~3300ms（冷启动更慢），而
     /// `arm_window_capture` 挂在 `WM_MOUSEMOVE` 上 —— 不缓存的话用户拖着
@@ -1117,7 +1143,9 @@ impl State {
             face_n: 0,
             app_anim: [0.0; MAX_APPS],
             app_hot: [0.0; MAX_APPS],
-            app_slot_a: [f32::NAN; MAX_APPS],
+            app_slot_s: [f32::NAN; MAX_APPS],
+            ring_off: 0.0,
+            ring_to: 0.0,
             land_app: usize::MAX,
             land_t0: 0.0,
             land_from: (0.0, 0.0),
@@ -1191,6 +1219,7 @@ impl State {
             onb_customized: false,
             onb_move: false,
             onb_edit: false,
+            onb_scroll: false,
             wincap_probed: Vec::new(),
             set_last: Instant::now(),
             set_tracking: false,
@@ -2274,13 +2303,23 @@ const GLASS_RIM: f32 = 6.0;
 /// 这是"液态玻璃"和"毛玻璃"的分界线 —— 只有模糊 = 磨砂，有折射才像一块玻璃。
 const GLASS_REFRACT: f32 = 13.0;
 
+/// `st.glass_bg` 每被换掉一次就 +1 —— 玻璃盘面的色层缓存拿它当失效键。
+static GLASS_BG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 写 `st.glass_bg` 的**唯一**入口：换了背景快照就必须让盘缓存作废，
+/// 否则滚动时会一直显示上一帧的玻璃内容。
+fn set_glass_bg(st: &mut State, v: Vec<u8>) {
+    st.glass_bg = v;
+    GLASS_BG_REV.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 抓桌面一块区域（`CANVAS²`，屏幕坐标）→ 模糊 → `st.glass_bg`。
 ///
 /// ⚠️ 调用时机**必须**是「窗口已经 `SW_HIDE`、且 `DwmFlush()` 已等过一帧」——
 /// 否则抓到自己上一次的残影，玻璃里就套着一圈自己的盘。
 /// 失败（GDI 报错 / 抓出来 почти全黑 = 受保护窗口）→ 留空，调用方退回纸面。
 unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
-    st.glass_bg.clear();
+    set_glass_bg(st, Vec::new());
     if !st.glass {
         return;
     }
@@ -2313,7 +2352,7 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
         return;
     }
     let t0 = std::time::Instant::now();
-    st.glass_bg = build_glass(&raw);
+    set_glass_bg(st, build_glass(&raw));
     // 只在需要时看：抓屏 + 模糊一共多久（菜单是"按下就出"，这段延迟用户能感觉到）
     if std::env::var_os("RL_GLASSDBG").is_some() {
         eprintln!("[glass] snap {}x{} at ({},{}) blur+blit = {:?}", CANVAS, CANVAS, x, y, t0.elapsed());
@@ -2374,6 +2413,7 @@ static GLASS_LIVE_X: AtomicI32 = AtomicI32::new(0);
 static GLASS_LIVE_Y: AtomicI32 = AtomicI32::new(0);
 /// UI 线程取走了多少帧（只给 `RL_GLASSDBG` 的日志用）
 static GLASS_LIVE_TAKEN: AtomicU32 = AtomicU32::new(0);
+
 /// 最新一帧（UI 线程 `take` 走，直接换进 `glass_bg`，不拷贝）
 static GLASS_LIVE_SLOT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 /// 菜单关着时把线程**挂起**（不是 12ms 轮询）：空闲时 0 唤醒、0 CPU，
@@ -2678,8 +2718,40 @@ fn glass_px(bg: &[u8], x: f32, y: f32, cx: f32, cy: f32, r: f32, dark: bool, ta:
     (c[0].clamp(0.0, 255.0), c[1].clamp(0.0, 255.0), c[2].clamp(0.0, 255.0))
 }
 
+/// 玻璃盘面的**色层缓存**：`bbox` 内每像素存未预乘 BGRA，A = 抗锯齿覆盖率。
+struct GlassDiscLayer {
+    /// 生成它时的 `glass_bg` 修订号（换快照就作废）
+    rev: u64,
+    /// 生成它时的盘面半径（`f32::to_bits`）—— 开合动画里每帧都变，自然每帧重建
+    r: u32,
+    dark: bool,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    px: Vec<u8>,
+}
+
+thread_local! {
+    /// 只有 UI 线程画图 → 单槽就够（菜单同时只有一个盘面）
+    static GLASS_DISC_CACHE: std::cell::RefCell<Option<GlassDiscLayer>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 收起菜单 / 关掉玻璃选项时释放那块 bbox
+fn glass_disc_drop() {
+    GLASS_DISC_CACHE.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
 /// 把盘面换成玻璃。**必须在 `flat_circle` 之后、任何图标之前调用** ——
 /// 那时盘内只有盘面（和一点描边），覆盖掉正好；再往后图标就画在玻璃上了。
+///
+/// ⚠️ 这一层是**滚动能不能跟手**的关键：`glass_px` 每像素要做两次跨 3.6MB 的
+/// 随机采样，整个盘 ≈17 万像素 ≈7ms —— 而它的输出只跟 (快照, 半径, 深浅色) 有关，
+/// **滚轮偏移动的是图标，盘面一个像素都不变**。所以这里把它缓存成一层，
+/// 命中时只做一次顺序 blit（~0.3ms）。
 unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let need = (CANVAS * CANVAS * 4) as usize * 2;
     if st.glass_bg.len() < need {
@@ -2691,30 +2763,62 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let y1 = ((CC + ext).min(CANVAS as f32 - 1.0)) as usize;
     let x0 = (CC - ext).max(0.0) as usize;
     let x1 = ((CC + ext).min(CANVAS as f32 - 1.0)) as usize;
-    for py in y0..=y1 {
-        let fy = py as f32 + 0.5;
-        let dy = fy - CC;
-        for px in x0..=x1 {
-            let fx = px as f32 + 0.5;
-            let dx = fx - CC;
-            let cov = cov1((dx * dx + dy * dy).sqrt() - r);
-            if cov <= 0.002 {
-                continue;
-            }
-            let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
-            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
-            let o = (py * w + px) * 4;
-            if cov >= 0.999 {
-                // 内部直接**替换**（不是叠加）：盘下压着的就是纸色，混进来会发灰
-                buf[o] = cb as u8;
-                buf[o + 1] = cg as u8;
-                buf[o + 2] = cr as u8;
-                buf[o + 3] = 255;
-            } else {
-                blend_over(buf, o, cr, cg, cb, cov);
+    let lw = x1 - x0 + 1;
+    let lh = y1 - y0 + 1;
+
+    let rev = GLASS_BG_REV.load(Ordering::Relaxed);
+    let hit = GLASS_DISC_CACHE.with(|c| {
+        let b = c.borrow();
+        matches!(b.as_ref(), Some(l)
+            if l.rev == rev && l.r == r.to_bits() && l.dark == dark && l.px.len() == lw * lh * 4)
+    });
+    if !hit {
+        let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
+        let mut px = vec![0u8; lw * lh * 4];
+        for (row, py) in (y0..=y1).enumerate() {
+            let fy = py as f32 + 0.5;
+            let dy = fy - CC;
+            for (col, pxi) in (x0..=x1).enumerate() {
+                let fx = pxi as f32 + 0.5;
+                let dx = fx - CC;
+                let cov = cov1((dx * dx + dy * dy).sqrt() - r);
+                if cov <= 0.002 {
+                    continue;
+                }
+                let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
+                let o = (row * lw + col) * 4;
+                px[o] = cb as u8;
+                px[o + 1] = cg as u8;
+                px[o + 2] = cr as u8;
+                px[o + 3] = (cov * 255.0) as u8;
             }
         }
+        GLASS_DISC_CACHE.with(|c| {
+            *c.borrow_mut() = Some(GlassDiscLayer { rev, r: r.to_bits(), dark, x0, y0, w: lw, h: lh, px });
+        });
     }
+
+    // 叠到画布上：内部覆盖率=1 → 整像素**替换**（盘下压着的就是纸色，混进来会发灰）
+    GLASS_DISC_CACHE.with(|c| {
+        let b = c.borrow();
+        let l = match b.as_ref() {
+            Some(l) => l,
+            None => return,
+        };
+        for row in 0..l.h {
+            let base = row * l.w * 4;
+            for col in 0..l.w {
+                let i = base + col * 4;
+                let a = l.px[i + 3];
+                if a == 0 {
+                    continue;
+                }
+                let o = ((l.y0 + row) * w + l.x0 + col) * 4;
+                let af = a as f32 / 255.0;
+                blend_over(buf, o, l.px[i + 2] as f32, l.px[i + 1] as f32, l.px[i] as f32, af);
+            }
+        }
+    });
 }
 
 unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
@@ -2867,20 +2971,31 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
         // 正在被拖出的那个：跟着光标走，并且随拖出距离淡出
         let dragging = st.drag_app == Some(i);
         let fade = if dragging { st.drag_fade } else { 0.0 };
-        let am = (1.0 - 0.38 * dim) * ap * (1.0 - fade);
+        // **显示槽位**（连续值）→ 极角、可见度、内沉全部由它派生，绘制与命中共用同一套。
+        // 拖动重排时走平滑值（图标是滑开的，不是瞬间跳到新槽位）；被拖的那个跟光标走，
+        // 永远不参与淡出 —— 它必须一直画在光标底下。
+        let s_disp = if dragging || !st.app_slot_s[i].is_finite() {
+            slot_of(st, i)
+        } else {
+            st.app_slot_s[i]
+        };
+        let appear = if dragging { 1.0 } else { slot_appear(s_disp, n) };
+        if appear <= 0.01 {
+            // 完全滚出可见窗口 → 一格都不画（顺带省掉这一格的逐像素循环）。
+            // ⚠️ 下标升序 = 槽位升序，所以「淡出的那一格」一定先画、「淡入的那一格」后画，
+            //    交叉处新图标压在上面 —— 不用额外排序。
+            continue;
+        }
+        // 淡出同时内沉 + 缩小（见 `SCROLL_SINK`）
+        let sink = SCROLL_SINK * (1.0 - appear);
+        let am = (1.0 - 0.38 * dim) * ap * (1.0 - fade) * appear;
         // ⚠️ 只要**正在被拖**就跟光标走（不再要求 `fade > 0.01`）：
         //    改了 `want_fade` 之后盘内拖动时 fade 恒为 0，若还挂着这个条件，
         //    图标会赖在自己槽位上不动（「拖不动」）。淡出只影响 `am` 透明度。
         let (cx, cy) = if dragging {
             (st.drag_x, st.drag_y)
         } else {
-            // 极角走**平滑值**：让位时图标是滑开的，不是瞬间跳到新槽位
-            let ang = if st.app_slot_a[i].is_finite() {
-                st.app_slot_a[i]
-            } else {
-                app_angle(i, n)
-            };
-            let (tx, ty) = polar(r_icon * pop, ang);
+            let (tx, ty) = polar(r_icon * pop - sink, slot_angle(s_disp, n));
             // 松手落位：**只有被拖的这个**从光标处滑进槽位。
             // 其余图标在拖动期间已经按预览排序滑到位了，这里绝不能再动一次
             // —— 用户 2026-10-14 报的「松手后别的图标也重新移动一下」。
@@ -2892,7 +3007,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 (tx, ty)
             }
         };
-        let scale = (0.30 + 0.70 * ap) * (1.0 + 0.10 * hot_k);
+        let scale = (0.30 + 0.70 * ap) * (1.0 + 0.10 * hot_k) * (1.0 - sink / icon_draw * 0.55);
 
         // 每格一块**统一的圆角方形底板** —— 「整齐」的来源就在这里：
         // 无论图标自带什么轮廓（圆形标 / 白纸 / 全出血方块），最后都收敛成同一个圆角方块。
@@ -3056,34 +3171,61 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // ── 3a. 幽灵磁贴：拖入内容"认不出宿主 / 宿主不在内环"→ 在空位上浮一个**半透明磁贴**。
     //     丢到它上面才真正新建内环。⚠️ 不参与 `ring_layout(n)`，只是叠上去，已有磁贴不动。──
     if let Some(g) = &st.drop_ghost {
-        let (gx, gy) = ghost_pos(st);
-        let half = icon_draw * 0.5;
-        let rad = icon_draw * TILE_RAD_K;
-        // 半透明底 + **墨色描边**：原来描边太浅（34% 灰 × 55% α），真机上几乎看不见，
-        // 用户根本找不到落点 → 拖进来"没反应"。描边必须够实。
-        flat_round_rect(
-            buf, gx, gy, half, half, rad,
-            mixc(pal.paper, pal.ink, 0.06),
-            1.8 * K,
-            pal.ink,
-            0.85,
-            0.0, 0.0, 0.0,
-            0.62,
-        );
-        // 优先画**真图标**（一眼就知道要加的是哪个应用）；实在没有才退回首字母 ——
-        // 只画首字母（Edge → "M"）用户根本看不懂「这是啥」。
-        if let Some(tex) = &g.icon {
-            let icon_side = icon_draw * 0.86;
-            draw_bgra_icon(buf, gx, gy, icon_side, tex, 0.72);
-        } else if let Some(ch) = g.name.chars().next() {
-            let cht = ch.to_uppercase().to_string();
-            let acc = mixc(pal.paper, pal.ink, 0.62);
-            draw_text(st, buf, gx as i32, gy as i32, &cht, 20, 700,
-                acc.0, acc.1, acc.2, (255.0 * 0.62) as u8, 0, 0);
+        // 满环时幽灵站在**多出来的那一格**（`apps.len()`）→ 不滚出来就看不见。
+        // 可见度与真实磁贴走同一份 `slot_appear`，`on_timer` 会在拖动时自动滚到它那一页。
+        let ga = slot_appear(slot_of(st, n_ap), n);
+        if ga > 0.01 {
+            let (gx, gy) = ghost_pos(st);
+            let half = icon_draw * 0.5;
+            let rad = icon_draw * TILE_RAD_K;
+            // 半透明底 + **墨色描边**：原来描边太浅（34% 灰 × 55% α），真机上几乎看不见，
+            // 用户根本找不到落点 → 拖进来"没反应"。描边必须够实。
+            flat_round_rect(
+                buf, gx, gy, half, half, rad,
+                mixc(pal.paper, pal.ink, 0.06),
+                1.8 * K,
+                pal.ink,
+                0.85,
+                0.0, 0.0, 0.0,
+                0.62 * ga,
+            );
+            // 优先画**真图标**（一眼就知道要加的是哪个应用）；实在没有才退回首字母 ——
+            // 只画首字母（Edge → "M"）用户根本看不懂「这是啥」。
+            if let Some(tex) = &g.icon {
+                let icon_side = icon_draw * 0.86;
+                draw_bgra_icon(buf, gx, gy, icon_side, tex, 0.72 * ga);
+            } else if let Some(ch) = g.name.chars().next() {
+                let cht = ch.to_uppercase().to_string();
+                let acc = mixc(pal.paper, pal.ink, 0.62);
+                draw_text(st, buf, gx as i32, gy as i32, &cht, 20, 700,
+                    acc.0, acc.1, acc.2, (255.0 * 0.62 * ga) as u8, 0, 0);
+            }
         }
     }
 
     // （教学虚线槽位已移除：它常驻且与图标重叠；落点指引改由拖动时的 `drop_ghost` 承担。）
+
+    // ── 3a-刻度：超过一屏才出现的一条**底部细弧**（6 点方向 = 盘上最空的那一带）──
+    //    轨道 = 整环可滚的范围，滑块 = 当前这一页占的份数，位置 = 当前偏移。
+    //    不写数字、不放箭头：这一条只负责表达「还有别的页」，其余交给气泡说明。
+    {
+        let mx = ring_off_max(n);
+        if mx > 0.0 {
+            let r = disc_r - 11.0;
+            let half = 34.0; // 轨道半跨（度），以正下方 180° 为中心
+            // 滑块长度 ∝ 一页 / 总数（至少留一点，24 个应用时也不至于看不见）
+            let th = (half * 2.0 * (ring_vis(n) as f32 / n as f32)).max(10.0);
+            let t = (st.ring_off / mx).clamp(0.0, 1.0);
+            // 屏幕上的「左端」是 214°（7 点），「右端」是 146°（5 点）→
+            // 第 1 页靠左、最后一页靠右，读法和横向滚动条一致。
+            let c = lerp(180.0 + half - th * 0.5, 180.0 - half + th * 0.5, t);
+            let w = 1.5 * K;
+            flat_arc(buf, r, 180.0 - half, 180.0 + half, w,
+                mixc(pal.paper, pal.ink, 0.16), 0.9);
+            flat_arc(buf, r, c - th * 0.5, c + th * 0.5, w,
+                mixc(pal.paper, pal.ink, 0.52), 1.0);
+        }
+    }
 
     // ── 3b. 取消按钮（拖出去松手后出现，边框走 5 秒倒计时）──
     // 画法抄自 my-pet `objects/dialogs/dynamic_island.py::_paint_event_countdown`：
@@ -3924,7 +4066,6 @@ fn eff_apps(st: &State) -> usize {
 
 /// 画布坐标 → 最近的应用磁贴（拖放落点识别）
 fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
-    let n_ap = st.apps.len();
     let n = eff_apps(st);
     if n == 0 {
         return None;
@@ -3936,13 +4077,11 @@ fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     if (dx * dx + dy * dy).sqrt() > r_icon + hit_half + slack + 4.0 {
         return None;
     }
-    let per = 360.0 / n as f32;
     let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
-    let i = ((deg / per).round() as usize).rem_euclid(n);
-    if i >= n_ap {
-        return None; // 幽灵槽不是"应用"，不参与 hover
-    }
-    let (ix, iy) = polar(r_icon, app_angle(i, n));
+    let i = app_at_deg(st, deg, n)?;
+    // 中心距也要按**显示槽位**算（滚动 / 淡出内沉后图标并不在自己的下标角度上）
+    let (ix, iy) = polar(r_icon - SCROLL_SINK * (1.0 - slot_appear(slot_of(st, i), n)),
+        slot_angle(slot_of(st, i), n));
     let d = ((px - ix) * (px - ix) + (py - iy) * (py - iy)).sqrt();
     if d <= hit_half + slack {
         Some(i)
@@ -3969,9 +4108,8 @@ fn drop_slot_app(st: &State, px: f32, py: f32) -> Option<usize> {
     if (r - r_icon).abs() > icon_sz * 0.5 + 18.0 {
         return None;
     }
-    let per = 360.0 / n as f32;
     let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
-    Some(((deg / per).round() as usize).rem_euclid(n))
+    slot_at_deg(st, deg, n)
 }
 
 /// 拖拽落点（外环）＝按**角度吸附**到最近的外环段（允许落在段间的缝里）。
@@ -4347,7 +4485,8 @@ fn ghost_pos(st: &State) -> (f32, f32) {
     let n_ap = st.apps.len();
     let n = n_ap + 1; // 画幽灵时必然按 n+1 排
     let (r_icon, _sz) = ring_layout(n);
-    polar(r_icon, app_angle(n_ap, n))
+    let s = slot_of(st, n_ap);
+    polar(r_icon - SCROLL_SINK * (1.0 - slot_appear(s, n)), slot_angle(s, n))
 }
 
 
@@ -4387,6 +4526,8 @@ fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> usize 
 /// 返回新增条数。入库即回写 ini 并全量热重载。
 fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) -> usize {
     let mut added = 0usize;
+    // 内环**数据**上限撞到了（一屏装不下的部分靠滚轮看，但总数不能再加）
+    let mut full = false;
     for it in items {
         drag_log(&format!(
             "item [{}] target={} force={:?}",
@@ -4440,6 +4581,7 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
                 }
                 if st.apps.len() >= MAX_APPS {
                     drag_log("  skip FULL apps");
+                    full = true;
                     continue;
                 }
                 if ini_insert_app(&st.ini_path, &it.name, &it.target) {
@@ -4456,6 +4598,10 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
         // 落点命中某个已有应用（进它的外环）→ ②「拖外环条目」也算学过
         // （不管是不是 force 的：命中即说明用户已经会往环里丢了）。
         onb_done_drag(st);
+    }
+    if full {
+        // 撞上限必须说一声 —— 以前只是 `drag_log`，用户的观感是「拖进去没反应」
+        say(st, "内环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_APPS), 6.0);
     }
     added
 }
@@ -4522,6 +4668,11 @@ fn onb_say(st: &mut State) {
     } else if st.onb_move && !st.onb_edit {
         say(st, "双击可改名", "Enter 保存 · Esc 取消", ONB_SECS);
         st.onb_edit = true;
+        unsafe { save_settings(st) };
+    } else if st.apps.len() > RING_SLOTS && !st.onb_scroll {
+        // 只有**真的超过一屏**才提这条（否则提了也没东西可滚）
+        say(st, "超过一屏了", "滚轮可以连续滚", ONB_SECS);
+        st.onb_scroll = true;
         unsafe { save_settings(st) };
     }
 }
@@ -6555,14 +6706,15 @@ unsafe fn thumb_tick(st: &mut State) {
         let py = st.win_y as f32 + cyp + dy / len * (half_diag * 0.55 + gap) - THUMB_H as f32 * 0.5;
         (ai * 1000 + ci, hw, (px, py))
     } else if let Some((ai, hw)) = want_app {
-        let n = st.apps.len();
+        // 与绘制同源：有幽灵时整环按 `n+1` 排，预览也必须跟着幽灵那一格走
+        let n = eff_apps(st);
         let (r_icon, _icon_sz) = ring_layout(n);
-        let ang = if st.app_slot_a[ai].is_finite() {
-            st.app_slot_a[ai]
+        let s = if st.app_slot_s[ai].is_finite() {
+            st.app_slot_s[ai]
         } else {
-            app_angle(ai, n)
+            slot_of(st, ai)
         };
-        let (cxp, cyp) = polar(r_icon, ang);
+        let (cxp, cyp) = polar(r_icon, slot_angle(s, n));
         let dx = cxp - CC;
         let dy = cyp - CC;
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
@@ -6757,6 +6909,27 @@ unsafe fn dump_all(dir: &str) {
     eprintln!("[cp5] disc drawn");
     save_bmp(&format!("{}\\dump_disc.bmp", dir), &buf, CANVAS, CANVAS);
 
+    // 1b) 滚动：应用超过一屏（`RING_SLOTS`）时再多出三张 ——
+    //     第 1 页 / 中间整页 / 交叉淡化最坏情况（偏移 = 1/4 格，两端同时半透明）/ 最后一页。
+    //     用于离线核对「让位的那格有没有压到中心头像」「底部刻度走位对不对」。
+    if st.apps.len() > RING_SLOTS {
+        let mx = ring_off_max(st.apps.len());
+        for (tag, off) in [
+            ("p1", 0.0f32),
+            ("mid", (mx * 0.5).round().max(0.5)),
+            ("xfade", mx * 0.5 + 0.25),
+            ("last", mx),
+        ] {
+            st.ring_off = off;
+            st.ring_to = off;
+            st.app_slot_s = [f32::NAN; MAX_APPS];
+            let buf = draw_to_buf(&mut st);
+            save_bmp(&format!("{}\\dump_scroll_{}.bmp", dir, tag), &buf, CANVAS, CANVAS);
+        }
+        st.ring_off = 0.0;
+        st.ring_to = 0.0;
+    }
+
     // 2) 悬停态（第一个有内容的应用展开 chips + 选中环 + 压暗其他）
     if let Some(hi) = st
         .apps
@@ -6827,10 +7000,10 @@ unsafe fn dump_all(dir: &str) {
             st.drag_fade = 1.0;
             st.drag_x = CC + 96.0;
             st.drag_y = CC - 66.0;
-            // ⚠️ 离线 dump 不走 `on_timer`，让位动画不会自己跑 —— 手动把极角
+            // ⚠️ 离线 dump 不走 `on_timer`，让位动画不会自己跑 —— 手动把**槽位**
             //    落到「预览排序」的终态，否则图标还停在原位、缝没开。
             for i in 0..nap {
-                st.app_slot_a[i] = app_angle(drag_preview_slot(0, 2, i), nap);
+                st.app_slot_s[i] = drag_preview_slot(0, 2, i) as f32 - st.ring_off;
             }
             let buf = draw_to_buf(&mut st);
             save_bmp(&format!("{}\\dump_drag_caret.bmp", dir), &buf, CANVAS, CANVAS);
@@ -6839,7 +7012,7 @@ unsafe fn dump_all(dir: &str) {
             st.drag_fade = 0.0;
             st.drag_x = 0.0;
             st.drag_y = 0.0;
-            st.app_slot_a = [f32::NAN; MAX_APPS];
+            st.app_slot_s = [f32::NAN; MAX_APPS];
         }
 
         // 2h) 外环插入光标：拖着 0 号胶囊、插到 2 号位的缝里
@@ -7023,7 +7196,7 @@ unsafe fn dump_all(dir: &str) {
             if st.apps[i].items.is_empty() {
                 continue;
             }
-            let d = (app_angle(i, ns) - 90.0).abs();
+            let d = (slot_angle(slot_of(&st, i), ns) - 90.0).abs();
             if d < bd {
                 bd = d;
                 best = Some(i);
@@ -7055,7 +7228,7 @@ unsafe fn dump_all(dir: &str) {
             let mut buf = Vec::with_capacity(raw.len() * 2);
             buf.extend_from_slice(&raw);
             buf.extend_from_slice(&blur_glass(&raw));
-            st.glass_bg = buf;
+            set_glass_bg(&mut st, buf);
         }
         st.glass = true;
         // 挑一个**真的有外环条目**的应用显示外环（玻璃段也要一起看）
@@ -7091,7 +7264,7 @@ unsafe fn dump_all(dir: &str) {
             let mut buf = Vec::with_capacity(raw2.len() * 2);
             buf.extend_from_slice(&raw2);
             buf.extend_from_slice(&blur_glass(&raw2));
-            st.glass_bg = buf;
+            set_glass_bg(&mut st, buf);
         }
         st.glass_liquid = false;
         st.glass = true;
@@ -7106,7 +7279,7 @@ unsafe fn dump_all(dir: &str) {
         println!("[dump] dump_glass_gray 液态玻璃（浅灰桌面，查分层）");
 
         st.glass = false;
-        st.glass_bg = Vec::new();
+        set_glass_bg(&mut st, Vec::new());
         st.glass_liquid = false;
         synth_bg(&mut st, false);
     }
@@ -7602,6 +7775,8 @@ unsafe fn read_persistent(st: &mut State) {
                 st.onb_move = v != "0";
             } else if let Some(v) = get("onb_edit=") {
                 st.onb_edit = v != "0";
+            } else if let Some(v) = get("onb_scroll=") {
+                st.onb_scroll = v != "0";
             } else if let Some(v) = get("guide_seen=") {
                 st.guide_seen = v != "0";
             } else if let Some(v) = get("update_auto=") {
@@ -8607,9 +8782,140 @@ unsafe fn init_fonts(st: &mut State) {
 
 // ───────────────────── 径向布局 ─────────────────────
 
-/// 应用方位角（0 = 正上方，顺时针）
-fn app_angle(i: usize, n: usize) -> f32 {
-    i as f32 * (360.0 / n as f32)
+/// 一屏几个槽：≤`RING_SLOTS` 个应用时就是应用数本身（均分一整圈，和老行为一模一样）；
+/// 超过则恒为 `RING_SLOTS` —— 多出来的应用靠滚轮连续滚动看到（`State::ring_off`）。
+/// **所有几何函数都先过这一道**，所以 `ring_layout(n)`/`disc_r(n)` 对 n>12 不再继续缩图标。
+#[inline]
+fn ring_vis(n: usize) -> usize {
+    n.min(RING_SLOTS).max(1)
+}
+
+/// 一格槽位的角跨（度）
+#[inline]
+fn ring_step(n: usize) -> f32 {
+    360.0 / ring_vis(n) as f32
+}
+
+/// 滚动偏移的取值上限。按**布局格数**算（`eff_apps`）—— 幽灵也占一格，
+/// 所以「满环 + 拖进来一个新应用」正好能滚出一格把幽灵磁贴露出来。
+#[inline]
+fn ring_off_max(n: usize) -> f32 {
+    n.saturating_sub(RING_SLOTS) as f32
+}
+
+/// 槽位下标 `i`（含幽灵槽 `apps.len()`）的**连续槽位** = 下标 − 滚动偏移。
+/// 小数是常态：滚动动画里偏移本身就是小数。
+#[inline]
+fn slot_of(st: &State, i: usize) -> f32 {
+    i as f32 - st.ring_off
+}
+
+/// 连续槽位 → 方位角（0 = 正上方，顺时针；与 `polar` 同一约定）。
+///
+/// ⚠️ **不做 360° 取模**：槽位 `vis` 和槽位 `0` 是同一个物理位置，但只有落在
+/// 可见窗口里的那一个该画出来 —— 而 `slot_appear` 正是靠**未取模**的槽位判断这一点。
+#[inline]
+fn slot_angle(s: f32, n: usize) -> f32 {
+    s * ring_step(n)
+}
+
+/// 连续槽位 → 缝隙处的可见度（1 = 完全可见，0 = 已滚出去 / 还没滚进来）。
+///
+/// 可见窗口 = `[-0.5, vis-0.5)`，**两端落在同一个楔形里**（第 `vis` 格与第 1 格之间，
+/// 约 11:30 位置）：出去的那个淡出、进来的那个淡入，在这一带交叉。
+/// 淡出带宽 = 0.5 槽 = 「缝隙中心 → 最近一格」的距离，于是**静止时（偏移为整数）
+/// 每一格的 alpha 恒为 1** —— 画面和没这功能时完全一致，只有滚动过程中才有淡出。
+fn slot_appear(s: f32, n: usize) -> f32 {
+    let v = ring_vis(n) as f32;
+    let k = clamp01((s + 0.5) * 2.0).min(clamp01((v - 0.5 - s) * 2.0));
+    // smoothstep：线性 alpha 在快速滚动时会看出「一闪一闪」
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// 极角（度，0=上、顺时针）→ 这一格**当前显示**的槽位下标（`0..n`，`n` = `eff_apps`，含幽灵槽）。
+///
+/// ⚠️ 命中判定**只许**走这里（`update_hover` / `nearest_app` / `drop_slot_app` 共用），
+/// 而且它和绘制共用同一份 `slot_of` + `slot_appear` —— 否则滚动偏移一变就「画在这、点到那」。
+/// 可见度 <0.5 的格子直接跳过：不允许点着一块几乎看不见的图标。
+fn slot_at_deg(st: &State, deg: f32, n: usize) -> Option<usize> {
+    let per = ring_step(n);
+    let mut best: Option<usize> = None;
+    let mut bd = f32::MAX;
+    for i in 0..n {
+        let s = slot_of(st, i);
+        if slot_appear(s, n) < 0.5 {
+            continue;
+        }
+        let mut d = slot_angle(s, n) - deg;
+        d = (d + 180.0).rem_euclid(360.0) - 180.0;
+        if d.abs() < bd {
+            bd = d.abs();
+            best = Some(i);
+        }
+    }
+    // 只认「离最近一格不超过半格」的（楔形尽头那两个都在淡出，已由上面的 0.5 门卡掉）
+    if bd <= per * 0.5 + 2.0 {
+        best
+    } else {
+        None
+    }
+}
+
+/// 极角 → 应用下标（`0..apps.len()`）。幽灵槽不是「应用」，不参与 hover。
+fn app_at_deg(st: &State, deg: f32, n: usize) -> Option<usize> {
+    slot_at_deg(st, deg, n).filter(|&i| i < st.apps.len())
+}
+
+/// 选中项滚出可见窗口 → 撤掉选中（外环跟着收）。
+/// `active_app` 是**故意粘性**的，但粘的是「哪个应用」，不是「它那一格还看得见」——
+/// 让它锚在一块已经淡出的图标上，外环就会在盘面上凭空浮出来。
+fn scroll_prune(st: &mut State) {
+    if let Some(ai) = st.active_app {
+        let n = eff_apps(st);
+        if ai >= n || slot_appear(slot_of(st, ai), n) < 0.5 {
+            st.active_app = None;
+            st.hover_chip = None;
+        }
+    }
+}
+
+/// 把滚动**目标**收到「槽位 `i` 落在可见窗口里」所需的最小幅度 ——
+/// 只做必要的滚动，不居中。用在两处：拖进来的幽灵磁贴、键盘 `nav_app` 换选中。
+/// ⚠️ 每帧都复查（`on_timer` 里调）：应用数和幽灵随时会变，算一次不够。
+fn ring_reveal(st: &mut State, i: usize) {
+    let n = eff_apps(st);
+    let mx = ring_off_max(n);
+    if mx <= 0.0 {
+        st.ring_to = 0.0;
+        return;
+    }
+    // 可见窗口 = [off, off+vis) → `i` 可见 ⇔ off ∈ [i-(vis-1), i]
+    let v = ring_vis(n) as f32;
+    let f = i as f32;
+    let lo = (f - v + 1.0).max(0.0);
+    let hi = f.min(mx);
+    st.ring_to = st.ring_to.clamp(lo, hi);
+}
+
+/// 滚轮转 `d` 格（`d > 0` = 往后一页的方向）：只改**目标**偏移，动画归 `on_timer`。
+/// 返回 `false` = 没得滚（没超过一屏，或已经到头）。
+fn ring_scroll(st: &mut State, d: f32) -> bool {
+    let mx = ring_off_max(eff_apps(st));
+    if mx <= 0.0 {
+        return false;
+    }
+    let to = (st.ring_to + d).clamp(0.0, mx);
+    if (to - st.ring_to).abs() < 1e-3 {
+        return false; // 顶到边界了
+    }
+    st.ring_to = to;
+    // 滚轮也是「输入」：光标压在轮盘中心不动时，`note_input` 不会刷新心跳，
+    // 一直滚就会在 12s 后被闲置自动收起打断（用户 2026-10-25 报的卡顿感之一）。
+    st.last_input = now_s();
+    st.hit_app = None;
+    st.hover_now = None;
+    scroll_prune(st);
+    true
 }
 
 /// 方位角（0=上，顺时针）→ 画布坐标
@@ -8634,7 +8940,7 @@ fn est_text_w(text: &str, cjk_w: f32, lat_w: f32) -> f32 {
 /// 旧实现的目标只是「刚好不相撞」（`icon·1.25 + 6`），所以 12 个应用时
 /// 间隙只有 0.28×图标，视觉上就是「贴在一起」。
 fn ring_layout(n: usize) -> (f32, f32) {
-    let hs = (std::f32::consts::PI / n.max(1) as f32).sin();
+    let hs = (std::f32::consts::PI / ring_vis(n) as f32).sin();
     let mut icon = ICON_DRAW;
     let mut r = icon * (TANG + GAP_K) / (2.0 * hs);
     let r_cap = DISC_R_MAX - icon * 0.5 - BAND_PAD;
@@ -8721,8 +9027,7 @@ fn sdf_sector(px: f32, py: f32, cx: f32, cy: f32,
     -sdf_rounded_rect(r - r_mid, d * r_mid, hu, hv, cr)
 }
 
-/// 沿一条弧画虚线 —— 项目没有虚线原语，用 `rot_rrect` 沿**切向**摆一排小圆角条。
-/// `a1/a2` 是**角度**（与 `polar` 同约定：0 = 正上、顺时针）。
+/// 沿一条弧画虚线 —— 项目没有虚线原语，用 `rot_rrect` 沿**切向**摆一排小圆角条。/// `a1/a2` 是**角度**（与 `polar` 同约定：0 = 正上、顺时针）。
 /// ⚠️ 切向单位向量 = (cos a, sin a) → `rot = a` 的弧度；
 ///    插入光标那个是**径向**（`a − π/2`），别混（2026-10-14 栽过一次）。
 unsafe fn dashed_arc(buf: &mut [u8], r: f32, a1: f32, a2: f32, n: usize,
@@ -8739,6 +9044,54 @@ unsafe fn dashed_arc(buf: &mut [u8], r: f32, a1: f32, a2: f32, n: usize,
     }
 }
 
+/// 一段**连续**的细圆弧（描边，不是扇形填充）。`a1/a2` = 角度，约定同 `polar`（0=上、顺时针）。
+///
+/// 直接复用梯形环那套 SDF（`sdf_sector`）：把径向半厚收到一两像素、圆角取满，
+/// 两端自然成圆头 —— 不用为刻度另写一份几何。
+unsafe fn flat_arc(buf: &mut [u8], r: f32, a1: f32, a2: f32, hw: f32,
+                   col: (u8, u8, u8), alpha: f32) {
+    if a2 <= a1 || alpha <= 0.002 {
+        return;
+    }
+    let mid_rad = ((a1 + a2) * 0.5).to_radians();
+    // 切向半长用**中间半径的弧长**刻度（与 `sdf_sector` 的约定一致）
+    let hv = ((a2 - a1) * 0.5).to_radians() * r;
+    // 包围盒：沿弧采样，内外两个半径各取一次（稳，不依赖解析极值）
+    let mut minx = f32::MAX;
+    let mut maxx = f32::MIN;
+    let mut miny = f32::MAX;
+    let mut maxy = f32::MIN;
+    let steps = ((a2 - a1) / 3.0).ceil().max(2.0) as usize;
+    for k in 0..=steps {
+        let a = a1 + (a2 - a1) * k as f32 / steps as f32;
+        for rr in [r - hw, r + hw] {
+            let (x, y) = polar(rr, a);
+            minx = minx.min(x);
+            maxx = maxx.max(x);
+            miny = miny.min(y);
+            maxy = maxy.max(y);
+        }
+    }
+    let pad = hw + 3.0;
+    let x0 = (minx - pad).floor().max(0.0) as i32;
+    let y0 = (miny - pad).floor().max(0.0) as i32;
+    let x1 = (maxx + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
+    let y1 = (maxy + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
+    let w = CANVAS as usize;
+    for y in y0..=y1 {
+        let fy = y as f32 + 0.5;
+        for x in x0..=x1 {
+            let fx = x as f32 + 0.5;
+            // 极坐标原点**只能是画布中心**（同梯形环那条铁律）
+            let c = cov1(sdf_sector(fx, fy, CC, CC, r, hw, hv, hw, mid_rad)) * alpha;
+            if c > 0.002 {
+                let o = (y as usize * w + x as usize) * 4;
+                blend_over(buf, o, col.0 as f32, col.1 as f32, col.2 as f32, c);
+            }
+        }
+    }
+}
+
 
 /// 玻璃参数：关着、或快照还没抓好 → `None`（走纸面）。
 fn glass_arg<'a>(st: &'a State, disc: f32) -> Option<(&'a [u8], bool, f32)> {
@@ -8750,7 +9103,6 @@ fn glass_arg<'a>(st: &'a State, disc: f32) -> Option<(&'a [u8], bool, f32)> {
 }
 
 /// 画一段梯形环（含硬投影、填充、描边）。
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
                     seg: (f32, f32, f32), hot: f32, alpha: f32, mode: u8,
@@ -9324,23 +9676,23 @@ fn drag_end(st: &mut State, x: i32, y: i32) {
             let entry = st.apps.remove(ai);
             let name = entry.name.clone();
             st.apps.insert(t, entry);
-            // ⚠️⚠️ `app_slot_a` 是**按数组下标**存的「当前显示极角」，必须跟着
+            // ⚠️⚠️ `app_slot_s` 是**按数组下标**存的「当前显示极角」，必须跟着
             //     `remove + insert` **同样重排一次**。忘了重排 → 下标与角度错位，
             //    松手后每个槽位都要从「别人的角度」滑到「自己的角度」= 图标集体多动一下
             //    （用户 2026-10-14 报：松手前它们明明已经就位了）。
-            let sa = st.app_slot_a[ai];
+            let sa = st.app_slot_s[ai];
             if ai < t {
                 for k in ai..t {
-                    st.app_slot_a[k] = st.app_slot_a[k + 1];
+                    st.app_slot_s[k] = st.app_slot_s[k + 1];
                 }
             } else {
                 let mut k = ai;
                 while k > t {
-                    st.app_slot_a[k] = st.app_slot_a[k - 1];
+                    st.app_slot_s[k] = st.app_slot_s[k - 1];
                     k -= 1;
                 }
             }
-            st.app_slot_a[t] = sa;
+            st.app_slot_s[t] = sa;
             // 松手后**只有被拖的那个需要动**：从光标处滑进槽位。
             // 其余图标在拖动期间已经滑到位（预览排序），这里必须原地不动。
             st.land_app = t;
@@ -9395,7 +9747,7 @@ fn drag_end(st: &mut State, x: i32, y: i32) {
             // ⚠️⚠️ `chip_seg_a` 是**按条目下标**存的「当前段角」，必须跟着
             //     `remove + insert` **同样重排一次** —— 忘了就会下标/角度错位，
             //     松手后每一段都要从「别人的角度」滑到「自己的角度」= 胶囊集体多动一下
-            //     （内环 `app_slot_a` 同款坑，用户 2026-10-14 报过）。
+            //     （内环 `app_slot_s` 同款坑，用户 2026-10-14 报过）。
             if j < MAX_ITEMS && t < MAX_ITEMS {
                 let ca = st.chip_seg_a[j];
                 if j < t {
@@ -9505,7 +9857,7 @@ fn chip_segs_of(st: &State, ai: usize, names: &[String]) -> Vec<(f32, f32)> {
 
     let (r_in, r_out) = ring_radii(n);
     let r = (r_in + r_out) * 0.5;
-    let a0 = app_angle(ai, n);
+    let a0 = slot_angle(slot_of(st, ai), n);
     let deg_per_px = 180.0 / (std::f32::consts::PI * r);
     let gap_deg = CHIP_MIN_GAP * deg_per_px;
     let wdeg: Vec<f32> = halfs.iter().map(|h| 2.0 * h * deg_per_px).collect();
@@ -10124,8 +10476,14 @@ unsafe extern "system" fn mouse_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LR
                 // 不在 `wParam` 里 —— 低级钩子的 wParam 只带消息 ID（实测恒为 0x20A，
                 // 高 16 位永远是 0）。第一版照窗口消息的写法取 `w.0 >> 16`，
                 // 于是 `d` 恒为 0、滚多少都没反应（用户 2026-10-17 报「滚轮后没反应」）。
-                // 没有第二屏了：滚轮不做事，但**仍然吞掉** —— 否则菜单开着时滚轮
-                // 会把下面的窗口/网页一起滚走。
+                //
+                // 钩子线程只做「取增量 + PostMessage」，绝不在这里碰 State（铁律）。
+                // 一格 = 120 = 转一个图标；细粒度滚轮（触摸板）自然给出小数 → 连续滚。
+                let d = ((*(l.0 as *const MsLlHook)).mouse_data >> 16) as u16 as i16;
+                if d != 0 {
+                    // 传**原始增量**（有符号），换算/夹取全在 UI 线程
+                    post(WM_APP_WHEEL, (d as u16) as usize, 0);
+                }
                 return LRESULT(1);
             }
         }
@@ -10643,7 +11001,11 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     let py = sy - st.win_y;
     let dx = px as f32 - CC;
     let dy = py as f32 - CC;
-    let n = st.apps.len();
+    let n_ap = st.apps.len();
+    // 命中/绘制都必须按**含幽灵的格数**算：有幽灵时整环按 `n+1` 排布、
+    // 每格角度也随之变化（`update_hover` 以前用 `apps.len()` 排布，幽灵一出现
+    // 图标就「画在这、点到那」）。
+    let n = eff_apps(st);
 
     // 内环：距离最近的图标中心 < SEL+2 → 锁定为当前应用
     // 锁定后移向盘面任意位置（含外环 chips）都不会丢失当前应用
@@ -10656,13 +11018,18 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
         let mut hit: Option<usize> = None;
         if rr <= r_icon + hit_half + 4.0 * K {
             let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
-            let per = 360.0 / n as f32;
-            let i = ((deg / per).round() as usize).rem_euclid(n);
-            let (ix, iy) = polar(r_icon, app_angle(i, n));
-            let ddx = px as f32 - ix;
-            let ddy = py as f32 - iy;
-            if (ddx * ddx + ddy * ddy).sqrt() <= hit_half {
-                hit = Some(i);
+            // 只认真正显示出来的那一格（`app_at_deg` 与绘制共用同一份槽位换算）
+            if let Some(i) = app_at_deg(st, deg, n) {
+                let s = slot_of(st, i);
+                let (ix, iy) = polar(
+                    r_icon - SCROLL_SINK * (1.0 - slot_appear(s, n)),
+                    slot_angle(s, n),
+                );
+                let ddx = px as f32 - ix;
+                let ddy = py as f32 - iy;
+                if (ddx * ddx + ddy * ddy).sqrt() <= hit_half {
+                    hit = Some(i);
+                }
             }
         }
         st.hit_app = hit;
@@ -10681,7 +11048,7 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     // （胶囊 → 梯形环）就会「画在这、点到那」。命中判定**只能有一份实现**。
     st.hover_chip = None;
     if let Some(ai) = st.active_app {
-        if ai < n {
+        if ai < n_ap {
             st.hover_chip = hit_chip_at(st, ai, px as f32, py as f32);
         }
     }
@@ -10775,6 +11142,8 @@ fn nav_app(st: &mut State, dir: i32) {
         st.active_app = Some(next);
         st.hover_chip = None;
         st.switch0 = now_s();
+        // 键盘翻页翻到了**另一页**的应用 → 顺手把那半页滚出来，否则选中看不见
+        ring_reveal(st, next);
     }
 }
 
@@ -10873,6 +11242,34 @@ unsafe fn on_timer(st: &mut State) {
     }
 
     let mut moving = false;
+    // ── 内环连续滚动：每帧把 `ring_off` 追向 `ring_to`（指数跟随，≈130ms 收敛）──
+    // ⚠️ 这是滚动**唯一的动画源**：绘制 / 命中 / 外环锚点全都现读 `ring_off`，
+    //    所以偏移一到位画面就静止 —— 别再给磁贴叠第二层「跟随」，那会变成双重拖影。
+    {
+        let d = st.ring_to - st.ring_off;
+        if d.abs() > 0.002 {
+            st.ring_off += d * RING_SCROLL_K;
+            // 滚动中：高亮必须跟着撤 —— 光标一动不动地停在旧位置上，
+            // 但那一格下面的图标已经换成另一个应用了（`hover_now` 是每帧重算的粘态）。
+            st.hit_app = None;
+            st.hover_now = None;
+            scroll_prune(st);
+            moving = true;
+        } else if st.ring_off != st.ring_to {
+            st.ring_off = st.ring_to;
+            moving = true;
+            // 刚停稳：按**当前光标**重判一次命中。不重判的话，用户滚完什么都不动，
+            // 高亮 / 外环还赖在上一轮的那一格上（粘性状态当位置 —— 这坑栽过四次）。
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            update_hover(st, p.x, p.y);
+        }
+    }
+    // 拖进来的幽灵磁贴站在**多出来的那一格**（满环时它在下一页）→ 自动滚过去露出它，
+    // 否则用户拖进来什么都看不见，只会以为「拖了没反应」。
+    if st.drop_ghost.is_some() {
+        ring_reveal(st, st.apps.len());
+    }
     // ── 窗口捕获：轮询「是否有窗口正被拖动」（hwndMoveSize），松手落盘 ──
     if poll_window_capture(st) {
         moving = true; // 捕获中保持持续重绘（预览 + 头像忙碌）
@@ -11023,32 +11420,31 @@ unsafe fn on_timer(st: &mut State) {
             st.app_hot[i] = target;
         }
     }
-    // ── 拖动重排：图标让位开缝（极角平滑滑到「预览槽位」）──
+    // ── 拖动重排：图标让位开缝（**槽位**平滑滑到「预览槽位」）──
     // 主流重排序是**图标滑开让出空位**，插入线落在空位里；原来的实现在原地闪一下，
     // 光标只能画在某个已有图标上 —— 用户 2026-10-14 明确否掉。
     {
         let n = eff_apps(st);
         if n > 0 {
             for i in 0..st.apps.len().min(MAX_APPS) {
+                // 目标 = **槽位**（不是极角）：槽位不会绕 360° 回绕，直接线性追赶就行，
+                // 而且淡出判定也认槽位（见 `slot_appear`）。
                 let tgt = match (st.drag_app, st.drag_over_app) {
                     (Some(ai), Some(ins)) if st.drop_ghost.is_none() => {
-                        app_angle(drag_preview_slot(ai, ins, i), n)
+                        drag_preview_slot(ai, ins, i) as f32 - st.ring_off
                     }
-                    _ => app_angle(i, n),
+                    _ => slot_of(st, i),
                 };
-                let cur = st.app_slot_a[i];
+                let cur = st.app_slot_s[i];
                 if !cur.is_finite() {
-                    st.app_slot_a[i] = tgt; // 首帧直接落位
+                    st.app_slot_s[i] = tgt; // 首帧直接落位
                 } else {
-                    // ⚠️ 走**最短弧**：从 350° 到 10° 要 +20°，不是 -340°。
-                    //    `+540 % 360 - 180` 把差值折到 (-180, 180]。
-                    let mut d = (tgt - cur + 540.0) % 360.0 - 180.0;
-                    if d.abs() > 0.05 {
-                        d *= 0.30;
-                        st.app_slot_a[i] = (cur + d).rem_euclid(360.0);
+                    let d = tgt - cur;
+                    if d.abs() > 0.01 {
+                        st.app_slot_s[i] = cur + d * 0.30;
                         moving = true;
                     } else {
-                        st.app_slot_a[i] = tgt;
+                        st.app_slot_s[i] = tgt;
                     }
                 }
             }
@@ -11172,12 +11568,18 @@ unsafe fn on_timer(st: &mut State) {
 
     // 实时玻璃：后台线程抓到的新帧换进来（Vec 直接 move，没有拷贝）。
     // 抓失败时槽里是空的 → 留着上一帧，不会闪回旧桌面。
-    if st.glass && st.glass_live {
+    //
+    // ⚠️ **滚动中故意不换**：换了 `glass_bg` 就等于换了玻璃的内容，
+    //    盘面色层缓存（见 `glass_disc`）必须重采一遍 —— 那是 7ms，正好落在
+    //    每一格滚轮动画上，用户看到的就是「一卡一卡」。背景在滚动这 ~200ms 里
+    //    冻结一下没人看得出来（动的本来就是图标），停下来立刻恢复实时。
+    let scrolling = (st.ring_off - st.ring_to).abs() > 0.002;
+    if st.glass && st.glass_live && !scrolling {
         if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
             if let Some(buf) = s.take() {
                 // ⚠️ 不要在这里 `moving = true`：OLE 拖放期间是故意停连续重绘的
                 // （线程要随时应答 DragOver，见上面的说明）。下一帧自然用新图。
-                st.glass_bg = buf;
+                set_glass_bg(st, buf);
                 GLASS_LIVE_TAKEN.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -11280,8 +11682,13 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     st.hover_chip = None;
     st.app_anim = [0.0; MAX_APPS];
     st.app_hot = [0.0; MAX_APPS];
-    // 极角重新落位（NAN = 首帧直接赋值，不做「从旧角度转过来」的动画）
-    st.app_slot_a = [f32::NAN; MAX_APPS];
+    // 槽位重新落位（NAN = 首帧直接赋值，不做「从旧槽位滑过来」的动画）
+    st.app_slot_s = [f32::NAN; MAX_APPS];
+    // ⚠️ 每次呼出都从第 1 页开始 —— 滚动偏移是**位置**，不是粘性状态。
+    //    留着上次的偏移，用户每次弹出都看到「随机那一页」，而且首帧的图标
+    //    位置与命中判定会错开一格（`update_hover` 用的是偏移后的槽位）。
+    st.ring_off = 0.0;
+    st.ring_to = 0.0;
     // 换次呼出 → UIA 探测结果作废（用户可能换了窗口/换了目录）
     st.wincap_probed.clear();
     st.land_app = usize::MAX;
@@ -11327,7 +11734,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
         let _ = windows::Win32::Graphics::Dwm::DwmFlush();
         snap_glass(st, st.win_x, st.win_y);
     } else if !st.glass_bg.is_empty() {
-        st.glass_bg = Vec::new();
+        set_glass_bg(st, Vec::new());
     }
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, st.win_x, st.win_y, CANVAS, CANVAS, SWP_NOACTIVATE);
     frame(st, 255);
@@ -11378,8 +11785,10 @@ unsafe fn close_menu_now(st: &mut State) {
     // 玻璃快照只服务于"这次呼出"，收起就还回去（900KB）。下次呼出重新抓 —— 3.5ms。
     // 常驻模式下菜单一直开着，自然一直留着。
     if !st.glass_bg.is_empty() {
-        st.glass_bg = Vec::new();
+        set_glass_bg(st, Vec::new());
     }
+    // 盘面色层缓存（bbox 大小）同理还回去 —— 菜单不在屏幕上时不该占着
+    glass_disc_drop();
     // 收起后开始计时：闲置 `TRIM_AFTER` 秒就把工作集还回去。
     st.trim_at = now_s() + TRIM_AFTER;
     // 菜单关了 → 若没有键盘组合自定义触发，立即摘掉键盘钩子（打字路径上不留钩子）
@@ -11420,6 +11829,11 @@ unsafe fn close_menu_now(st: &mut State) {
     st.drag_over_chip = None;
     st.drag_fade = 0.0;
     st.land_app = usize::MAX;
+    // ⚠️ 滚动偏移也随菜单归零（粘性状态复位铁律）：`show_menu` 里同样会清一次，
+    //    但常驻模式（`locked`）不重走 `show_menu`，漏在这里就会带着上一页的偏移继续用。
+    st.ring_off = 0.0;
+    st.ring_to = 0.0;
+    st.app_slot_s = [f32::NAN; MAX_APPS];
     // 窗口捕获随菜单一起清：没落盘的拖动作废（用户松手在环外 = 放弃）
     st.window_capture = None;
     // 拖放等待态随菜单一起清：残留的 DROP_MODE_ARMED 会让下次呼出后**所有左键都只关菜单、
@@ -12154,16 +12568,50 @@ WM_APP_DISMISS_FG => {
             unsafe { thumb_apply(hw, (160, 160)) };
             LRESULT(0)
         }
+        WM_APP_WHEEL => {
+            // 滚轮一格：内环**连续滚动**（只在一屏装不下时才生效）。
+            // `w` = 原始增量（钩子把 `mouseData` 高 16 位当 u16 传过来，这里还原成 i16）。
+            let st = state_of(hwnd);
+            let d = (w.0 as u16) as i16;
+            // 一格 = `WHEEL_DELTA`(120) = 正好转一个图标；触摸板的小增量自然变成连续滚。
+            ring_scroll(st, -(d as f32 / 120.0));
+            LRESULT(0)
+        }
+        WM_APP_SCROLLSIM => {
+            // 仅测试：把偏移**直接**设成 `w / 100`（不动画），
+            // 用来回归「滚到第 N 页之后命中和绘制还对不对」。
+            let st = state_of(hwnd);
+            let mx = ring_off_max(eff_apps(st));
+            let to = ((w.0 as f32) / 100.0).clamp(0.0, mx);
+            st.ring_off = to;
+            st.ring_to = to;
+            st.hit_app = None;
+            st.hover_now = None;
+            scroll_prune(st);
+            LRESULT(0)
+        }
+        WM_APP_HITTEST => {
+            // 仅测试：走**真实**命中路径（含滚动偏移、淡出内沉），回报 `hit_app + 1`。
+            let st = state_of(hwnd);
+            update_hover(st, w.0 as i32, l.0 as i32);
+            LRESULT(st.hit_app.map(|i| i as isize + 1).unwrap_or(0))
+        }
         WM_APP_APPPOS => {
             let st = state_of(hwnd);
             let i = w.0;
-            let n = st.apps.len();
+            let n = eff_apps(st);
             if n == 0 || i >= n {
                 return LRESULT(0);
             }
+            // 回报**显示位置**（含滚动偏移与淡出内沉），并且淡到看不见的格子返回 0 ——
+            // 测试据此判断「这一格不在当前页上」，别去点一个隐形的图标。
+            let s = slot_of(st, i);
+            let a = slot_appear(s, n);
+            if a < 0.5 {
+                return LRESULT(0);
+            }
             let (r, _icon) = ring_layout(n);
-            let a = app_angle(i, n);
-            let (dx, dy) = polar(r, a);
+            let (dx, dy) = polar(r - SCROLL_SINK * (1.0 - a), slot_angle(s, n));
             let sx = (st.win_x + dx as i32).clamp(0, 65535);
             let sy = (st.win_y + dy as i32).clamp(0, 65535);
             return LRESULT(((sy as isize) << 16) | (sx as isize));
@@ -14115,8 +14563,9 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
                 st.glass = want;
                 if !want {
                     // 关掉就把 900KB 的快照还回去
-                    st.glass_bg = Vec::new();
+                    set_glass_bg(st, Vec::new());
                     st.glass_bg.shrink_to_fit();
+                    glass_disc_drop();
                 }
                 save_settings(st);
             }
@@ -14204,6 +14653,7 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             st.onb_drag = false;
             st.onb_move = false;
             st.onb_edit = false;
+            st.onb_scroll = false;
             unsafe { save_settings(st) };
         }
         Ctl::UpdateCheck => match st.update_st {
@@ -14666,6 +15116,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("onb_drag={}\r\n", b(st.onb_drag)));
     out.push_str(&format!("onb_move={}\r\n", b(st.onb_move)));
     out.push_str(&format!("onb_edit={}\r\n", b(st.onb_edit)));
+    out.push_str(&format!("onb_scroll={}\r\n", b(st.onb_scroll)));
     out.push_str(&format!("trig_custom_kind={}\r\n", st.trig_custom_kind));
     out.push_str(&format!("trig_custom_btn={}\r\n", st.trig_custom_btn));
     out.push_str(&format!("trig_custom_vk={}\r\n", st.trig_custom_vk));
@@ -16173,6 +16624,7 @@ fn main() {
         init_fonts(&mut st);
 
         // 托盘宿主窗口（不可见普通窗口：托盘菜单需要前台窗口）
+        let suffix = std::env::var("RL_INSTANCE").unwrap_or_default();
         let cls: Vec<u16> = wide("RLHost");
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(host_proc),
@@ -16183,7 +16635,11 @@ fn main() {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(cls.as_ptr()),
-            PCWSTR::null(),
+            // 标题带上测试实例后缀：自动化脚本要靠它区分「自己那份」，
+            // 只按类名找会命中用户正在跑的实例（类名对所有实例都一样）。
+            PCWSTR(
+                wide(&format!("PiPieHost{}", suffix)).as_ptr(),
+            ),
             WINDOW_STYLE(0),
             0,
             0,
@@ -16209,7 +16665,7 @@ fn main() {
                 WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0,
             ),
             PCWSTR(rcls.as_ptr()),
-            PCWSTR::null(),
+            PCWSTR(wide(&format!("PiPieRing{}", suffix)).as_ptr()),
             WS_POPUP,
             0,
             0,
