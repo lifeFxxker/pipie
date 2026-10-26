@@ -211,6 +211,9 @@ const WM_APP_SCROLLSIM: u32 = WM_APP + 36;
 /// 仅测试：按 (w, l) 走一遍**真实**的 hover 命中路径，返回命中的应用下标 +1（0 = 未命中）。
 /// 配合 `WM_APP_SCROLLSIM` + `WM_APP_APPPOS` 才能回归「滚过之后再点，点的是不是画出来的那个」。
 const WM_APP_HITTEST: u32 = WM_APP + 37;
+/// 后台 UIA 探测（文件夹路径 / 网址）跑完了 → UI 线程把结果回填进刚落盘的窗口条目。
+/// 只在**松手落盘那一次**起探测，所以这条消息一次拖动最多来一回。
+const WM_APP_WINPROBE: u32 = WM_APP + 38;
 
 /// `loading.1` 用这个哨兵值表示「loading 挂在内环**应用本体**上」（图标位置），
 /// 而不是某个外环胶囊 —— 与 `commit_chip == usize::MAX`（内环提交）同一套约定。
@@ -1023,13 +1026,13 @@ struct State {
     onb_edit: bool,
     /// ⑤ 「应用多到一屏装不下 → 用滚轮滚」引导已播过（只在超过 `RING_SLOTS` 后才可能播）
     onb_scroll: bool,
-    /// 已经用 UIA 探测过「当前路径/网址」的窗口（`hwnd as isize`）。
-    /// ⚠️ 这是**性能必需的**：UIA 探测实测 15~3300ms（冷启动更慢），而
-    /// `arm_window_capture` 挂在 `WM_MOUSEMOVE` 上 —— 不缓存的话用户拖着
-    /// 标题栏每挪一下鼠标就卡一次。同窗口只探一次，换窗口才重探。
-    /// （hwnd → 上次探测到的 relaunch）。**必须连值一起存**，光记 hwnd 没用
-    /// （见 `arm_window_capture` 里的注释：命中缓存时要拿的是"上次探到的路径"）。
-    wincap_probed: Vec<(isize, String)>,
+    /// 最近 UIA **探测失败**的窗口（hwnd → 失败时刻 tick）。
+    /// 负缓存是必需的：UIA 探测实测 15~3300ms（冷启动更慢），探不到（受保护窗口 /
+    /// 公司机器把无障碍关了）时若不记住这次失败，就会每次都重撞整棵元素树。
+    /// 以前这里存的是「探到的值」，但判命中写的是 `!v.is_empty()` —— 失败存空串
+    /// 等于永远不命中，实测每次 arm 都重跑 40~90ms，全白跑。
+    /// 现在探测只在**落盘那一次**发起（`wincap_probe_start`），只留失败记录。
+    wincap_failed: Vec<(isize, u32)>,
     /// 上一帧时刻（求 dt，帧率无关）
     set_last: Instant,
     /// 是否已注册 WM_MOUSELEAVE 通知
@@ -1220,7 +1223,7 @@ impl State {
             onb_move: false,
             onb_edit: false,
             onb_scroll: false,
-            wincap_probed: Vec::new(),
+            wincap_failed: Vec::new(),
             set_last: Instant::now(),
             set_tracking: false,
             set_expanded: usize::MAX,
@@ -2302,6 +2305,10 @@ const GLASS_RIM: f32 = 6.0;
 /// 边缘折射的最大外拉距离（px）：靠近盘沿时采样点往外偏这么多。
 /// 这是"液态玻璃"和"毛玻璃"的分界线 —— 只有模糊 = 磨砂，有折射才像一块玻璃。
 const GLASS_REFRACT: f32 = 13.0;
+/// 「自擦」模式（WDA 设不上）下盘面的清晰度权重。
+/// 那种模式下盘里的"原图"层是拿外圈均色填出来的假背景，留 30% 只会把分箱的
+/// 扇形条纹看得清清楚楚 → 几乎全用模糊层，读成磨砂玻璃。
+const GLASS_SHARP_MASK: f32 = 0.97;
 
 /// `st.glass_bg` 每被换掉一次就 +1 —— 玻璃盘面的色层缓存拿它当失效键。
 static GLASS_BG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2311,6 +2318,172 @@ static GLASS_BG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 fn set_glass_bg(st: &mut State, v: Vec<u8>) {
     st.glass_bg = v;
     GLASS_BG_REV.fetch_add(1, Ordering::Relaxed);
+}
+
+// ───────────────────── 玻璃降级诊断 ─────────────────────
+//
+// 玻璃有好几条「静默退回纸面」的路：抓屏失败、抓出来全黑（DRM/受保护窗口）、
+// 系统设不上 WDA_EXCLUDEFROMCAPTURE。以前一个字都不写，用户只能报「我这台不实时」，
+// 日志里查不到任何线索。现在每个原因**一次运行只记一行**（实时线程 30fps，
+// 去重是必须的），并且带上坐标和屏幕尺寸 —— 公司电脑发回来的日志能自己把话说完。
+
+const GL_WDA: u32 = 1 << 0;     // WDA_EXCLUDEFROMCAPTURE 设不上 → 改走「自遮罩」实时
+const GL_LIVE_ON: u32 = 1 << 1; // 实时线程跑起来了（记一条，证明这条路是通的）
+const GL_SNAP_BLACK: u32 = 1 << 2;
+const GL_SNAP_CAP: u32 = 1 << 3;  // 呼出时那次抓屏失败（GetDC / BitBlt）
+const GL_LIVE_BLACK: u32 = 1 << 4;
+const GL_LIVE_CAP: u32 = 1 << 5;
+const GL_OFFSCREEN: u32 = 1 << 6; // 抓取矩形整个落在虚拟屏幕之外
+
+static GLASS_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// 同一原因只写一行；`msg` 是闭包，被去重挡掉时连字符串都不拼。
+fn glass_note(bit: u32, msg: impl FnOnce() -> String) {
+    if GLASS_LOGGED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    diag_line(&format!("{}\\radial_log.txt", log_dir()), &msg());
+}
+
+/// 抓屏坐标 + 屏幕范围（一眼看出是不是「副屏 / 负坐标 / 越界」这类问题）。
+fn glass_where(x: i32, y: i32) -> String {
+    let (vx, vy, vw, vh) = virtual_screen();
+    format!(
+        "at=({},{}) size={}x{} virtual=({},{},{}x{})",
+        x, y, CANVAS, CANVAS, vx, vy, vw, vh
+    )
+}
+
+fn virtual_screen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+/// 抓取矩形是否整个落在虚拟屏幕外（只压掉一半不算 —— 剩下还有半张桌面，
+/// `mostly_black` 会放过，视觉上也就是盘沿一部分糊掉）。
+fn glass_offscreen(x: i32, y: i32) -> bool {
+    let (vx, vy, vw, vh) = virtual_screen();
+    x + CANVAS <= vx || y + CANVAS <= vy || x >= vx + vw || y >= vy + vh
+}
+
+/// WDA 设不上时的兜底：把抓到的那一帧里「轮盘自己」抹掉。
+///
+/// 做法是**角度扩散**，不是径向外推 —— 外推实测会把壁纸拉成一个风车（盘心是奇点，
+/// 深色区域被拉成扇形黑块），比不擦还扎眼。这里：
+/// 1. 贴着遮罩外沿取一圈干净桌面，按角度分箱求平均色（96 箱，循环平滑一遍）；
+/// 2. 盘内每个像素 = 全局均值 → 该角度均值 的径向过渡，越靠盘沿越接近真实周边；
+/// 3. 于是盘读起来是「背景的柔和延续」，再过一道 `blur_glass` 就是磨砂玻璃。
+/// 不如 WDA（看不见背景的细节），但玻璃是活的、没有自己的残影，也不会露馅成一块白。
+fn glass_scrub_self(raw: &mut [u8], rm: f32) {
+    const NB: usize = 96;
+    /// 取样的环带宽度：贴近遮罩才像「背景的延续」，取远了颜色就跑偏
+    const BAND: f32 = 40.0;
+    let w = CANVAS as usize;
+    let hi_edge = CC - 3.0;                 // 画布内切圆：再往外就取不到干净像素
+    let lo = (rm + GL_MASK_PAD).min(hi_edge);
+    let hi = (lo + BAND).min(hi_edge);
+    if hi - lo < 6.0 {
+        return;                             // 遮罩顶到画布边了，没什么可取 → 留着上一帧
+    }
+    let mut acc = [[0f32; 3]; NB];
+    let mut cnt = [0f32; NB];
+    let mut gsum = [0f32; 3];
+    let mut gn = 0f32;
+    let r_out = hi + 1.0;
+    let y0 = (CC - r_out).max(0.0) as usize;
+    let y1 = ((CC + r_out).min(CANVAS as f32 - 1.0)) as usize;
+    for py in y0..=y1 {
+        let dy = py as f32 + 0.5 - CC;
+        let sx = (r_out * r_out - dy * dy).sqrt().max(0.0);
+        let xa = (CC - sx).max(0.0) as usize;
+        let xb = ((CC + sx).min(CANVAS as f32 - 1.0)) as usize;
+        for px in xa..=xb {
+            let dx = px as f32 + 0.5 - CC;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d < lo || d > hi {
+                continue;
+            }
+            let o = (py * w + px) * 4;
+            let b = ang_bin(dx, dy);
+            for c in 0..3 {
+                let v = raw[o + c] as f32;
+                acc[b][c] += v;
+                gsum[c] += v;
+            }
+            cnt[b] += 1.0;
+            gn += 1.0;
+        }
+    }
+    if gn < 1.0 {
+        return;
+    }
+    let gm = [gsum[0] / gn, gsum[1] / gn, gsum[2] / gn];
+    // 每箱均值（空箱 = 那一向被画布边切掉了）→ 退回全局均值
+    let mut prof = [[0f32; 3]; NB];
+    for i in 0..NB {
+        if cnt[i] > 0.5 {
+            for c in 0..3 {
+                prof[i][c] = acc[i][c] / cnt[i];
+            }
+        } else {
+            prof[i] = gm;
+        }
+    }
+    // 循环 3 抽头平滑：分箱之间不留硬边
+    let mut sm = prof;
+    for i in 0..NB {
+        let (a, b) = (prof[(i + NB - 1) % NB], prof[(i + 1) % NB]);
+        for c in 0..3 {
+            sm[i][c] = (a[c] + prof[i][c] * 2.0 + b[c]) * 0.25;
+        }
+    }
+    // 填盘内
+    let y0 = (CC - rm).max(0.0) as usize;
+    let y1 = ((CC + rm).min(CANVAS as f32 - 1.0)) as usize;
+    for py in y0..=y1 {
+        let dy = py as f32 + 0.5 - CC;
+        let sx = (rm * rm - dy * dy).sqrt().max(0.0);
+        let xa = (CC - sx).max(0.0) as usize;
+        let xb = ((CC + sx).min(CANVAS as f32 - 1.0)) as usize;
+        for px in xa..=xb {
+            let dx = px as f32 + 0.5 - CC;
+            let d = (dx * dx + dy * dy).sqrt();
+            let o = (py * w + px) * 4;
+            // 越靠盘心越接近全局均值（幂次 >1 让中心那块"糊"得更开，奇点不显形）
+            let u = d / rm;
+            let t = u * u * u.sqrt();
+            let (i0, i1, fr) = ang_lerp(dx, dy);
+            let (p0, p1) = (sm[i0], sm[i1]);
+            for c in 0..3 {
+                let v = gm[c] * (1.0 - t) + (p0[c] * (1.0 - fr) + p1[c] * fr) * t;
+                raw[o + c] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// 方向 → 角度箱（0..NB）。约定与 `glass_px` 无关，只要自洽即可。
+fn ang_bin(dx: f32, dy: f32) -> usize {
+    const NB: usize = 96;
+    let th = dy.atan2(dx);                       // -π..π
+    let b = (th + std::f32::consts::PI) * (NB as f32 / (2.0 * std::f32::consts::PI));
+    (b as usize) % NB
+}
+
+/// 方向 → 相邻两箱 + 插值系数（避免 96 箱的分段感）
+fn ang_lerp(dx: f32, dy: f32) -> (usize, usize, f32) {
+    const NB: usize = 96;
+    let th = dy.atan2(dx);
+    let pos = (th + std::f32::consts::PI) * (NB as f32 / (2.0 * std::f32::consts::PI));
+    let f = pos.floor();
+    let i0 = (f as usize) % NB;
+    (i0, (i0 + 1) % NB, pos - f)
 }
 
 /// 抓桌面一块区域（`CANVAS²`，屏幕坐标）→ 模糊 → `st.glass_bg`。
@@ -2346,9 +2519,20 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
     let _ = DeleteObject(HGDIOBJ(bmp.0));
     let _ = DeleteDC(mdc);
     if !ok {
+        glass_note(GL_SNAP_CAP, || {
+            format!("GLASS reason=capfail snap（呼出时那次抓屏就失败 → 第一帧是纸面）{}", glass_where(x, y))
+        });
         return;
     }
+    if glass_offscreen(x, y) {
+        glass_note(GL_OFFSCREEN, || {
+            format!("GLASS reason=offscreen（抓取矩形整个在虚拟屏幕外）{}", glass_where(x, y))
+        });
+    }
     if mostly_black(&raw) {
+        glass_note(GL_SNAP_BLACK, || {
+            format!("GLASS reason=black snap（抓出来全黑 = DRM/受保护窗口 → 退回纸面）{}", glass_where(x, y))
+        });
         return;
     }
     let t0 = std::time::Instant::now();
@@ -2411,8 +2595,50 @@ const GLASS_LIVE_MS: u64 = 33;
 static GLASS_LIVE_ON: AtomicBool = AtomicBool::new(false);
 static GLASS_LIVE_X: AtomicI32 = AtomicI32::new(0);
 static GLASS_LIVE_Y: AtomicI32 = AtomicI32::new(0);
+/// WDA 设不上（老系统 / 远程桌面 / 受管控的机器）→ 每帧自己把盘那一块从抓到的画面里
+/// 擦掉（`glass_scrub_self`）。以前是直接放弃实时，玻璃就整个不动了。
+static GLASS_SELF_MASK: AtomicBool = AtomicBool::new(false);
+/// 要擦掉的半径（**×10 定点**，画布坐标）。UI 线程每帧按「这一帧实际画到哪」更新；
+/// 0 = 还没画过，用 `GL_MASK_R_FALLBACK` 兜底。
+static GLASS_MASK_R: AtomicU32 = AtomicU32::new(0);
+/// 遮罩半径之外还要再让出这么多，才当作「干净的桌面」来取样 ——
+/// 遮罩本身已经把盘/外环的投影算进去了（`GL_MASK_SHAD`）。
+const GL_MASK_PAD: f32 = 6.0;
+/// 盘和外环都带一圈柔和投影（下移 6K + 模糊 18K，注释里实测最远 r+30）。
+/// 遮罩半径 = 实际画到哪 + 这一圈投影，否则擦完还留一圈自己的影子。
+const GL_MASK_SHAD: f32 = 26.0;
+/// UI 还没报过半径时的兜底 = 最坏绘制范围（盘 + 外环 + hover 抬升）。
+const GL_MASK_R_FALLBACK: f32 = DISC_R_MAX + 3.0 * K + RING_T + 2.0 * K + GL_MASK_SHAD;
 /// UI 线程取走了多少帧（只给 `RL_GLASSDBG` 的日志用）
 static GLASS_LIVE_TAKEN: AtomicU32 = AtomicU32::new(0);
+/// **外部窗口正在被拖向环**（窗口捕获武装中）→ 暂停抓屏、冻结盘面色层。
+/// 理由同「滚动中故意不换帧」（见 `on_timer`）：这时候背景本来就没人看，
+/// 而每 33ms 一次的全屏 `BitBlt(CAPTUREBLT)` 会和 DWM 的合成抢带宽 ——
+/// 用户正拖着浏览器窗口，那一边最需要的就是合成不被抢（2026-10-26「拖浏览器巨卡」）。
+static GLASS_FREEZE: AtomicBool = AtomicBool::new(false);
+
+/// 抓屏内容的粗签名：每 16px 采一个点（≈30×30）。
+/// 桌面没变 → 签名相同 → 不 blur、不入槽 → UI 不 bump `GLASS_BG_REV` →
+/// 省掉每帧固定 7ms 的盘内重采（空闲时的主要税）。
+fn glass_sig(raw: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let step = 16usize;
+    let w = CANVAS as usize;
+    let mut y = step / 2;
+    while y < w {
+        let mut x = step / 2;
+        while x < w {
+            let o = (y * w + x) * 4;
+            if o + 3 < raw.len() {
+                let p = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+                h = (h ^ p as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            x += step;
+        }
+        y += step;
+    }
+    h
+}
 
 /// 最新一帧（UI 线程 `take` 走，直接换进 `glass_bg`，不拷贝）
 static GLASS_LIVE_SLOT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
@@ -2430,6 +2656,7 @@ fn glass_live_spawn() {
         let mut dump_i = 0u32;
         let mut dib: Option<(*mut u8, HDC, HBITMAP)> = None;
         let mut on_since: Option<Instant> = None;
+        let mut sig_last: Option<u64> = None;
         let (mut stat_n, mut stat_blit_us, mut stat_blur_us) = (0u32, 0u64, 0u64);
         loop {
             if !GLASS_LIVE_ON.load(Ordering::Relaxed) {
@@ -2448,6 +2675,7 @@ fn glass_live_spawn() {
             if on_since.is_none() {
                 on_since = Some(Instant::now());
                 dump_i = 0;
+                sig_last = None;
                 if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
                     *s = None;
                 }
@@ -2461,6 +2689,13 @@ fn glass_live_spawn() {
                 }
                 dib = Some((bits, mdc, bmp));
             }
+            // 有人正把窗口拖向环 → 这一拍不抓屏（把 DWM 合成让给被拖的窗口），
+            // 也不推新帧 → 盘面色层冻在最后一帧。见 `GLASS_FREEZE`。
+            if GLASS_FREEZE.load(Ordering::Relaxed) {
+                sig_last = None;
+                std::thread::sleep(std::time::Duration::from_millis(GLASS_LIVE_MS));
+                continue;
+            }
             let t_tick = Instant::now();
             // WDA 生效要过一帧合成：刚打开的头 40ms 不抓，免得把轮盘自己拍进去
             if on_since.map(|t| t.elapsed().as_millis() as u64 >= 40).unwrap_or(false) {
@@ -2473,9 +2708,24 @@ fn glass_live_spawn() {
                     if BitBlt(mdc, 0, 0, CANVAS, CANVAS, sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
                         // ⚠️ 这一段包含「等 DWM 下一次合成」（≈16ms），不是 CPU 耗时
                         let t1 = Instant::now();
-                        let raw = std::slice::from_raw_parts(bits, n);
+                        let raw = std::slice::from_raw_parts_mut(bits, n);
+                        if GLASS_SELF_MASK.load(Ordering::Relaxed) {
+                            // WDA 没生效 → 把「自己」从这一帧里擦掉，否则玻璃里套一圈盘
+                            let rm = match GLASS_MASK_R.load(Ordering::Relaxed) {
+                                0 => GL_MASK_R_FALLBACK,
+                                t => t as f32 / 10.0,
+                            };
+                            glass_scrub_self(raw, rm);
+                        }
                         // 抓失败（受保护窗口全黑）→ 不发，UI 留着上一帧
-                        if !mostly_black(raw) {
+                        // 内容没变（粗签名相同）→ 也不发：省掉 blur，更省掉 UI 侧
+                        // 每次换帧固定 7ms 的盘内重采 —— 空闲时最大的那笔税。
+                        if !mostly_black(raw) && {
+                            let sig = glass_sig(raw);
+                            let changed = sig_last != Some(sig);
+                            sig_last = Some(sig);
+                            changed
+                        } {
                             let buf = build_glass(raw);
                             let t2 = Instant::now();
                             if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
@@ -2499,9 +2749,21 @@ fn glass_live_spawn() {
                                 stat_blit_us = 0;
                                 stat_blur_us = 0;
                             }
+                        } else {
+                            glass_note(GL_LIVE_BLACK, || {
+                                format!("GLASS reason=black live（抓出来全黑 = DRM/受保护窗口，玻璃退回上一帧）{}",
+                                         glass_where(x, y))
+                            });
                         }
+                    } else {
+                        glass_note(GL_LIVE_CAP, || {
+                            format!("GLASS reason=capfail live（BitBlt 抓屏失败，玻璃不实时）{}",
+                                    glass_where(x, y))
+                        });
                     }
                     let _ = ReleaseDC(None, sdc);
+                } else {
+                    glass_note(GL_LIVE_CAP, || "GLASS reason=capfail live（GetDC(NULL) 拿不到屏幕 DC）".to_string());
                 }
             }
             // 补足到 33ms 一拍。BitBlt 本身就阻塞了 ~16ms，别在这上面再加 33
@@ -2518,13 +2780,25 @@ unsafe fn glass_live_start(st: &State, hwnd: HWND) {
         return;
     }
     // 轮盘窗口不参与抓屏 —— 实时抓背景时就不会把自己拍进去。
-    // ⚠️ 老系统（< Win10 2004）没有 WDA_EXCLUDEFROMCAPTURE：设失败就别开实时，
-    //    否则每帧都拍到「玻璃里套着一圈自己」。
-    if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
-        return;
+    // ⚠️ 老系统（< Win10 2004）、远程桌面、被 DLP 管控的机器设不上这个属性。
+    //    以前设失败就整个关掉实时（用户看到的「玻璃不动」大半是这个），现在退一步：
+    //    照常抓，每帧把「自己画的那一圈」用外圈均色填掉（`glass_scrub_self`）。
+    //    不如 WDA 干净（看不见背景细节），但玻璃至少是活的。
+    let wda_ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok()
+        && std::env::var_os("RL_GLASS_NOWDA").is_none();
+    GLASS_SELF_MASK.store(!wda_ok, Ordering::Relaxed);
+    if wda_ok {
+        glass_note(GL_LIVE_ON, || "GLASS live=on（WDA 排除自己，抓屏干净）".to_string());
+    } else {
+        glass_note(GL_WDA, || {
+            "GLASS reason=wda（SetWindowDisplayAffinity 设不上 → 每帧自擦盘区域，玻璃仍然实时）"
+                .to_string()
+        });
     }
     GLASS_LIVE_X.store(st.win_x, Ordering::Relaxed);
     GLASS_LIVE_Y.store(st.win_y, Ordering::Relaxed);
+    // 上一轮的半径别带到这一轮（第一帧没画过就用兜底值）
+    GLASS_MASK_R.store(0, Ordering::Relaxed);
     // 别把上一轮（可能已关菜单）的残留帧喂给这一次
     if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
         *s = None;
@@ -2646,7 +2920,7 @@ fn blur_glass(src: &[u8]) -> Vec<u8> {
 ///
 /// `(x, y)` 是**画布坐标**（像素中心），`(cx, cy, r)` 是**盘的几何**（中心与半径）。
 fn glass_px(bg: &[u8], x: f32, y: f32, cx: f32, cy: f32, r: f32, dark: bool, ta: f32,
-            rim_k: f32) -> (f32, f32, f32) {
+            rim_k: f32, sharp: f32) -> (f32, f32, f32) {
     let dx0 = x + 0.5 - cx;
     let dy0 = y + 0.5 - cy;
     let d0 = (dx0 * dx0 + dy0 * dy0).sqrt().max(0.001);
@@ -2666,12 +2940,12 @@ fn glass_px(bg: &[u8], x: f32, y: f32, cx: f32, cy: f32, r: f32, dark: bool, ta:
     let mr = mb + n;           // 原图（缓冲前半）—— 顺序：raw 在前、blur 在后
     let mut c = [bg[mr + 2] as f32, bg[mr + 1] as f32, bg[mr] as f32];
     // 混入模糊层：**这一步决定了它是"玻璃"还是"磨砂"**。
-    // 全模糊 = 磨砂；这里只盖 70%，剩下 30% 原图的细节 ——
+    // 全模糊 = 磨砂；这里只盖 `sharp`（默认 70%），剩下 30% 原图的细节 ——
     // 背景的文字/颗粒/色块边界都还认得出来，边缘又是柔的。
-    let sharp = 1.0 - GLASS_SHARP;
-    c[0] = c[0] * sharp + bg[mb + 2] as f32 * GLASS_SHARP;
-    c[1] = c[1] * sharp + bg[mb + 1] as f32 * GLASS_SHARP;
-    c[2] = c[2] * sharp + bg[mb] as f32 * GLASS_SHARP;
+    let inv = 1.0 - sharp;
+    c[0] = c[0] * inv + bg[mb + 2] as f32 * sharp;
+    c[1] = c[1] * inv + bg[mb + 1] as f32 * sharp;
+    c[2] = c[2] * inv + bg[mb] as f32 * sharp;
     // ① 饱和度 + 提亮 4%：玻璃"透出来但更艳"，糊成灰就成磨砂了
     let lum = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
     for ch in c.iter_mut() {
@@ -2725,6 +2999,8 @@ struct GlassDiscLayer {
     /// 生成它时的盘面半径（`f32::to_bits`）—— 开合动画里每帧都变，自然每帧重建
     r: u32,
     dark: bool,
+    /// 生成它时是否走「自擦」模式（WDA 设不上）—— 那一档清晰度不同，缓存不能共用
+    mask: bool,
     x0: usize,
     y0: usize,
     w: usize,
@@ -2766,6 +3042,10 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let lw = x1 - x0 + 1;
     let lh = y1 - y0 + 1;
     let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
+    // WDA 设不上时，盘里的「原图」层是拿外圈均色填出来的（不是真桌面）。
+    // 那一层留 30% 只会把分箱的扇形条纹看得清清楚楚 → 干脆基本全用模糊层，读成磨砂玻璃。
+    let mask = GLASS_SELF_MASK.load(Ordering::Relaxed);
+    let sharp = if mask { GLASS_SHARP_MASK } else { GLASS_SHARP };
 
     // 缓存只装**盘内部**（`cov >= 0.999`，即整像素替换）。盘沿那道抗锯齿带只有
     // 不到 1px 宽、约 2k 像素（≈0.1ms），却依赖浮点覆盖率 —— 量化成 8 位会把整圈
@@ -2774,7 +3054,8 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let hit = GLASS_DISC_CACHE.with(|c| {
         let b = c.borrow();
         matches!(b.as_ref(), Some(l)
-            if l.rev == rev && l.r == r.to_bits() && l.dark == dark && l.px.len() == lw * lh * 4)
+            if l.rev == rev && l.r == r.to_bits() && l.dark == dark && l.mask == mask
+                && l.px.len() == lw * lh * 4)
     });
     if !hit {
         let mut px = vec![0u8; lw * lh * 4];
@@ -2787,7 +3068,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
                 if cov1((dx * dx + dy * dy).sqrt() - r) < 0.999 {
                     continue;
                 }
-                let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
+                let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0, sharp);
                 let o = (row * lw + col) * 4;
                 px[o] = cb as u8;
                 px[o + 1] = cg as u8;
@@ -2796,7 +3077,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             }
         }
         GLASS_DISC_CACHE.with(|c| {
-            *c.borrow_mut() = Some(GlassDiscLayer { rev, r: r.to_bits(), dark, x0, y0, w: lw, h: lh, px });
+            *c.borrow_mut() = Some(GlassDiscLayer { rev, r: r.to_bits(), dark, mask, x0, y0, w: lw, h: lh, px });
         });
     }
 
@@ -2833,7 +3114,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             if cov <= 0.002 || cov >= 0.999 {
                 continue; // 盘外，或已由缓存整像素替换
             }
-            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0);
+            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0, sharp);
             blend_over(buf, (py * w + pxi) * 4, cr, cg, cb, cov);
         }
     }
@@ -2900,6 +3181,16 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     //    早了没盘可盖，晚了会把图标/头像一起盖掉。
     if st.glass {
         glass_disc(&*st, buf, disc_r, st.glass_liquid);
+    }
+    // WDA 设不上时抓屏线程要「自擦」的半径 —— 只有这一帧的绘制范围说了算：
+    // 外环展开时比盘面大一整圈，只按 disc_r 擦就会在玻璃里留下一圈自己的梯形。
+    if GLASS_SELF_MASK.load(Ordering::Relaxed) {
+        let drawn = if st.active_app.is_some() {
+            ring_radii(n).1 + 2.0 * K
+        } else {
+            disc_r
+        };
+        GLASS_MASK_R.store(((drawn + GL_MASK_SHAD) * 10.0) as u32, Ordering::Relaxed);
     }
 
     // 拖放感知指示：drop 模式下盘沿亮一圈绿环（证明 OLE 已找到我们）
@@ -4788,23 +5079,99 @@ unsafe fn moving_window() -> Option<HWND> {
     }
 }
 
-/// `moving_window()` 的节流版：它要 `AttachThreadInput` 到前台线程，60fps 反复挂/摘
-/// 会让**正在拖窗的那个线程**发涩（用户 2026-10-20 报「拖窗口卡顿」）。
-/// 策略：**正在拖**（上次有结果）时 90ms 才复查一次（≈11 次/秒）；**没在拖**
-/// （上次 None）时每帧都查，保证拖拽起手立刻被发现、松手最多晚 90ms 落盘。
+/// 「松手」那一瞬的光标（`pack_pt`；0 = 没有记录）。见 [`moving_window_throttled`]。
+static MOVE_RELEASE_PT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 光标当前位置：优先用钩子写进原子量的值；钩子没装（停止监听）或还没收到过
+/// 任何一次移动（原子量还是 0）→ 直接问系统。`WM_APP_SHOW` / `WM_APP_HOVER`
+/// 早就是这么兜底的，窗口捕获的落点判定也必须一致 —— 否则原子量停在 (0,0)，
+/// 「拖进环」永远判成没落盘。
+unsafe fn cursor_now() -> (i32, i32) {
+    let (x, y) = (
+        CURSOR_X.load(Ordering::Relaxed),
+        CURSOR_Y.load(Ordering::Relaxed),
+    );
+    if x == 0 && y == 0 {
+        let mut p = POINT::default();
+        let _ = GetCursorPos(&mut p);
+        (p.x, p.y)
+    } else {
+        (x, y)
+    }
+}
+
+/// `moving_window()` 的节流 + 去抖版。三条硬规则（2026-10-26 修「呼出轮盘后拖浏览器巨卡」）：
+///  * **一律 ≤15Hz**（原来「没在拖时每帧都查」）：`moving_window` 要 `AttachThreadInput`
+///    挂到**前台线程**（拖浏览器时就是浏览器的 UI 线程）再取 `hwndMoveSize`。挂/摘本身
+///    要打扰那个线程，60fps 反复做 = 每帧给浏览器插一刀 —— 用户报的「拖窗口掉帧」正是它。
+///  * **左键没按下 = 不可能在拖窗口** → 一次都不查（零 attach）。
+///    拖标题栏全程按着左键，这是免费且绝对可靠的前置门。
+///  * **连续 2 次 None 才算松手**：单帧 `hwndMoveSize` 为空常常只是被拖线程 momentarily
+///    忙（弹菜单、切进程），以前一 None 就判定松手 → 拖到半路预览消失、落点误判。
+///    第一次 None 时**快照当时光标**当松手点（`release_point`）：去抖多等的这 ~130ms
+///    里手可能已经移开，用快照才等于用户真实的落点。
 fn moving_window_throttled() -> Option<HWND> {
     use std::sync::atomic::{AtomicIsize, AtomicU32};
     static AT: AtomicU32 = AtomicU32::new(0);
     static RES: AtomicIsize = AtomicIsize::new(0);
+    static MISS: AtomicU32 = AtomicU32::new(0);
+    /// ≈15Hz
+    const PERIOD: u32 = 66;
+    /// 连续这么多次 None 才承认松手
+    const KEEP: u32 = 2;
+
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
     let prev = RES.load(Ordering::Relaxed);
-    if prev != 0 && now.wrapping_sub(AT.load(Ordering::Relaxed)) < 90 {
-        return Some(HWND(prev as *mut c_void));
+    if now.wrapping_sub(AT.load(Ordering::Relaxed)) < PERIOD {
+        // 未到复查间隔：沿用上次的结论
+        return if prev != 0 { Some(HWND(prev as *mut c_void)) } else { None };
     }
-    let r = unsafe { moving_window() };
+    if prev == 0 {
+        let ldown = unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) as u16 & 0x8000 != 0
+        };
+        if !ldown {
+            // 没人按着左键 → 连 attach 都省了，只推进时间戳
+            AT.store(now, Ordering::Relaxed);
+            return None;
+        }
+    }
     AT.store(now, Ordering::Relaxed);
-    RES.store(r.map(|h| h.0 as isize).unwrap_or(0), Ordering::Relaxed);
-    r
+    let r = unsafe { moving_window() };
+    match r {
+        Some(h) => {
+            MISS.store(0, Ordering::Relaxed);
+            MOVE_RELEASE_PT.store(0, Ordering::Relaxed);
+            RES.store(h.0 as isize, Ordering::Relaxed);
+            Some(h)
+        }
+        None => {
+            let was_dragging = prev != 0;
+            if was_dragging {
+                let m = MISS.fetch_add(1, Ordering::Relaxed) + 1;
+                if m < KEEP {
+                    // 还在去抖窗口内：对外仍然算「正在拖」
+                    return Some(HWND(prev as *mut c_void));
+                }
+                MISS.store(0, Ordering::Relaxed);
+                // 松手点快照：落点判定用它，不用去抖之后的当前光标
+                let (rx, ry) = unsafe { cursor_now() };
+                MOVE_RELEASE_PT.store(pack_pt(rx, ry), Ordering::Relaxed);
+            }
+            RES.store(0, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// 取走（并清空）最近一次「松手」时的光标位置。None = 没有记录（调用方用当前光标）。
+fn release_point() -> Option<(i32, i32)> {
+    let v = MOVE_RELEASE_PT.swap(0, Ordering::Relaxed);
+    if v == 0 {
+        None
+    } else {
+        Some(unpack_pt(v))
+    }
 }
 
 /// 窗口标题（GetWindowTextW）
@@ -5240,6 +5607,20 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
     let title = window_title(hw);
     let mut pid = 0u32;
     GetWindowThreadProcessId(hw, Some(&mut pid));
+    // ⚠️⚠️ **`exe` 是全路径**（`c:\windows\explorer.exe`），不是文件名！
+    //    判进程一律先取文件名再比（曾经拿全路径和 `"explorer.exe"` 比，恒为 false
+    //    → UIA 探测一次都没跑过，落盘的 explorer 条目点了什么都不开 ——
+    //    用户 2026-10-16「我窗口拖进来的文件夹直接打不开了」）。
+    let base = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&exe)
+        .to_ascii_lowercase();
+    let is_explorer = base == "explorer.exe";
+    let is_browser = matches!(
+        base.as_str(),
+        "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
+    );
 
     // ── ① 先把预览摆出来（纯内存，<1ms）──
     // 这一步**绝不能等 UIA**：预览（ghost / suggest）是用户判断"拖进去会落在哪"的
@@ -5248,7 +5629,8 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
         hwnd: hw.0 as isize,
         exe: exe.clone(),
         title: title.clone(),
-        // relaunch 先占位（进程命令行）；explorer/浏览器紧接着由 UIA 补上（见下）。
+        // relaunch 先占位（进程命令行）；explorer/浏览器要等**落盘那一次**才由
+        // 后台 UIA 探测补上（`wincap_probe_start` → 回填条目，见 ②）。
         // ⚠️ 占位值要过 `sanitize_relaunch`：explorer 窗口进程的命令行是 COM 工厂串
         //    （`… /factory,{guid} -Embedding`），拿它"重开"点了什么都不开。
         relaunch: sanitize_relaunch(&process_command_line(pid).unwrap_or_else(|| exe.clone()), &exe),
@@ -5293,66 +5675,16 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
     }
     set_mood(st, 5);
 
-    // ── ② explorer / 浏览器的路径·网址：同步探测一次（**预览已经在上面摆好了**）──
+    // ── ② explorer / 浏览器：这里**不探测**路径·网址 ──
     //
-    // ⚠️ 为什么同步而不是丢后台线程：这个函数是从 `WM_MOUSEMOVE` 调的，同步跑
-    //    会卡 UI。但**实测 UIA 只要 30~120ms**（explorer 面包屑 / Edge omnibox），
-    //    真正慢的是冷启动（3 秒级）。所以：
-    //      ① 预览（ghost / suggest）在**探测之前**就摆好了 → 慢也不影响反馈
-    //      ② `wincap_probed` 保证**同一个窗口只探一次** → 只有第一次移入时卡一下
-    //      ③ 换窗口才重探（路径可能变了）
-    //    之前试过丢后台线程 + `post` 回来更新，但那条链路在真实拖动里不可靠
-    //    （WC_PROBE 经常对不上 hwnd），而且引入了"松手早于探测完成"的竞态。
-    // ⚠️⚠️ **`exe` 是全路径**（`c:\windows\explorer.exe`），不是文件名！
-    //    拿全路径去和 `"explorer.exe"` 比（下面第一版就是这么写的）**恒为 false** ——
-    //    于是 UIA 探测一次都没跑过，relaunch 退化成进程命令行，而 explorer 窗口进程的
-    //    命令行是 COM 工厂串 `… /factory,{guid} -Embedding`，点了**什么都不开**
-    //    （用户 2026-10-16：「我窗口拖进来的文件夹直接打不开了」）。
-    //    判进程一律先取文件名再比。
-    let base = exe
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(&exe)
-        .to_ascii_lowercase();
-    let is_explorer = base == "explorer.exe";
-    let is_browser = matches!(
-        base.as_str(),
-        "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
-    );
-    if is_explorer || is_browser {
-        // ⚠️⚠️ 缓存必须**存探测到的值**：原来只记 hwnd、命中时再从 `window_capture`
-        //    里"复用" —— 而 `window_capture` 是上面刚**用占位值重建**的，读出来又写回去
-        //    等于自赋值。结果：第二次拖同一个窗口时永远命中缓存、永远不再探测，
-        //    relaunch 一直是占位的裸 exe → 落盘的条目打不开文件夹。
-        let cached = st
-            .wincap_probed
-            .iter()
-            .find(|(h, _)| *h == hw.0 as isize)
-            .map(|(_, v)| v.clone());
-        match cached {
-            Some(v) if !v.is_empty() => {
-                if let Some(wc) = st.window_capture.as_mut() {
-                    wc.relaunch = v;
-                }
-            }
-            _ => {
-                let got = if is_explorer {
-                    explorer_window_folder(hw).map(|p| format!("{} \"{}\"", exe, p))
-                } else {
-                    browser_window_url(hw)
-                };
-                st.wincap_probed.retain(|(h, _)| *h != hw.0 as isize);
-                st.wincap_probed.push((
-                    hw.0 as isize,
-                    got.clone().unwrap_or_default(),
-                ));
-                // 探测失败**不写缓存**（下次移入再试一次），只更新本次
-                if let (Some(v), Some(wc)) = (got, st.window_capture.as_mut()) {
-                    wc.relaunch = v;
-                }
-            }
-        }
-    }
+    // 原来在这里同步跑 UIA（注释里写「实测只要 30~120ms」），代价是：
+    //  * 拖动过程中每次武装都触发一次 `FindAll(Descendants, 全部元素)`，
+    //    浏览器为了回答它要**现搭整棵无障碍树** —— 而用户绝大多数拖动
+    //    只是挪窗口、根本不收进环。实测拖 Edge 时「非常非常卡、掉帧」。
+    //  * 探测失败时缓存里存的是空串，`Some(v) if !v.is_empty()` 判不命中
+    //    → **每次移动都重探**（实测 msedge 每次 arm 40~90ms，全部白跑）。
+    // 现在：预览照旧（纯内存，<1ms），**只有松手且落在盘内、这条真要存了**
+    // 才问一次（`wincap_probe_start` 后台线程 → `WM_APP_WINPROBE` 回填条目）。
     println!(
         "[wincap] 检测到拖动窗口 · exe={} title={} relaunch={}",
         exe,
@@ -5372,6 +5704,9 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
 
 /// `on_timer` 每帧调用：探测/落盘窗口捕获。返回是否处于捕获中（用于保持持续重绘）。
 unsafe fn poll_window_capture(st: &mut State) -> bool {
+    // 武装中 = 有人在拖窗口 → 实时玻璃暂停抓屏、盘面色层冻结（`GLASS_FREEZE`）。
+    // 每帧按状态重设，不留任何「忘了清」的分支。
+    GLASS_FREEZE.store(st.window_capture.is_some(), Ordering::Relaxed);
     if st.window_capture.is_some() {
         // 测试武装态（WM_APP_WINARM）：poll 不得自动清理/落盘，专等 WM_APP_WINDROP 处理
         if st.window_capture.as_ref().unwrap().test {
@@ -5380,13 +5715,13 @@ unsafe fn poll_window_capture(st: &mut State) -> bool {
         if moving_window_throttled().is_some() {
             return true; // 还在拖
         }
-        // 松手 → 光标在盘面内才落盘
+        // 松手 → 光标在盘面内才落盘。
+        // ⚠️ 用**松手那一刻**的光标（`release_point`）而不是当前光标：去抖要多等
+        //    ~130ms 才承认松手，这期间手早就可能移开了 —— 用当前光标会把
+        //    「在环里松的手」判成没落盘，或反过来误吞一次快速甩开。
         let wc = st.window_capture.take().unwrap();
-        let over = in_disc(
-            st,
-            CURSOR_X.load(Ordering::Relaxed),
-            CURSOR_Y.load(Ordering::Relaxed),
-        );
+        let (rx, ry) = release_point().unwrap_or_else(|| unsafe { cursor_now() });
+        let over = in_disc(st, rx, ry);
         if over {
             capture_window(
                 st,
@@ -5396,6 +5731,8 @@ unsafe fn poll_window_capture(st: &mut State) -> bool {
                 &wc.relaunch,
             );
             st.commit_pulse = 1.0;
+            // 落盘成功 = 这条要存了，**这时**才去 UIA 问路径/网址（后台线程，不卡 UI）
+            wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
         }
         st.drop_suggest = None;
         st.drop_ghost = None;
@@ -5414,6 +5751,150 @@ unsafe fn poll_window_capture(st: &mut State) -> bool {
         false
     } else {
         false
+    }
+}
+
+// ─────────────── 窗口捕获的「路径 / 网址」后台探测 ───────────────
+
+/// 后台探测的回信信箱：`(hwnd, 探到的 relaunch)`（None = 没探到）。
+static WINPROBE_TX: std::sync::Mutex<Vec<(isize, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+/// 正在探测中的窗口（同一个 hwnd 不叠第二个线程）
+static WINPROBE_BUSY: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+/// 同一扇窗探测失败后，多久之内不再重试
+const WINPROBE_FAIL_MS: u32 = 60_000;
+
+/// 这条 exe 需不需要问 UIA（只有 explorer 文件夹窗口和浏览器窗口要）
+fn wincap_needs_probe(exe: &str) -> bool {
+    let base = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(exe)
+        .to_ascii_lowercase();
+    base == "explorer.exe"
+        || matches!(
+            base.as_str(),
+            "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
+        )
+}
+
+/// **落盘之后**才发起：后台线程问 UIA「这扇窗现在的路径 / 网址是什么」，
+/// 回信走 `WM_APP_WINPROBE` → [`wincap_apply_probe`] 回填条目和 INI。
+///
+/// 为什么搬后台：`explorer_window_folder` / `browser_window_url` 实测 15~3300ms
+/// （冷启动更慢），同步跑在 UI 线程上 = 松手那一刻整个菜单钉住；更要命的是它以前
+/// 挂在拖动路径上，**只是挪个窗口不收进环**也要撞一次，浏览器还得现搭无障碍树
+/// —— 用户 2026-10-26 报的「呼出轮盘后拖浏览器非常非常卡」。
+///
+/// 为什么现在敢搬后台：只在**这条真要存了**的时候跑一次，hwnd 就是刚存的那扇窗，
+/// 回填按 `live_hwnd` 定位，不存在以前「探测回来时对不上 hwnd」的竞态。
+/// 回信晚了 = 条目先留着占位值（点开至少能起进程），回来再升级；
+/// 探不到就记进 `wincap_failed`（带时间戳），60 秒内不再撞第二次。
+unsafe fn wincap_probe_start(st: &mut State, hw: HWND, exe: &str) {
+    if !wincap_needs_probe(exe) {
+        return;
+    }
+    let h = hw.0 as isize;
+    let now = windows::Win32::System::SystemInformation::GetTickCount();
+    if let Some(pos) = st.wincap_failed.iter().position(|(x, _)| *x == h) {
+        if now.wrapping_sub(st.wincap_failed[pos].1) < WINPROBE_FAIL_MS {
+            wlog(&format!("probe-skip hw={:#x} ({}ms 前刚失败过)", h, now.wrapping_sub(st.wincap_failed[pos].1)));
+            return;
+        }
+        st.wincap_failed.remove(pos);
+    }
+    {
+        let Ok(mut b) = WINPROBE_BUSY.lock() else { return };
+        if b.contains(&h) {
+            return;
+        }
+        b.push(h);
+    }
+    let exe_owned = exe.to_string();
+    let is_explorer = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(&exe)
+        .eq_ignore_ascii_case("explorer.exe");
+    // 诊断开关：`RL_WINCAP_SYNC=1` → 就在 UI 线程**同步**探一次。
+    // 用来分清「读不到路径」到底是后台线程的问题，还是这扇窗本来就读不出来
+    // （伪窗口 / 对方无障碍没开）。沙箱实测两种跑法结果一致 → 不是线程的问题。
+    if std::env::var_os("RL_WINCAP_SYNC").is_some() {
+        let got = wincap_probe_exe(h, &exe_owned, is_explorer);
+        wlog(&format!("probe-sync hw={h:#x} got={got:?}"));
+        if let Ok(mut t) = WINPROBE_TX.lock() {
+            t.push((h, got));
+        }
+        if let Ok(mut b) = WINPROBE_BUSY.lock() {
+            b.retain(|x| *x != h);
+        }
+        wincap_apply_probe(st);
+        return;
+    }
+    std::thread::spawn(move || unsafe {
+        let got = wincap_probe_exe(h, &exe_owned, is_explorer);
+        // ⚠️ 套间模型不是这里的关键：实测本线程先 `CoInitializeEx(MULTITHREADED)`
+        //    （把后面那句 APARTMENTTHREADED 挡成 RPC_E_CHANGED_MODE）和根本不先初始化
+        //    （= 走 STA）**结果一样**。跨进程 UIA 贵的是等提供方建树，不是我们的套间。
+        //    不注册 UIA 事件，所以这条线程没有消息循环也没关系。
+        wlog(&format!("probe-done hw={:#x} got={:?}", h, got));
+        if let Ok(mut t) = WINPROBE_TX.lock() {
+            t.push((h, got));
+        }
+        if let Ok(mut b) = WINPROBE_BUSY.lock() {
+            b.retain(|x| *x != h);
+        }
+        post(WM_APP_WINPROBE, 0, 0);
+    });
+}
+
+/// 探测本体：explorer 走面包屑，浏览器走地址栏。同步调用，谁调谁等。
+unsafe fn wincap_probe_exe(h: isize, exe: &str, is_explorer: bool) -> Option<String> {
+    let hw = HWND(h as *mut c_void);
+    if is_explorer {
+        explorer_window_folder(hw).map(|p| format!("{} \"{}\"", exe, p))
+    } else {
+        browser_window_url(hw)
+    }
+}
+
+/// 回填：把后台探到的路径 / 网址写进那条窗口条目（内存 + INI）。
+/// 只在 `live_hwnd` 对得上、且**比现有值更像能重开**（`relaunch_score`）时才覆盖 ——
+/// 不降级覆盖（同 `capture_window`）。窗口已经关了 / 条目已被删 → 直接丢弃。
+unsafe fn wincap_apply_probe(st: &mut State) {
+    let got = match WINPROBE_TX.lock() {
+        Ok(mut t) if !t.is_empty() => std::mem::take(&mut *t),
+        _ => return,
+    };
+    let now = windows::Win32::System::SystemInformation::GetTickCount();
+    for (h, v) in got {
+        let Some(v) = v else {
+            st.wincap_failed.retain(|(x, _)| *x != h);
+            st.wincap_failed.push((h, now));
+            continue;
+        };
+        let hit = st.apps.iter().position(|a| {
+            a.items
+                .iter()
+                .any(|x| x.kind == 1 && x.live_hwnd == h && relaunch_score(&v) > relaunch_score(&x.relaunch))
+        });
+        let Some(ai) = hit else { continue };
+        let ii = st.apps[ai]
+            .items
+            .iter()
+            .position(|x| x.kind == 1 && x.live_hwnd == h)
+            .unwrap();
+        let exe = st.apps[ai].items[ii].target.clone();
+        let sec = st.apps[ai].name.clone();
+        let name = st.apps[ai].items[ii].name.clone();
+        st.apps[ai].items[ii].relaunch = v.clone();
+        ini_set_item(
+            &st.ini_path,
+            &sec,
+            &name,
+            &format!("{}|@win|{}", exe, v),
+        );
+        println!("[wincap] 回填重开命令行 · {} → {}", name, v);
+        wlog(&format!("probe-patch hw={:#x} app={} name={} relaunch={}", h, sec, name, v));
     }
 }
 
@@ -5784,14 +6265,16 @@ unsafe fn explorer_window_folder(hwnd: HWND) -> Option<String> {
         want: isize,
         found: Option<String>,
         done: bool,
+        /// 同类名、同文件夹的候选数（诊断：分不清「扫描没找到候选」和
+        /// 「找到候选但 UIA 读不出面包屑」时看这个数）
+        cands: u32,
+        /// 其中 `IsWindowVisible=false` 的有几个
+        hidden: u32,
     }
     extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
         unsafe {
             let s = &mut *(lp.0 as *mut Scan);
             if s.done || h.0 as isize == s.want {
-                return BOOL(1);
-            }
-            if !IsWindowVisible(h).as_bool() {
                 return BOOL(1);
             }
             if window_class(h) != s.cls {
@@ -5805,6 +6288,15 @@ unsafe fn explorer_window_folder(hwnd: HWND) -> Option<String> {
             if lf != s.leaf {
                 return BOOL(1);
             }
+            s.cands += 1;
+            // ⚠️ 可见性判定放在**类名+标题匹配之后**，而且只记不筛：
+            //    以前它排在最前面，`IsWindowVisible=false` 的那些（Win11 的 XAML 宿主
+            //    窗口 / 刚建好还没走完可见性转换的窗口）连名都不报，
+            //    等于「能读到面包屑的那个候选」可能被无声滤掉。
+            //    候选本来就只有一两个，多试一个隐藏窗口的代价 = 一次 UIA 读。
+            if !IsWindowVisible(h).as_bool() {
+                s.hidden += 1;
+            }
             if let Some(v) = explorer_window_folder_self(h) {
                 s.found = Some(v);
                 s.done = true;
@@ -5814,13 +6306,27 @@ unsafe fn explorer_window_folder(hwnd: HWND) -> Option<String> {
         }
     }
     let mut sc = Scan {
-        cls,
-        leaf,
+        cls: cls.clone(),
+        leaf: leaf.clone(),
         want: hwnd.0 as isize,
         found: None,
         done: false,
+        cands: 0,
+        hidden: 0,
     };
     let _ = EnumWindows(Some(cb), LPARAM(&mut sc as *mut _ as isize));
+    // 一行说清：给到的 hwnd 是什么类名/组、扫到几个同类候选、成了没有。
+    // 「存下来的又是光秃秃的 Explorer.EXE」时先看这行 —— 候选 0 个是匹配问题，
+    // 候选 >0 还没路径就是对方那棵 UIA 树读不出面包屑。
+    wlog(&format!(
+        "crumb-scan want={:#x} cls={:?} leaf={:?} 候选 {} 个(隐藏 {}) → {}",
+        hwnd.0 as isize,
+        cls,
+        leaf,
+        sc.cands,
+        sc.hidden,
+        if sc.found.is_some() { "读到路径" } else { "没有" }
+    ));
     sc.found
 }
 
@@ -5836,20 +6342,47 @@ unsafe fn explorer_window_folder_self(hwnd: HWND) -> Option<String> {
         None,
         windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
     );
+    let hwi = hwnd.0 as isize;
     let ui: windows::Win32::UI::Accessibility::IUIAutomation =
-        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+        match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            Ok(v) => v,
+            Err(e) => {
+                wlog(&format!("uia-crumb hw={hwi:#x} CoCreateInstance 失败 {e:?}"));
+                return None;
+            }
+        };
+    // ⚠️ 这里**不能**学 `browser_window_url` 用属性窄查询：实测按
+    //    `ClassName = FileExplorerExtensions.BreadcrumbBarItemControl` 过滤，
+    //    DirectUI（explorer 的工具栏）那批 provider **一个元素都不返回**（沙箱实测
+    //    `命中元素 0 个`，同窗口用 TrueCondition 能读到面包屑）。
+    //    explorer 的树本来就小（实测 110~131 个元素），全量走一遍代价可忽略 ——
+    //    真正贵的是 Chromium 那种几千节点的树。
     let cond = ui.CreateTrueCondition().ok()?;
-    let root = ui.ElementFromHandle(hwnd).ok()?;
-    let arr = root.FindAll(TreeScope_Descendants, &cond).ok()?;
+    let root = match ui.ElementFromHandle(hwnd) {
+        Ok(v) => v,
+        Err(e) => {
+            wlog(&format!("uia-crumb hw={hwi:#x} ElementFromHandle 失败 {e:?}"));
+            return None;
+        }
+    };
+    let arr = match root.FindAll(TreeScope_Descendants, &cond) {
+        Ok(v) => v,
+        Err(e) => {
+            wlog(&format!("uia-crumb hw={hwi:#x} FindAll 失败 {e:?}"));
+            return None;
+        }
+    };
 
     let mut crumbs: Vec<String> = Vec::new();
     let mut edit_val = String::new();
+    let mut crumb_hits = 0u32;
     for i in 0..arr.Length().unwrap_or(0) {
         let Ok(e) = arr.GetElement(i) else { continue };
         let cls = e.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
 
         // ① 面包屑（路径的权威来源）
         if cls == "FileExplorerExtensions.BreadcrumbBarItemControl" {
+            crumb_hits += 1;
             let name = e.CurrentName().map(|b| b.to_string()).unwrap_or_default();
             if name.trim().is_empty() {
                 continue;
@@ -5896,6 +6429,12 @@ unsafe fn explorer_window_folder_self(hwnd: HWND) -> Option<String> {
     if !edit_val.is_empty() {
         return Some(edit_val);
     }
+    // `元素` = 整棵树的节点数，`面包屑` = 其中属于面包屑的个数。
+    // 伪窗口（UIA 只看得到 7 个节点、面包屑 0 个）就是靠这行认出来的。
+    wlog(&format!(
+        "uia-crumb hw={hwi:#x} 元素 {} 个 / 面包屑 {crumb_hits} 个 → 读不到路径",
+        arr.Length().unwrap_or(0)
+    ));
     None
 }
 
@@ -5943,7 +6482,7 @@ fn looks_like_path(s: &str) -> bool {
 /// 直接给完整 URL（实测能拿到 `https://cn.bing.com/images/search?q=…`）。
 ///
 /// ⚠️ 必须走**后台线程**（UIA 首次 `ElementFromHandle` 实测 15~3300ms，
-///    冷启动更慢）—— 见 `arm_window_capture` 的调用点。
+///    冷启动更慢）—— 调用点是 `wincap_probe_start`（只在松手落盘那一次）。
 unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Accessibility::{CUIAutomation, TreeScope_Descendants};
@@ -5955,20 +6494,25 @@ unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
     );
     let ui: windows::Win32::UI::Accessibility::IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
-    let cond = ui.CreateTrueCondition().ok()?;
+    // ⚠️ **窄查询**：TrueCondition 会让 UIA 把整棵子树的每个元素都物化并缓存，
+    //    Chromium 为了回答它要现搭整棵无障碍树（卡的是浏览器那一头）。
+    //    地址栏一定是 Edit，按 ControlType 筛掉 99% 的元素。
+    let cond = ui
+        .CreatePropertyCondition(
+            windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId,
+            &windows_core::VARIANT::from(UIA_EDIT_CT),
+        )
+        .ok()?;
     let root = ui.ElementFromHandle(hwnd).ok()?;
     let arr = root.FindAll(TreeScope_Descendants, &cond).ok()?;
-
+    let hwi = hwnd.0 as isize;
+    let mut edits = 0i32;
+    let mut omni = 0i32;
     for i in 0..arr.Length().unwrap_or(0) {
         let Ok(e) = arr.GetElement(i) else { continue };
+        edits += 1;
         let cls = e.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
         let name = e.CurrentName().map(|b| b.to_string()).unwrap_or_default();
-        // 取一次存局部变量（UIA 属性查询是实时 COM 调用，别在多处重复取）
-        let ct: i32 = e.CurrentControlType().map(|c| c.0).unwrap_or(-1);
-        // 编辑框
-        if ct != UIA_EDIT_CT {
-            continue;
-        }
         // 地址栏的特征：cls 是 OmniboxViewViews，或名字里带「地址」/「搜索栏」
         let is_omni = cls == "OmniboxViewViews" || cls.contains("Omnibox");
         let is_named =
@@ -5976,9 +6520,7 @@ unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
         if !is_omni && !is_named {
             continue;
         }
-        if ct != UIA_EDIT_CT {
-            continue;
-        }
+        omni += 1;
         // 三条取值途径，按可靠度排序：
         // ① `ValuePattern`（最正规，但部分版本的 Chromium 只在聚焦时给）
         // ② `UIA_ValueValuePropertyId`（属性直读，绕过 pattern）
@@ -6018,6 +6560,9 @@ unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
             return Some(t.to_string());
         }
     }
+    wlog(&format!(
+        "uia-omni hw={hwi:#x} Edit {edits} 个 / 地址栏 {omni} 个，三条途径都取不到 URL"
+    ));
     None
 }
 
@@ -9205,7 +9750,7 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
                     Some((bg, dark, dr)) if mode == 0 && bg.len() >= (CANVAS * CANVAS * 4) as usize * 2 => {
                         let ta = if dark { GLASS_CHIP_A_D } else { GLASS_CHIP_A_L };
                         let (gr, gg, gb) =
-                            glass_px(bg, fx, fy, CC, CC, dr, dark, ta, GLASS_CHIP_RIM);
+                            glass_px(bg, fx, fy, CC, CC, dr, dark, ta, GLASS_CHIP_RIM, GLASS_SHARP);
                         blend_over(buf, o, gr, gg, gb, a_f);
                     }
                     _ => blend_over(buf, o, fill.0 as f32, fill.1 as f32, fill.2 as f32, a_f),
@@ -11591,8 +12136,10 @@ unsafe fn on_timer(st: &mut State) {
     //    盘面色层缓存（见 `glass_disc`）必须重采一遍 —— 那是 7ms，正好落在
     //    每一格滚轮动画上，用户看到的就是「一卡一卡」。背景在滚动这 ~200ms 里
     //    冻结一下没人看得出来（动的本来就是图标），停下来立刻恢复实时。
+    // 有人正把窗口拖向环时同样冻结（`GLASS_FREEZE`）：换帧 = 盘面色层重采 7ms，
+    // 而这 7ms 正和用户在拖的那个窗口抢 CPU/GPU，此时背景根本没人看。
     let scrolling = (st.ring_off - st.ring_to).abs() > 0.002;
-    if st.glass && st.glass_live && !scrolling {
+    if st.glass && st.glass_live && !scrolling && !GLASS_FREEZE.load(Ordering::Relaxed) {
         if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
             if let Some(buf) = s.take() {
                 // ⚠️ 不要在这里 `moving = true`：OLE 拖放期间是故意停连续重绘的
@@ -11708,7 +12255,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     st.ring_off = 0.0;
     st.ring_to = 0.0;
     // 换次呼出 → UIA 探测结果作废（用户可能换了窗口/换了目录）
-    st.wincap_probed.clear();
+    st.wincap_failed.clear();
     st.land_app = usize::MAX;
     st.chip_anim = [0.0; MAX_ITEMS];
     st.chip_hot = [0.0; MAX_ITEMS];
@@ -12172,11 +12719,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             if MENU_OPEN.load(Ordering::Relaxed) && st.window_capture.is_some() {
                 unsafe {
                     let wc = st.window_capture.take().unwrap();
-                                let over = in_disc(
-                        st,
-                        CURSOR_X.load(Ordering::Relaxed),
-                        CURSOR_Y.load(Ordering::Relaxed),
-                    );
+                    let (cx, cy) = cursor_now();
+                    let over = in_disc(st, cx, cy);
                     if over {
                         capture_window(
                             st,
@@ -12185,6 +12729,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                             &wc.title,
                             &wc.relaunch,
                         );
+                        wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
                         st.commit_pulse = 1.0;
                         set_mood(st, 5);
                         st.mood_hold = now_s() + 1.5;
@@ -12196,6 +12741,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     println!("[wincap-test] drop over={} exe={}", over, wc.exe);
                 }
             }
+            LRESULT(0)
+        }
+        WM_APP_WINPROBE => {
+            // 后台 UIA 探到了文件夹路径 / 网址 → 回填刚落盘的那条窗口条目
+            let st = state_of(hwnd);
+            unsafe { wincap_apply_probe(st) };
             LRESULT(0)
         }
         WM_APP_CHAR => {
