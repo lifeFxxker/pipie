@@ -214,6 +214,8 @@ const WM_APP_HITTEST: u32 = WM_APP + 37;
 /// 后台 UIA 探测（文件夹路径 / 网址）跑完了 → UI 线程把结果回填进刚落盘的窗口条目。
 /// 只在**松手落盘那一次**起探测，所以这条消息一次拖动最多来一回。
 const WM_APP_WINPROBE: u32 = WM_APP + 38;
+/// 后台抓 `<title>` 跑完了 → **设置窗口**把新名字回填进那条网址条目（见 `title_fetch_start`）。
+const WM_APP_TITLE: u32 = WM_APP + 39;
 
 /// `loading.1` 用这个哨兵值表示「loading 挂在内环**应用本体**上」（图标位置），
 /// 而不是某个外环胶囊 —— 与 `commit_chip == usize::MAX`（内环提交）同一套约定。
@@ -279,6 +281,8 @@ const REVEAL_SECS: f64 = 2.0;
 /// ⚠️ 必须是**定时收**而不是"等下个气泡顶掉"：教学气泡会压住右上角那一块图标，
 /// 挂太久就变成遮挡（2026-10-14 出图后发现的，用户拍板 3.5 秒）。
 const ONB_SECS: f64 = 3.5;
+/// 「发现新版本」气泡的停留时长（和启动「亮个相」同一档：只是点个头，别赖着）。
+const UPD_BUB_SECS: f64 = 2.0;
 
 /// 越过移除线后，虚线环的旋转速度（度/秒）。90°/s ≈ 4 秒一圈：一秒正好移 6 格（15°/格），
 /// 慢到不刺眼、快到余光能跟住"它在转"。（再快就糊成闪烁噪声了）
@@ -440,6 +444,8 @@ const S_PENDING_RM: u32 = 1 << 12;
 const S_HAS_FOCUS_APP: u32 = 1 << 13;
 const S_HAS_HOVER_CHIP: u32 = 1 << 14;
 const S_HAS_HIT_APP: u32 = 1 << 15;
+const S_EXEMPT: u32 = 1 << 16;
+const S_TRIG_CAP: u32 = 1 << 17;
 
 /// 把全部跨线程关键状态打包成 24 位掩码。
 /// **为什么必须有它**：出问题时「鼠标点不动」可能源自任何一个原子量卡住
@@ -464,6 +470,10 @@ fn state_bits(hiding: bool, entering: bool, pending_rm: bool,
     if focus { b |= S_HAS_FOCUS_APP }
     if hover_chip { b |= S_HAS_HOVER_CHIP }
     if hit_app { b |= S_HAS_HIT_APP }
+    // 这两个不在 UI 私有状态里，是跨线程原子量，本线程直接读：
+    // 「有时按了没反应」的两个头号嫌疑人，之前日志里**一个位都没有**。
+    if EXEMPT.load(Ordering::Relaxed) { b |= S_EXEMPT }
+    if CAPTURE_TRIGGER.load(Ordering::Relaxed) { b |= S_TRIG_CAP }
     b
 }
 
@@ -523,7 +533,7 @@ fn diag_line(path: &str, s: &str) {
 /// 把状态掩码展开成 `MENU_OPEN|LB_DOWN` 这样的可读文本。
 /// 出事后翻日志，一眼能看出「哪个开关忘了复位」。
 fn state_str(b: u32) -> String {
-    const NAMES: [(u32, &str); 16] = [
+    const NAMES: [(u32, &str); 18] = [
         (S_MENU_OPEN, "MENU_OPEN"),
         (S_LOCKED, "LOCKED"),
         (S_DRAG_ACTIVE, "DRAG_ACTIVE"),
@@ -540,6 +550,8 @@ fn state_str(b: u32) -> String {
         (S_HAS_FOCUS_APP, "focus"),
         (S_HAS_HOVER_CHIP, "hover_chip"),
         (S_HAS_HIT_APP, "hit_app"),
+        (S_EXEMPT, "EXEMPT"),
+        (S_TRIG_CAP, "TRIG_CAPTURE"),
     ];
     let mut v = Vec::new();
     for (bit, name) in NAMES {
@@ -1008,6 +1020,11 @@ struct State {
     update_latest: String,
     /// 失败原因 / 提示文案（给人看）
     update_msg: String,
+    /// 后台检查发现「确实有更新」的那个版本号（ini `update_avail_ver`，空 = 没有）。
+    /// ⚠️ 必须落盘：提醒是在**下一次呼出轮盘**时才发生的，中间可能已经重启过。
+    update_avail_ver: String,
+    /// 已经用头像气泡提醒过的最新版本（ini `update_bub_ver`）—— 每个版本最多提醒一次就靠它
+    update_bub_ver: String,
 
     // ── 拖入引导（onboarding）四步阶梯（用户 2026-10-14 定稿）──
     // ①② 由「**真的做了那个动作**」置位 → 槽位是 self-clearing 的，不需要任何"已读"状态；
@@ -1040,6 +1057,15 @@ struct State {
     /// 应用页当前展开的应用（usize::MAX = 都没展开）
     set_expanded: usize,
     set_scroll: i32,
+    /// 应用页「＋ 网址」内联输入框：正在编辑哪个应用的条目列表（usize::MAX = 没在编辑）
+    set_edit_ai: usize,
+    /// 内联输入框的缓冲（UTF-8）；中文由 IME 合成后以 `WM_CHAR` / `WM_IME_CHAR` 追加
+    set_edit_buf: String,
+    /// 后台抓 `<title>` 进行中的网址：这些条目名先显示「正在取标题」
+    title_busy: Vec<String>,
+    /// 待确认的删除（`Ctl::AppDel` / `Ctl::ItemDel` / `Ctl::ExcDel` 之一；
+    /// `Ctl::None` = 没有卡）。存的就是「要删谁」，确认时照着它执行，不再反查坐标。
+    set_confirm: Ctl,
     // 设置窗口字体：固定 px，**不跟 K 缩放** —— 设置页是独立窗口，不该跟着环一起缩。
     // 字号 ×SS：文字是在 SS 倍的 DIB 上画的，降采样后才回到标称字号（同时拿到 AA）。
     sf_title: HFONT,
@@ -1218,6 +1244,8 @@ impl State {
             update_st: 0,
             update_latest: String::new(),
             update_msg: String::new(),
+            update_avail_ver: String::new(),
+            update_bub_ver: String::new(),
             onb_drag: false,
             onb_customized: false,
             onb_move: false,
@@ -1228,6 +1256,10 @@ impl State {
             set_tracking: false,
             set_expanded: usize::MAX,
             set_scroll: 0,
+            set_edit_ai: usize::MAX,
+            set_edit_buf: String::new(),
+            set_confirm: Ctl::None,
+            title_busy: Vec::new(),
             sf_title: HFONT(ptr::null_mut()),
             sf_h1: HFONT(ptr::null_mut()),
             sf_nav: HFONT(ptr::null_mut()),
@@ -4986,6 +5018,25 @@ fn onb_say(st: &mut State) {
     }
 }
 
+/// 后台检查发现新版本 → 下一次呼出轮盘时用头像气泡提醒**一次**。
+///
+/// 「每个版本最多提醒一次」靠 ini 的 `update_bub_ver` 记账：**说出口那一刻就落盘**，
+/// 所以哪怕这次没点、之后重启了，同一个版本也不会再提醒第二遍。
+/// ⚠️ 只在 `WM_APP_SHOW` 真实呼出后调（排在 `show_menu` 里的 `onb_say` 之后，
+///    教学气泡占着气泡位时不抢话）；放进 `show_menu` 会被启动「亮个相」那声 `say` 顶掉。
+fn update_say(st: &mut State) {
+    let v = st.update_avail_ver.clone();
+    if v.is_empty() || v == st.update_bub_ver || st.bub_until > now_s() {
+        return;
+    }
+    // 只报版本号，不带「去哪更新」那行小字（用户 2026-10-27：一行就够，别啰嗦）
+    say(st, &format!("发现新版本 v{v}"), "", UPD_BUB_SECS);
+    st.update_bub_ver = v.clone();
+    unsafe { save_settings(st) };
+    // 一行日志 = 这条提醒**真的说出口了**（回归靠它数次数：每个版本只能有一条）
+    println!("[upd] 头像气泡提醒 · 新版本 v{v}");
+}
+
 
 /// 把 `name=target` 插入 [app.<app>] 段（无段则建段）。成功返回 true。
 fn ini_insert_item(path: &str, app: &str, key: &str, value: &str) -> bool {
@@ -5617,10 +5668,7 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
         .unwrap_or(&exe)
         .to_ascii_lowercase();
     let is_explorer = base == "explorer.exe";
-    let is_browser = matches!(
-        base.as_str(),
-        "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
-    );
+    let is_browser = is_browser_exe(&base);
 
     // ── ① 先把预览摆出来（纯内存，<1ms）──
     // 这一步**绝不能等 UIA**：预览（ghost / suggest）是用户判断"拖进去会落在哪"的
@@ -5763,6 +5811,25 @@ static WINPROBE_BUSY: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::
 /// 同一扇窗探测失败后，多久之内不再重试
 const WINPROBE_FAIL_MS: u32 = 60_000;
 
+/// 浏览器内核 exe（`exe` 可以是全路径，也可以已经只剩文件名）
+fn is_browser_exe(exe: &str) -> bool {
+    let base = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(exe)
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
+    )
+}
+
+/// 这个「内环应用」的条目是不是**网址**：应用本身是浏览器，或者应用直接指向一个 URL。
+/// 决定设置页那颗入口是「＋ 网址」（内联输入框）还是「＋ 添加条目…」（系统文件框）。
+fn app_accepts_url(a: &AppEntry) -> bool {
+    is_url(&a.target) || is_browser_exe(&a.target)
+}
+
 /// 这条 exe 需不需要问 UIA（只有 explorer 文件夹窗口和浏览器窗口要）
 fn wincap_needs_probe(exe: &str) -> bool {
     let base = exe
@@ -5770,11 +5837,7 @@ fn wincap_needs_probe(exe: &str) -> bool {
         .next()
         .unwrap_or(exe)
         .to_ascii_lowercase();
-    base == "explorer.exe"
-        || matches!(
-            base.as_str(),
-            "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "firefox.exe"
-        )
+    base == "explorer.exe" || is_browser_exe(&base)
 }
 
 /// **落盘之后**才发起：后台线程问 UIA「这扇窗现在的路径 / 网址是什么」，
@@ -6073,11 +6136,15 @@ fn extract_title(html: &str) -> Option<String> {
         let gt = html[i..].find('>')?;
         let start = i + gt + 1;
         let end = low[start..].find("</title")?;
-        let t = norm_title(&html[start..start + end]);
-        if !t.is_empty() {
-            return Some(t);
+        // 只压空白、**保留原始大小写**：这个标题现在有两个用处 ——
+        // 比对标签页（`select_tab_by_title` 自己会 `norm_title` 转小写）和
+        // 当设置页条目名（「example domain」这种全小写很难看）。
+        let t = start + end;
+        let raw = html[start..t].split_whitespace().collect::<Vec<_>>().join(" ");
+        if !raw.is_empty() {
+            return Some(raw);
         }
-        from = start + end + 8;
+        from = t + 8;
     }
     None
 }
@@ -6678,26 +6745,50 @@ unsafe fn fg_proc_name() -> String {
     }
 }
 
-/// 前台窗口是否占满它所在的整个显示器（= 全屏：游戏 / 视频 / 远程桌面…）
-unsafe fn fg_fullscreen() -> bool {
+/// Windows 外壳窗口 = **桌面本身**（`Progman` / 桌面幻灯片 `WorkerW`）和任务栏。
+///
+/// ⚠️ 为什么例外名单判定必须把它们摘出去（issue #1，2026-10-27 定位）：
+/// 桌面窗口的矩形**正好铺满整个显示器**（实测 1920×1080 的机器上
+/// `Progman` = `(0,0,1920,1080)`），于是「前台窗口矩形盖满显示器」这条全屏判据
+/// 对桌面恒为真 → `EXEMPT` → 呼出键被原样放行 → **盘子再也调不出来**。
+/// 现场就是用户报的：「浏览器里中键呼出，点右下角“显示桌面”，之后中键无效，
+/// 非得进一次设置界面才恢复」—— 进设置界面之所以有效，是因为前台换成了
+/// 我们自己的窗口（`fg_proc_name` 对本进程返回空串 → 不例外）。
+unsafe fn is_shell_wnd(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    matches!(
+        window_class(hwnd).as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    )
+}
+
+/// 窗口矩形是否**完全盖住**它所在的整个显示器（= 真全屏 / 无边框窗口化游戏）
+unsafe fn window_covers_monitor(hwnd: HWND) -> bool {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    let fg = GetForegroundWindow();
-    if fg.0.is_null() {
-        return false;
-    }
     let mut r = RECT::default();
-    if GetWindowRect(fg, &mut r).is_err() {
+    if GetWindowRect(hwnd, &mut r).is_err() {
         return false;
     }
     let mut mi = MONITORINFO::default();
     mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    if !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
         return false;
     }
     let m = mi.rcMonitor;
     r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+}
+
+/// 前台窗口是不是「全屏」（游戏 / 视频 / 远程桌面…）
+unsafe fn fg_fullscreen() -> bool {
+    let fg = GetForegroundWindow();
+    if fg.is_invalid() || !IsWindowVisible(fg).as_bool() || is_shell_wnd(fg) {
+        return false;
+    }
+    window_covers_monitor(fg)
 }
 
 /// 刷新 `EXEMPT`。⚠️ 只能由 **UI 线程**定时调（见该静态量的注释）。
@@ -6711,8 +6802,11 @@ unsafe fn update_exempt(st: &State) {
         } else if st.exc_mode == 1 {
             // 白名单模式：**不在**白名单里的才放行。
             // ⚠️ 空表时必须判成「不例外」，否则启动器永远不工作。
+            // ⚠️ 桌面/任务栏也不算「应用」：白名单下前台是桌面时必须照样能呼出，
+            //    否则「回到桌面」就把启动器钉死了（和 issue #1 同一个坑，另一条路）。
+            //    黑名单**不**走这个后门 —— 用户把 `explorer.exe` 拉黑是有意的。
             let w = st.exc_w.iter().any(|e| e == &n);
-            !st.exc_w.is_empty() && !w
+            !st.exc_w.is_empty() && !w && !is_shell_wnd(GetForegroundWindow())
         } else {
             // 黑名单模式：在名单里的放行
             st.exc.iter().any(|e| e == &n)
@@ -7541,6 +7635,10 @@ unsafe fn dump_all(dir: &str) {
         say(&mut st, "已添加：Visual Studio Code", "拖进来就能用，右键可改", 99.0);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_add.bmp", dir), &buf, CANVAS, CANVAS);
+        // 2d-2) 气泡：发现新版本（用户 2026-10-27 要头像提醒）—— 文案必须和 `update_say` 一致
+        say(&mut st, "发现新版本 v1.0.7", "", 99.0);
+        let buf = draw_to_buf(&mut st);
+        save_bmp(&format!("{}\\dump_bub_update.bmp", dir), &buf, CANVAS, CANVAS);
         // 2e) 气泡：短消息（验证「按文字量收缩」而不是一律撑满）
         say(&mut st, "已移除：终端", "", 99.0);
         let buf = draw_to_buf(&mut st);
@@ -8346,6 +8444,10 @@ unsafe fn read_persistent(st: &mut State) {
                 st.update_auto = v != "0";
             } else if let Some(v) = get("update_last_check=") {
                 st.update_last_check = v.parse::<f64>().unwrap_or(0.0);
+            } else if let Some(v) = get("update_avail_ver=") {
+                st.update_avail_ver = v;
+            } else if let Some(v) = get("update_bub_ver=") {
+                st.update_bub_ver = v;
             }
         }
     }
@@ -12503,6 +12605,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     y = p.y;
                 }
                 show_menu(st, x, y);
+                // 有新版本 → 借这一次**真实呼出**提醒一次（每个版本最多一次）。
+                // ⚠️ 不放进 `show_menu`：启动那次「亮个相」也走 `show_menu`，
+                //    它紧接着的 `say(REVEAL_MSG)` 会把提醒顶掉，可账已经记了 —— 白丢一次。
+                update_say(st);
             }
             LRESULT(0)
         }
@@ -13004,13 +13110,26 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             let ex = EXEMPT.load(Ordering::Relaxed);
             let (fg, fs) = unsafe { (fg_proc_name(), fg_fullscreen()) };
+            // `progman_*` = **不用真的把桌面切到前台**也能验这条判据（issue #1 回归）：
+            // 桌面矩形盖满整屏（geo=1）正是它被误判成全屏的原因，`is_shell_wnd` 是摘掉它的那一刀。
+            // 期望值：`progman_geo=1 progman_shell=1 progman_fs=0`。
+            let pm = match unsafe { FindWindowW(PCWSTR(wide("Progman").as_ptr()), PCWSTR::null()) }
+            {
+                Ok(h) => h,
+                Err(_) => HWND(ptr::null_mut()),
+            };
+            let (geo, shell) = unsafe { (window_covers_monitor(pm), is_shell_wnd(pm)) };
             println!(
-                "[exemsim] fg={:?} fullscreen={} black={} white={} exempt={}",
+                "[exemsim] fg={:?} fullscreen={} black={} white={} exempt={} progman_geo={} progman_shell={} progman_fs={} mode={}",
                 fg,
                 fs as u8,
                 st.exc.len(),
                 st.exc_w.len(),
-                ex as u8
+                ex as u8,
+                geo as u8,
+                shell as u8,
+                (geo && !shell) as u8,
+                st.exc_mode
             );
             LRESULT(0)
         }
@@ -13030,6 +13149,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 st.update_st = s;
                 st.update_latest = latest;
                 st.update_msg = msg;
+                // s=3「有新版本」→ 把版本号记到 ini：提醒要等**下一次呼出**才发生，
+                // 中间进程可能已经重启过，不落盘这条提醒就会丢。
+                if s == 3 && st.update_avail_ver != st.update_latest {
+                    st.update_avail_ver = st.update_latest.clone();
+                    unsafe { save_settings(st) };
+                }
             }
             unsafe { kick_setup_frame(st) };
             LRESULT(0)
@@ -13291,6 +13416,19 @@ WM_APP_DISMISS_FG => {
                         trim_working_set();
                     }
                 }
+                // 在线升级的**周期**检查也挂这条定时器：常驻进程可能十天不重启，
+                // 只在启动时查一次就永远等不到发版（用户 2026-10-27 要「可以每天检查」）。
+                // ⚠️ 三道闸缺一不可：`update_st == 1` = 已经有一发在跑（别叠）；
+                //    `MENU_OPEN`/`hiding` = 正呼出 / 正淡出时绝不插队
+                //    （`start_update_check` 要在 UI 线程同步写一次 ini）。
+                if st.update_auto
+                    && st.update_st != 1
+                    && !MENU_OPEN.load(Ordering::Relaxed)
+                    && !st.hiding
+                    && unix_now() - st.update_last_check >= update_min_interval()
+                {
+                    start_update_check(st, false);
+                }
             }
             LRESULT(0)
         }
@@ -13470,7 +13608,14 @@ enum Ctl {
     AppDel(usize),
     ItemDel(usize, usize),
     AddApp,
-    AddItem(usize),
+    /// 删除确认小卡上的两颗按钮（自绘模态；点 ✕ 不再直接删 —— 用户 2026-10-27）
+    ConfYes,
+    ConfNo,
+    /// 条目行末尾的入口胶囊：`0` = 选文件，`1` = 选文件夹。
+    /// ⚠️ 必须是**两颗** —— 原生对话框里「选文件」和「选文件夹」是两种模式
+    ///    （`FOS_PICKFOLDERS` 一开，文件就变灰不可选），没有「两个都能选」的现代对话框。
+    ///    用户 2026-10-27：「文件夹应该是能添加目录的而不是只能添加文件」。
+    AddItem(usize, u8),
     /// 交互页行为区的「开机自启」（状态 = `st.autostart`，同步到注册表）
     Autostart,
     /// 标题栏「查看引导」入口（重播聚光灯引导）
@@ -13728,6 +13873,131 @@ fn s_nav_rect(i: usize) -> RECT {
 
 fn s_row_rect(y: i32, h: i32) -> RECT {
     RECT { left: S_X0, top: y, right: S_X1, bottom: y + h - 6 }
+}
+
+/// 条目行、「＋ 网址」小胶囊、内联输入框的左边界 —— 三者必须同一列
+const S_ADD_X: i32 = S_X0 + 26;
+/// 小胶囊/输入框的高度（比 32 的行高矮一截，上下各留 4px 才不像一整行）
+const S_PILL_H: i32 = 24;
+
+/// 条目行末尾有哪几颗入口胶囊 —— 浏览器只要「＋ 网址」，其它应用「文件 / 文件夹」都要。
+/// 顺序即 `Ctl::AddItem` 的 mode，绘制与命中都按它走。
+fn add_pill_labels(web: bool) -> &'static [&'static str] {
+    if web {
+        &["＋ 网址"]
+    } else {
+        &["＋ 文件", "＋ 文件夹"]
+    }
+}
+
+/// 第 `m` 颗小胶囊的矩形：从 `S_ADD_X` 起按文字宽度依次排开，颗间留 8px。
+/// 绘制和命中都走这里（量宽要个 DC，命中那边传 `st.txt_dc`），
+/// 否则 hover 高亮会圈在画出来的框外面。
+unsafe fn s_add_pill(dc: HDC, st: &State, ry: i32, web: bool, m: usize) -> RECT {
+    let ls = add_pill_labels(web);
+    let mut x = S_ADD_X;
+    for k in 0..m.min(ls.len()) {
+        x += s_text_w(dc, ls[k], st.sf_small) + 20 + 8;
+    }
+    let w = s_text_w(dc, ls.get(m).copied().unwrap_or(""), st.sf_small) + 20;
+    RECT { left: x, top: ry + 4, right: x + w, bottom: ry + 4 + S_PILL_H }
+}
+
+/// 内联输入框：点中小胶囊之后就位，宽度放开到整个内容区（网址比按钮长得多）
+fn s_add_input(ry: i32) -> RECT {
+    RECT { left: S_ADD_X, top: ry + 4, right: S_X1, bottom: ry + 4 + S_PILL_H }
+}
+
+// ── 删除确认小卡（自绘模态，画在内容区正中）──
+
+const S_CONF_W: i32 = 340;
+const S_CONF_H: i32 = 116;
+
+/// 卡片本体：在**内容区**（侧栏右边那块）水平居中、垂直偏上 40%
+fn s_conf_rect() -> RECT {
+    let l = S_NAV_W + ((S_W - S_NAV_W - S_CONF_W) / 2).max(8);
+    let t = (S_H * 2 / 5 - S_CONF_H / 2).max(S_TITLE_H + 12);
+    RECT { left: l, top: t, right: l + S_CONF_W, bottom: t + S_CONF_H }
+}
+
+/// 卡开着 = 模态：整块画布压暗一档，让卡从页面里「浮」出来。
+/// GDI 没有半透明填充，但分层窗口的像素就是我们自己的 DIB —— 直接按位乘，
+/// 和聚光灯引导用的是同一招（见 `guide_draw`）。
+/// ⚠️ 必须在**降采样之前**调用（否则圆角和文字的抗锯齿会被这趟遍历毁掉）；
+///    卡本体是在这之后才画的不透明实心，所以整块压暗不会伤到它。
+unsafe fn conf_dim(st: &State) {
+    if st.s_hi_bits.is_null() {
+        return;
+    }
+    let mut lut = [0u8; 256];
+    for v in 0..256usize {
+        lut[v] = (v * 45 / 100) as u8;
+    }
+    let w = (S_WW * SS) as usize;
+    let h = (S_HH * SS) as usize;
+    let bits = st.s_hi_bits;
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let o = (row + x) * 4;
+            // BGRA：只压 RGB，alpha 不动（窗口圆角外的透明边界得留着）
+            *bits.add(o) = lut[*bits.add(o) as usize];
+            *bits.add(o + 1) = lut[*bits.add(o + 1) as usize];
+            *bits.add(o + 2) = lut[*bits.add(o + 2) as usize];
+        }
+    }
+}
+
+/// 卡里那颗按钮（`0` = 右边那颗「取消」，`1` = 左边那颗「删除」；`i` 越大越往左）
+fn s_conf_btn(r: RECT, i: usize) -> RECT {
+    let bw = 88;
+    let right = r.right - 16 - (i as i32) * (bw + 8);
+    RECT { left: right - bw, top: r.bottom - 16 - S_PILL_H, right, bottom: r.bottom - 16 }
+}
+
+/// 待删对象的一句话（卡片标题下那行小字）
+fn s_conf_text(st: &State) -> (String, String) {
+    let idx = |i: usize, n: usize| i < n;
+    match st.set_confirm {
+        Ctl::AppDel(ai) => {
+            if idx(ai, st.apps.len()) {
+                let a = &st.apps[ai];
+                (
+                    format!("删除应用「{}」？", a.name),
+                    if a.items.is_empty() {
+                        "它不会出现在内环了。".to_string()
+                    } else {
+                        format!("连同外环 {} 条条目一起删除。", a.items.len())
+                    },
+                )
+            } else {
+                ("删除应用？".to_string(), String::new())
+            }
+        }
+        Ctl::ItemDel(ai, ii) => {
+            let name = if idx(ai, st.apps.len()) && idx(ii, st.apps[ai].items.len()) {
+                Some(st.apps[ai].items[ii].name.clone())
+            } else {
+                None
+            };
+            (
+                match name {
+                    Some(n) => format!("删除条目「{}」？", n),
+                    None => "删除条目？".to_string(),
+                },
+                "只删这一条，应用还在。".to_string(),
+            )
+        }
+        Ctl::ExcDel(c, i) => {
+            let bucket = if c == 0 { &st.exc } else { &st.exc_w };
+            let name = bucket.get(i).cloned().unwrap_or_default();
+            (
+                format!("从{}单里移除「{}」？", if c == 0 { "黑" } else { "白" }, name),
+                "这个程序以后按上面的模式处理。".to_string(),
+            )
+        }
+        _ => (String::new(), String::new()),
+    }
 }
 
 /// 内容区里从左到右排一排等宽控件
@@ -14378,6 +14648,49 @@ unsafe fn settings_draw(st: &mut State, dc: HDC) {
         }
     }
 
+    // ── 删除确认小卡：画在最后（要盖住列表和 tooltip）──
+    if st.set_confirm != Ctl::None {
+        let r = s_conf_rect();
+        let (t1, t2) = s_conf_text(st);
+        conf_dim(st);
+        g_shadow(dc, r, 14, &pal);
+        g_rrect(dc, r, 14, mixc(pal.paper, pal.ink, 0.04), Some(pal.edge), 2);
+        g_text(
+            dc,
+            &t1,
+            RECT { left: r.left + 18, top: r.top + 16, right: r.right - 18, bottom: r.top + 40 },
+            pal.ink,
+            st.sf_body,
+            false,
+        );
+        if !t2.is_empty() {
+            g_text(
+                dc,
+                &t2,
+                RECT { left: r.left + 18, top: r.top + 44, right: r.right - 18, bottom: r.top + 64 },
+                mixc(pal.paper, pal.ink, 0.5),
+                st.sf_small,
+                false,
+            );
+        }
+        for (i, label) in ["取消", "删除"].iter().enumerate() {
+            let br = s_conf_btn(r, i);
+            let ctl = if i == 0 { Ctl::ConfNo } else { Ctl::ConfYes };
+            let hv = hov(st, ctl);
+            if i == 1 {
+                // 危险动作：实底红，hover 再深一档
+                let base = mixc((198, 74, 74), pal.ink, 0.12 * hv);
+                g_rrect(dc, br, S_PILL_H / 2, base, None, 0);
+                g_text(dc, label, br, mixc(pal.paper, (255, 255, 255), 0.6 + 0.4 * hv),
+                    st.sf_small, true);
+            } else {
+                g_rrect(dc, br, S_PILL_H / 2, mixc(pal.paper, pal.ink, 0.06 * hv),
+                    Some(mixc(pal.edge, pal.ink, 0.25 + 0.5 * hv)), 2);
+                g_text(dc, label, br, mixc(pal.paper, pal.ink, 0.6 + 0.3 * hv), st.sf_small, true);
+            }
+        }
+    }
+
     // 卡片外框**最后画**：它是描边不填充，既不会被内容盖住，也不会盖住内容
     // （卡片外那圈靠 alpha 裁掉，所以这里的直角矩形也不用倒角）
     g_rrect_stroke(dc, full, CARD_RAD, pal.ink, 2);
@@ -14634,11 +14947,47 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
         let del_ctl = if head { Ctl::AppDel(row.ai) } else { Ctl::ItemDel(row.ai, row.ii) };
 
         if row.kind == 2 {
-            let ahv = hov(st, Ctl::AddItem(row.ai));
-            g_rrect(dc, r, 9, mixc(pal.paper, pal.ink, 0.06 * ahv),
-                Some(mixc(mixc(pal.paper, pal.ink, 0.14), pal.edge, ahv)), 2);
-            g_text(dc, "＋ 添加条目…", r, mixc(mixc(pal.paper, pal.ink, 0.55), pal.ink, ahv),
-                st.sf_small, false);
+            let web = app_accepts_url(&st.apps[row.ai]);
+            let editing = st.set_edit_ai == row.ai;
+            let r2 = if editing {
+                s_add_input(ry)
+            } else {
+                s_add_pill(dc, st, ry, web, 0)
+            };
+            if editing {
+                let fg = mixc(pal.paper, pal.ink, 0.85);
+                g_rrect(dc, r2, 8, mixc(pal.paper, pal.ink, 0.05),
+                    Some(mixc(pal.paper, pal.ink, 0.5)), 2);
+                let buf = st.set_edit_buf.clone();
+                let tr = RECT { left: r2.left + 10, top: r2.top, right: r2.right - 10, bottom: r2.bottom };
+                if buf.is_empty() {
+                    g_text(dc, "输入网址，回车添加", tr,
+                        mixc(pal.paper, pal.ink, 0.35), st.sf_small, false);
+                } else {
+                    g_text(dc, &buf, tr, pal.ink, st.sf_small, false);
+                }
+                // 光标：0.5s 方波闪烁，画在文字末尾（相位必须按当前时间算，见环上同名逻辑）
+                if (now_s() * 2.0).fract() < 0.5 {
+                    let tw = if buf.is_empty() {
+                        0
+                    } else {
+                        s_text_w(dc, &buf, st.sf_small)
+                    };
+                    let cx = (tr.left + tw).min(r2.right - 12);
+                    g_rrect(dc, RECT { left: cx + 1, top: r2.top + 6, right: cx + 2, bottom: r2.bottom - 6 },
+                        0, fg, None, 0);
+                }
+            } else {
+                // 一颗一画（非浏览器有两颗：文件 / 文件夹）
+                for (m, label) in add_pill_labels(web).iter().enumerate() {
+                    let pr = s_add_pill(dc, st, ry, web, m);
+                    let ahv = hov(st, Ctl::AddItem(row.ai, m as u8));
+                    g_rrect(dc, pr, S_PILL_H / 2, mixc(pal.paper, pal.ink, 0.06 * ahv),
+                        Some(mixc(mixc(pal.paper, pal.ink, 0.14), pal.edge, ahv)), 2);
+                    g_text(dc, label, pr,
+                        mixc(mixc(pal.paper, pal.ink, 0.55), pal.ink, ahv), st.sf_small, true);
+                }
+            }
             continue;
         }
 
@@ -14660,18 +15009,19 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
         let tx = r.left + 12;
         let nm_r = RECT { left: tx, top: r.top, right: tx + 170, bottom: r.bottom };
         let tg_r = RECT { left: tx + 176, top: r.top, right: r.right - 52, bottom: r.bottom };
-        g_text(dc, name, nm_r,
-            if head { pal.ink } else { mixc(pal.paper, pal.ink, 0.75) },
-            if head { st.sf_body } else { st.sf_small }, false);
+        // 后台还在抓这个网址的 `<title>` → 名字先显示跳动的点（标题回来就换成真名）
+        let waiting = !head && st.title_busy.iter().any(|u| u.as_str() == target.as_str());
+        if waiting {
+            let dots = ".".repeat(((now_s() * 2.0) as usize) % 3 + 1);
+            g_text(dc, &format!("正在取标题{dots}"), nm_r,
+                mixc(pal.paper, pal.ink, 0.45), st.sf_small, false);
+        } else {
+            g_text(dc, name, nm_r,
+                if head { pal.ink } else { mixc(pal.paper, pal.ink, 0.75) },
+                if head { st.sf_body } else { st.sf_small }, false);
+        }
         g_text(dc, &target, tg_r, mixc(pal.paper, pal.ink, 0.45), st.sf_small, false);
 
-        if head {
-            let n = st.apps[row.ai].items.len();
-            let cr = RECT { left: r.right - 92, top: r.top + 10, right: r.right - 44, bottom: r.top + 32 };
-            let pill = format!("{} 条", n);
-            g_rrect(dc, cr, 11, pal.paper, Some(pal.edge), 2);
-            g_text(dc, &pill, cr, mixc(pal.paper, pal.ink, 0.75), st.sf_small, true);
-        }
         let dhv = hov(st, del_ctl);
         if dhv > 0.01 {
             g_rrect(dc, del, 8, mixc(pal.paper, pal.ink, dhv), None, 0);
@@ -14922,6 +15272,18 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
     if st.guide_step >= 0 {
         return Ctl::None;
     }
+    // 删除确认卡开着 = 模态：只认卡上那两颗按钮，卡外一律 `None`
+    // （点卡外由 `s_click` 解释成「取消」；这里返回 None 才不会让「取消」到处发亮）
+    if st.set_confirm != Ctl::None {
+        let r = s_conf_rect();
+        if in_rect(s_conf_btn(r, 0), x, y) {
+            return Ctl::ConfNo;
+        }
+        if in_rect(s_conf_btn(r, 1), x, y) {
+            return Ctl::ConfYes;
+        }
+        return Ctl::None;
+    }
     if x >= S_W - 50 && y < S_TITLE_H && x >= S_W - 46 - 6 {
         return Ctl::Close;
     }
@@ -15010,6 +15372,22 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             let (rows, _) = s_rows(st);
             for row in &rows {
                 let ry = S_LIST_TOP - scroll + row.y;
+                if row.kind == 2 {
+                    // 只有胶囊本身可点（编辑中是那条输入框），整行不算命中
+                    if st.set_edit_ai == row.ai {
+                        if in_rect(s_add_input(ry), x, y) {
+                            return Ctl::AddItem(row.ai, 0);
+                        }
+                        continue;
+                    }
+                    let web = app_accepts_url(&st.apps[row.ai]);
+                    for m in 0..add_pill_labels(web).len() {
+                        if in_rect(unsafe { s_add_pill(st.txt_dc, st, ry, web, m) }, x, y) {
+                            return Ctl::AddItem(row.ai, m as u8);
+                        }
+                    }
+                    continue;
+                }
                 let r = if row.kind == 0 {
                     s_row_rect(ry, row.h)
                 } else {
@@ -15027,14 +15405,13 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
                             Ctl::AppHead(row.ai)
                         }
                     }
-                    1 => {
+                    _ => {
                         if in_rect(del, x, y) {
                             Ctl::ItemDel(row.ai, row.ii)
                         } else {
                             Ctl::None
                         }
                     }
-                    _ => Ctl::AddItem(row.ai),
                 };
             }
         }
@@ -15067,6 +15444,11 @@ unsafe fn open_settings(st: &mut State) {
     let _ = SetWindowPos(hwnd, None, st.set_x, st.set_y, S_WW, S_HH, SWP_NOZORDER);
     st.set_hover = Ctl::None;
     st.set_hover_prev = Ctl::None;
+    // 关窗时没收回的输入框：重开不该停在「打字打到一半」的脏状态
+    st.set_edit_ai = usize::MAX;
+    st.set_edit_buf.clear();
+    // 确认卡同理：卡存的是**下标**，重开时列表可能已经变了（拖放/热重载都会动它）
+    st.set_confirm = Ctl::None;
     // 首启引导：**只在没看过时自动播一次**（`guide_seen` 落 ini，跳过了也不再弹）；
     // 想重看就点标题栏的「查看引导」。
     // `guide_start` 内部会切到交互页 —— 4 步高亮的都是交互页的控件。
@@ -15103,10 +15485,245 @@ unsafe fn cancel_trig_capture() {
     CAPTURE_TRIGGER.store(false, Ordering::SeqCst);
 }
 
+// ── 应用页「＋ 网址」：内联输入框 + 后台抓标题改名 ──
+
+/// 后台抓 `<title>` 的回信信箱：`(网址, 标题)`（None = 没抓到，条目留着域名当名字）
+static TITLE_TX: std::sync::Mutex<Vec<(String, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+
+/// 输入框里的东西 → 可点击的网址。没写协议就补 `https://`；
+/// 一眼就不像网址（连点都没有，例如「百度」）就返回空串，**不添加**、留在输入框里让用户改。
+fn normalize_url(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let l = s.to_ascii_lowercase();
+    if l.starts_with("http://") || l.starts_with("https://") || l.starts_with("file:///") {
+        return s.to_string();
+    }
+    let host = s.split('/').next().unwrap_or(s);
+    if !host.contains('.') && !l.starts_with("localhost") {
+        return String::new();
+    }
+    format!("https://{s}")
+}
+
+/// 剪贴板的纯文本（内联输入框按 Ctrl+V 用）。只认 `CF_UNICODETEXT`，最多 2048 字符。
+unsafe fn clip_text() -> Option<String> {
+    if OpenClipboard(HWND(ptr::null_mut())).is_err() {
+        return None;
+    }
+    let mut out: Option<String> = None;
+    if let Ok(h) = GetClipboardData(13) {
+        let hg = HGLOBAL(h.0);
+        let p = GlobalLock(hg);
+        if !p.is_null() {
+            let ws = p as *const u16;
+            let mut len = 0usize;
+            while *ws.add(len) != 0 && len < 2048 {
+                len += 1;
+            }
+            out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(ws, len)));
+            let _ = GlobalUnlock(hg);
+        }
+    }
+    let _ = CloseClipboard();
+    out.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 起后台线程抓这个网址的标题（复用「已打开就切到那个标签」那套 `fetch_page_title`
+/// + `SWITCH_CACHE`）。⚠️ 1.2 秒超时只是**下限**，慢站能在后台挂好几秒 ——
+/// 同步跑在 UI 线程上就是「按了回车整页钉住」，所以一律走线程 + `WM_APP_TITLE` 回信。
+unsafe fn title_fetch_start(st: &mut State, url: &str) {
+    if let Some(t) = cache_get(url) {
+        apply_title(st, url, Some(&t));
+        return;
+    }
+    if st.title_busy.iter().any(|u| u == url) {
+        return;
+    }
+    st.title_busy.push(url.to_string());
+    let u = url.to_string();
+    std::thread::spawn(move || unsafe {
+        // 单次 1.2s 超时经常空手（实测 example.org 连跑 6 次有 2 次没抓到）——
+        // 这条线程不阻塞任何人，再给一次机会。
+        let mut got = fetch_page_title(&u);
+        if got.is_none() {
+            got = fetch_page_title(&u);
+        }
+        let got = got.map(|t| {
+            cache_put(&u, &t);
+            t
+        });
+        if let Ok(mut b) = TITLE_TX.lock() {
+            b.push((u, got));
+        }
+        let h = SET_HWND.load(Ordering::SeqCst);
+        if h != 0 {
+            let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_TITLE, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// 把抓到的标题写进那条网址条目（按 `target` 找，不按下标 —— 等待期间用户可能
+/// 又加/删了条目，下标会漂）。抓不到就留着原来的域名名。
+unsafe fn apply_title(st: &mut State, url: &str, title: Option<&str>) {
+    st.title_busy.retain(|u| u != url);
+    let Some(t) = title else { return };
+    let name = clamp_name(t);
+    if name.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    for a in st.apps.iter_mut() {
+        for it in a.items.iter_mut() {
+            if it.kind == 0 && it.target == url && it.name != name {
+                it.name = name.clone();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_settings(st);
+    }
+}
+
+/// 收信：把后台抓到的标题一律应用掉（设置窗口可能已经关了 → 消息根本不会进来）
+unsafe fn title_apply_pending(st: &mut State) {
+    let got = match TITLE_TX.lock() {
+        Ok(mut t) if !t.is_empty() => std::mem::take(&mut *t),
+        _ => return,
+    };
+    for (url, title) in got {
+        apply_title(st, &url, title.as_deref());
+    }
+}
+
+/// 打开/保持应用页的内联网址输入框（只有浏览器类应用有这一态）
+fn set_edit_begin(st: &mut State, ai: usize) {
+    if st.set_edit_ai != ai {
+        st.set_edit_ai = ai;
+        st.set_edit_buf.clear();
+    }
+}
+
+/// 退出输入框。`commit` = 按回车的语义：缓冲能规整成网址就加一条，否则**不收**——
+/// 留在框里让用户接着改（打错字按回车不该悄悄丢内容）。
+/// `commit=false`（Esc / 点到别处）= 直接收回并丢掉缓冲。
+unsafe fn set_edit_finish(st: &mut State, commit: bool) {
+    let ai = st.set_edit_ai;
+    if ai == usize::MAX {
+        return;
+    }
+    if !commit {
+        st.set_edit_ai = usize::MAX;
+        st.set_edit_buf.clear();
+        setup_present(st);
+        return;
+    }
+    let url = normalize_url(&st.set_edit_buf);
+    if url.is_empty() {
+        setup_present(st);
+        return;
+    }
+    st.set_edit_ai = usize::MAX;
+    st.set_edit_buf.clear();
+    add_url_item(st, ai, &url);
+    setup_present(st);
+}
+
+/// 加一条网址条目：名字先用缓存标题或域名顶着，剩下的交给 `title_fetch_start`
+unsafe fn add_url_item(st: &mut State, ai: usize, url: &str) {
+    let Some(app) = st.apps.get(ai) else { return };
+    if app.items.iter().any(|x| x.kind == 0 && x.target == url) {
+        return; // 同一个网址不加第二遍
+    }
+    let base = cache_get(url)
+        .map(|t| clamp_name(&t))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| url_host_name(url));
+    let name = unique_item_name(st, ai, &base);
+    st.apps[ai].items.push(ItemEntry {
+        name,
+        target: url.to_string(),
+        color: None,
+        icon: None,
+        kind: 0,
+        relaunch: String::new(),
+        live_hwnd: 0,
+    });
+    if st.apps[ai].items.len() > MAX_ITEMS {
+        st.apps[ai].items.truncate(MAX_ITEMS);
+    }
+    save_settings(st);
+    title_fetch_start(st, url);
+}
+
+/// 确认卡上按「删除」之后真正执行的那一步。
+///
+/// ⚠️ 调用前必须**先把卡收掉**（`st.set_confirm = Ctl::None`）：
+/// 删完下标全体左移，卡还挂着旧下标就会指着另一行。
+unsafe fn s_do_del(st: &mut State, t: Ctl) {
+    match t {
+        Ctl::AppDel(ai) => {
+            if ai >= st.apps.len() {
+                return;
+            }
+            // 删的是应用本身 → 内联网址输入框（按应用下标定身）必须一起收掉，
+            // 不然下标全体左移，输入框会「隐形」挂在另一个应用上。
+            st.set_edit_ai = usize::MAX;
+            st.set_edit_buf.clear();
+            st.apps.remove(ai);
+            if st.set_expanded == ai {
+                st.set_expanded = usize::MAX;
+            }
+            st.active_app = None;
+            save_settings(st);
+            load_icons(st);
+        }
+        Ctl::ItemDel(ai, ii) => {
+            if ai < st.apps.len() && ii < st.apps[ai].items.len() {
+                st.apps[ai].items.remove(ii);
+                save_settings(st);
+            }
+        }
+        Ctl::ExcDel(c, i) => {
+            let bucket = if c == 0 { &mut st.exc } else { &mut st.exc_w };
+            if i < bucket.len() {
+                bucket.remove(i);
+                save_settings(st);
+            }
+        }
+        _ => {}
+    }
+}
+
 unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
     let c = s_hit(st, x, y);
+    // ── 删除确认卡开着 = 模态：这一击只用来处理卡，别的控件一律不响应 ──
+    if st.set_confirm != Ctl::None {
+        if c == Ctl::ConfYes {
+            let t = st.set_confirm;
+            st.set_confirm = Ctl::None;
+            s_do_del(st, t);
+        } else {
+            st.set_confirm = Ctl::None; // 「取消」和「点卡外」同一个意思
+        }
+        setup_present(st);
+        setup_kick(st, hwnd);
+        return;
+    }
+    // 输入框开着又点了别的地方 → 先收回（缓冲按「放弃」处理，不悄悄加半条网址）。
+    // 例外：点的还是**自己那颗胶囊/输入框**，要保持编辑态。
+    if st.set_edit_ai != usize::MAX
+        && !matches!(c, Ctl::AddItem(i, _) if i == st.set_edit_ai)
+    {
+        set_edit_finish(st, false);
+    }
     match c {
         Ctl::None => {}
+        // 确认卡的按钮在上面的模态分支里已经消费完了，走到这里说明不该再有事发生。
+        Ctl::ConfYes | Ctl::ConfNo => {}
         Ctl::Close => {
             cancel_trig_capture();
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -15236,21 +15853,15 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             st.set_expanded = if st.set_expanded == ai { usize::MAX } else { ai };
             st.set_scroll = st.set_scroll.min(s_scroll_max(st));
         }
+        // 点 ✕ **不直接删** —— 先弹自绘确认卡（用户 2026-10-27），真删在 `s_do_del`
         Ctl::AppDel(ai) => {
             if ai < st.apps.len() {
-                st.apps.remove(ai);
-                if st.set_expanded == ai {
-                    st.set_expanded = usize::MAX;
-                }
-                st.active_app = None;
-                save_settings(st);
-                load_icons(st);
+                st.set_confirm = c;
             }
         }
         Ctl::ItemDel(ai, ii) => {
             if ai < st.apps.len() && ii < st.apps[ai].items.len() {
-                st.apps[ai].items.remove(ii);
-                save_settings(st);
+                st.set_confirm = c;
             }
         }
         Ctl::AddApp => {
@@ -15274,11 +15885,10 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             st.exc_mode = c;
             save_settings(st);
         }
-        Ctl::ExcDel(c, i) => {
-            let bucket = if c == 0 { &mut st.exc } else { &mut st.exc_w };
-            if i < bucket.len() {
-                bucket.remove(i);
-                save_settings(st);
+        Ctl::ExcDel(cc, i) => {
+            let n = if cc == 0 { st.exc.len() } else { st.exc_w.len() };
+            if i < n {
+                st.set_confirm = c;
             }
         }
         Ctl::ExcPlus(c) => {
@@ -15293,9 +15903,12 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             }
         }
 
-        Ctl::AddItem(ai) => {
+        Ctl::AddItem(ai, m) => {
             if ai < st.apps.len() {
-                if let Some(p) = pick_file() {
+                if app_accepts_url(&st.apps[ai]) {
+                    // 浏览器（或应用本身就是个网址）→ 条目是网址，就地开内联输入框
+                    set_edit_begin(st, ai);
+                } else if let Some(p) = if m == 1 { pick_folder() } else { pick_file() } {
                     let name = unique_item_name(st, ai, &name_from_path(&p));
                     st.apps[ai]
                         .items
@@ -15457,6 +16070,16 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         } else {
             st.sw_a[i] = targets[i];
         }
+    }
+
+    // 内联网址输入框：光标要闪；后台还在抓标题：名字那串点要跳 —— 两种都得继续出帧。
+    // ⚠️ 但窗口已经藏了（点 × / 按 Esc 关掉）就不能再算编辑态忙：那条状态是「粘性」的，
+    //    没人再点一下它就永远没人取消 → 16ms 定时器会一直全速重绘一页看不见的东西。
+    //    （重开时 `open_settings` 会把输入框收回干净。）
+    if (st.set_edit_ai != usize::MAX && IsWindowVisible(hwnd).as_bool())
+        || !st.title_busy.is_empty()
+    {
+        busy = true;
     }
 
     if !busy {
@@ -15625,6 +16248,49 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             }
             LRESULT(0)
         }
+        WM_APP_TITLE => {
+            // 后台抓 `<title>` 回来了 → 改名 + 把「正在取标题」的点点掉
+            let st = state_of(hwnd);
+            unsafe { title_apply_pending(st) };
+            setup_present(st);
+            setup_kick(st, hwnd);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            // 内联网址输入框的唯一入口。IME 合成的中文由 `WM_IME_CHAR` 交给
+            // `DefWindowProcW`（默认分支）转成这条 `WM_CHAR`，所以这里只处理一种。
+            let st = state_of(hwnd);
+            if st.set_edit_ai == usize::MAX {
+                return LRESULT(0);
+            }
+            match w.0 as u32 {
+                0x1B => unsafe { set_edit_finish(st, false) }, // Esc：收回输入框（**不是**关窗）
+                0x0D => unsafe { set_edit_finish(st, true) },  // 回车：添加
+                0x08 => {
+                    st.set_edit_buf.pop();
+                }
+                0x16 => {
+                    // Ctrl+V：只贴纯文本，取第一个非空字段（复制「标题 + 链接」时不至于粘进标题）
+                    if let Some(t) = unsafe { clip_text() } {
+                        for ch in t.split_whitespace().next().unwrap_or("").chars() {
+                            if !ch.is_control() && st.set_edit_buf.chars().count() < 200 {
+                                st.set_edit_buf.push(ch);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(ch) = char::from_u32(w.0 as u32) {
+                        if !ch.is_control() && st.set_edit_buf.chars().count() < 200 {
+                            st.set_edit_buf.push(ch);
+                        }
+                    }
+                }
+            }
+            setup_present(st);
+            setup_kick(st, hwnd);
+            LRESULT(0)
+        }
         WM_KEYDOWN => {
             // 引导进行中：←/→/Enter 翻步，Esc **退出引导**（而不是关设置窗）
             {
@@ -15637,6 +16303,18 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                         _ => {}
                     }
                     setup_kick(st, hwnd);
+                    return LRESULT(0);
+                }
+                // 删除确认卡开着：Esc = 收卡，**不是**关整个设置窗
+                if st.set_confirm != Ctl::None {
+                    st.set_confirm = Ctl::None;
+                    setup_present(st);
+                    setup_kick(st, hwnd);
+                    return LRESULT(0);
+                }
+                // 内联网址输入框开着：按键一律走 `WM_CHAR` 那套语义。
+                // 少了这道闸，输入框里按 Esc 会**把整个设置窗关掉**。
+                if st.set_edit_ai != usize::MAX {
                     return LRESULT(0);
                 }
             }
@@ -15682,6 +16360,8 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("guide_seen={}\r\n", b(st.guide_seen)));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
+    out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
+    out.push_str(&format!("update_bub_ver={}\r\n", st.update_bub_ver));
     out.push_str(&format!("onb_drag={}\r\n", b(st.onb_drag)));
     out.push_str(&format!("onb_move={}\r\n", b(st.onb_move)));
     out.push_str(&format!("onb_edit={}\r\n", b(st.onb_edit)));
@@ -15921,6 +16601,39 @@ unsafe fn pick_file() -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+/// 选**文件夹**（原生「选择文件夹」对话框 = 同一个 `IFileOpenDialog`，只是开了
+/// `FOS_PICKFOLDERS`）。
+///
+/// ⚠️ 为什么不能和「选文件」合成一颗入口：`FOS_PICKFOLDERS` 一开，列表里的**文件会变灰、
+/// 选不动**（实测；微软文档：该选项让对话框「在文件夹而非文件之间做选择」）。
+/// 唯一能两者通选的 `SHBrowseForFolder` + `BIF_BROWSEINCLUDEFILES` 是老式树控件，
+/// 和设置页的观感对不上 —— 所以做成「＋ 文件 / ＋ 文件夹」两颗。
+unsafe fn pick_folder() -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PICKFOLDERS,
+        SIGDN_FILESYSPATH,
+    };
+    // 本线程（UI 线程）启动时已 CoInitializeEx 过，这里再调一次只是幂等的保险
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+    // NOCHANGEDIR：不许对话框改我们的当前目录（`pick_file` 同样带这条）
+    let _ = dlg.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+    if dlg.Show(None).is_err() {
+        return None; // 用户取消
+    }
+    let item = dlg.GetResult().ok()?;
+    let ps = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+    let s = ps.to_string().ok()?;
+    CoTaskMemFree(Some(ps.0 as *const _));
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 // ── 超采样渲染管线 ──
 
 /// 设置页那5 号 SS× 字体：按需创建（关窗由 `setup_free` 删掉）。
@@ -16096,6 +16809,24 @@ unsafe fn setup_present(st: &mut State) {
 }
 
 /// 设置页的离屏核对：把每个页面渲染成 BMP（配 bmp2png.py 看图，不用真机点）
+/// 把当前 `s_lo_bits` 合成到中灰底上存成 `{dir}\\{name}.bmp`。
+/// BMP 不带 alpha，直接存的话圆角外和投影区显示的是原始 RGB，
+/// 看不出投影浓淡和透明边界 —— 所以每次出图都要过这一步。
+unsafe fn s_dump_save(st: &State, dir: &str, name: &str) {
+    let bg = (205u8, 205u8, 208u8);
+    let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+    for p in px.chunks_mut(4) {
+        let a = p[3] as f32 / 255.0;
+        let ia = 1.0 - a;
+        p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[3] = 255;
+    }
+    let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, S_WW, S_HH);
+    println!("[setup] {name} {}", if ok { "OK" } else { "FAIL" });
+}
+
 unsafe fn settings_dump(dir: &str, st: &mut State) {
     // 最后一个「页」不是页：交互页 + 展开的「?」tooltip
     // （tooltip 只在悬停时出现，离屏没法复现 hover，直接置位出图核对）
@@ -16198,6 +16929,68 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         st.trig_capturing = false;
     }
 
+    // 「＋ 网址」内联输入框：浏览器应用展开后那颗小胶囊点开、并且已经打了字。
+    // 光标是 0.5s 方波闪的，出两张才有一张带光标（离屏没法按真键盘）；
+    // 第三张是空缓冲 → 核对占位文案。
+    for tag in ["a", "b", "c"] {
+        st.set_page = 2;
+        st.set_page_a = 1.0;
+        st.guide_step = -1;
+        st.tip = 0;
+        st.set_scroll = 0;
+        st.set_expanded = 0;
+        st.set_hover = Ctl::None;
+        st.set_edit_ai = 0;
+        st.set_edit_buf = if tag == "c" { String::new() } else { "github.com/qoder".to_string() };
+        st.title_busy = vec!["https://example.com/".to_string()];
+        setup_render(st);
+        std::thread::sleep(std::time::Duration::from_millis(280));
+        let bg = (205u8, 205u8, 208u8);
+        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+        for p in px.chunks_mut(4) {
+            let a = p[3] as f32 / 255.0;
+            let ia = 1.0 - a;
+            p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[3] = 255;
+        }
+        let ok = save_bmp(&format!("{}\\setup_addurl_{}.bmp", dir, tag), &px, S_WW, S_HH);
+        println!("[setup] setup_addurl_{} {}", tag, if ok { "OK" } else { "FAIL" });
+    }
+    st.set_edit_ai = usize::MAX;
+    st.set_edit_buf.clear();
+    st.title_busy.clear();
+
+    // 删除确认卡：应用行 ✕ 点下去之后的样子（页 2 / 应用 0 展开）
+    {
+        st.set_page = 2;
+        st.set_page_a = 1.0;
+        st.guide_step = -1;
+        st.tip = 0;
+        st.set_scroll = 0;
+        st.set_expanded = 0;
+        st.set_hover = Ctl::ConfYes; // 鼠标停在「删除」上那张
+        st.set_confirm = Ctl::AppDel(0);
+        setup_render(st);
+        std::thread::sleep(std::time::Duration::from_millis(280));
+        s_dump_save(st, dir, "setup_confirm");
+        st.set_confirm = Ctl::None;
+        st.set_hover = Ctl::None;
+    }
+    // 同一张卡在**交互页**上的样子：那页比应用页挤（开关 + 两张名单卡），
+    // 没有遮罩，得确认卡盖下去之后底下的字不会和卡里的字打架。
+    {
+        st.set_page = 1;
+        st.set_expanded = usize::MAX;
+        st.set_hover = Ctl::None;
+        st.set_confirm = Ctl::ExcDel(0, 0);
+        setup_render(st);
+        std::thread::sleep(std::time::Duration::from_millis(280));
+        s_dump_save(st, dir, "setup_confirm_exc");
+        st.set_confirm = Ctl::None;
+    }
+
     st.set_page = 0;
     st.tip = 0;
     st.guide_step = -1;
@@ -16211,6 +17004,16 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
 const UPDATE_API: &str = "https://api.github.com/repos/lifeFxxker/pipie/releases/latest";
 /// 自动检查的最小间隔（秒）：防 GitHub 匿名 API 限流（60 次/时/IP）。
 const UPDATE_MIN_INTERVAL: f64 = 6.0 * 3600.0;
+
+/// 实际生效的检查间隔。`PIPIE_UPDATE_INTERVAL`（秒）可覆盖 ——
+/// 常驻进程「不重启也能等到发版」靠的是周期定时器，回归总不能真等 6 小时。
+fn update_min_interval() -> f64 {
+    std::env::var("PIPIE_UPDATE_INTERVAL")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(UPDATE_MIN_INTERVAL)
+}
 
 /// 当前版本（Cargo.toml 的 version）。
 fn cur_version() -> &'static str {
@@ -17256,7 +18059,7 @@ fn main() {
 
         // 在线升级：启动静默检查（**只查不装**）。首次启动必查，之后 ≥6h 一次（防限流）。
         // 后台线程 sleep 3s 再联网，避免和启动抢资源；结果 post 回 UI 刷关于页。
-        if st.update_auto && unix_now() - st.update_last_check >= UPDATE_MIN_INTERVAL {
+        if st.update_auto && unix_now() - st.update_last_check >= update_min_interval() {
             start_update_check(&mut st, false);
         }
 
