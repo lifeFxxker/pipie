@@ -1,6 +1,6 @@
 [package]
 name = "pipie"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "A radial (pie-menu) app launcher for Windows with live window previews"
 authors = ["PiPie"]
