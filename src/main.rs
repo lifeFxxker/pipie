@@ -2337,10 +2337,6 @@ const GLASS_RIM: f32 = 6.0;
 /// 边缘折射的最大外拉距离（px）：靠近盘沿时采样点往外偏这么多。
 /// 这是"液态玻璃"和"毛玻璃"的分界线 —— 只有模糊 = 磨砂，有折射才像一块玻璃。
 const GLASS_REFRACT: f32 = 13.0;
-/// 「自擦」模式（WDA 设不上）下盘面的清晰度权重。
-/// 那种模式下盘里的"原图"层是拿外圈均色填出来的假背景，留 30% 只会把分箱的
-/// 扇形条纹看得清清楚楚 → 几乎全用模糊层，读成磨砂玻璃。
-const GLASS_SHARP_MASK: f32 = 0.97;
 
 /// `st.glass_bg` 每被换掉一次就 +1 —— 玻璃盘面的色层缓存拿它当失效键。
 static GLASS_BG_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2363,7 +2359,6 @@ const GL_WDA: u32 = 1 << 0;     // WDA_EXCLUDEFROMCAPTURE 设不上 → 改走�
 const GL_LIVE_ON: u32 = 1 << 1; // 实时线程跑起来了（记一条，证明这条路是通的）
 const GL_SNAP_BLACK: u32 = 1 << 2;
 const GL_SNAP_CAP: u32 = 1 << 3;  // 呼出时那次抓屏失败（GetDC / BitBlt）
-const GL_LIVE_BLACK: u32 = 1 << 4;
 const GL_LIVE_CAP: u32 = 1 << 5;
 const GL_OFFSCREEN: u32 = 1 << 6; // 抓取矩形整个落在虚拟屏幕之外
 
@@ -2386,6 +2381,43 @@ fn glass_where(x: i32, y: i32) -> String {
     )
 }
 
+/// 「这台机器为什么设不上 WDA」的两条硬线索：**系统 build 号** + **是不是远程桌面会话**。
+/// `WDA_EXCLUDEFROMCAPTURE` 要 Win10 1903(18362) 以上，且 RDP / 云桌面会话里直接禁用 ——
+/// 光记一句「设不上」分不出这两种，用户发回来的日志得自己把话说完。
+fn wda_where() -> String {
+    let mut build = 0u32;
+    unsafe {
+        use windows::Win32::System::Registry::{
+            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+        };
+        let sub: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0"
+            .encode_utf16()
+            .collect();
+        let name: Vec<u16> = "CurrentBuildNumber\0".encode_utf16().collect();
+        let mut buf = [0u16; 32];
+        let mut sz = (buf.len() * 2) as u32;
+        if RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut sz),
+        )
+        .is_ok()
+        {
+            build = String::from_utf16_lossy(&buf)
+                .trim_end_matches('\0')
+                .trim()
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+    let rdp = unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 };
+    format!("build={build} rdp={}", if rdp { 1 } else { 0 })
+}
+
 fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe {
         (
@@ -2402,120 +2434,6 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
 fn glass_offscreen(x: i32, y: i32) -> bool {
     let (vx, vy, vw, vh) = virtual_screen();
     x + CANVAS <= vx || y + CANVAS <= vy || x >= vx + vw || y >= vy + vh
-}
-
-/// WDA 设不上时的兜底：把抓到的那一帧里「轮盘自己」抹掉。
-///
-/// 做法是**角度扩散**，不是径向外推 —— 外推实测会把壁纸拉成一个风车（盘心是奇点，
-/// 深色区域被拉成扇形黑块），比不擦还扎眼。这里：
-/// 1. 贴着遮罩外沿取一圈干净桌面，按角度分箱求平均色（96 箱，循环平滑一遍）；
-/// 2. 盘内每个像素 = 全局均值 → 该角度均值 的径向过渡，越靠盘沿越接近真实周边；
-/// 3. 于是盘读起来是「背景的柔和延续」，再过一道 `blur_glass` 就是磨砂玻璃。
-/// 不如 WDA（看不见背景的细节），但玻璃是活的、没有自己的残影，也不会露馅成一块白。
-fn glass_scrub_self(raw: &mut [u8], rm: f32) {
-    const NB: usize = 96;
-    /// 取样的环带宽度：贴近遮罩才像「背景的延续」，取远了颜色就跑偏
-    const BAND: f32 = 40.0;
-    let w = CANVAS as usize;
-    let hi_edge = CC - 3.0;                 // 画布内切圆：再往外就取不到干净像素
-    let lo = (rm + GL_MASK_PAD).min(hi_edge);
-    let hi = (lo + BAND).min(hi_edge);
-    if hi - lo < 6.0 {
-        return;                             // 遮罩顶到画布边了，没什么可取 → 留着上一帧
-    }
-    let mut acc = [[0f32; 3]; NB];
-    let mut cnt = [0f32; NB];
-    let mut gsum = [0f32; 3];
-    let mut gn = 0f32;
-    let r_out = hi + 1.0;
-    let y0 = (CC - r_out).max(0.0) as usize;
-    let y1 = ((CC + r_out).min(CANVAS as f32 - 1.0)) as usize;
-    for py in y0..=y1 {
-        let dy = py as f32 + 0.5 - CC;
-        let sx = (r_out * r_out - dy * dy).sqrt().max(0.0);
-        let xa = (CC - sx).max(0.0) as usize;
-        let xb = ((CC + sx).min(CANVAS as f32 - 1.0)) as usize;
-        for px in xa..=xb {
-            let dx = px as f32 + 0.5 - CC;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d < lo || d > hi {
-                continue;
-            }
-            let o = (py * w + px) * 4;
-            let b = ang_bin(dx, dy);
-            for c in 0..3 {
-                let v = raw[o + c] as f32;
-                acc[b][c] += v;
-                gsum[c] += v;
-            }
-            cnt[b] += 1.0;
-            gn += 1.0;
-        }
-    }
-    if gn < 1.0 {
-        return;
-    }
-    let gm = [gsum[0] / gn, gsum[1] / gn, gsum[2] / gn];
-    // 每箱均值（空箱 = 那一向被画布边切掉了）→ 退回全局均值
-    let mut prof = [[0f32; 3]; NB];
-    for i in 0..NB {
-        if cnt[i] > 0.5 {
-            for c in 0..3 {
-                prof[i][c] = acc[i][c] / cnt[i];
-            }
-        } else {
-            prof[i] = gm;
-        }
-    }
-    // 循环 3 抽头平滑：分箱之间不留硬边
-    let mut sm = prof;
-    for i in 0..NB {
-        let (a, b) = (prof[(i + NB - 1) % NB], prof[(i + 1) % NB]);
-        for c in 0..3 {
-            sm[i][c] = (a[c] + prof[i][c] * 2.0 + b[c]) * 0.25;
-        }
-    }
-    // 填盘内
-    let y0 = (CC - rm).max(0.0) as usize;
-    let y1 = ((CC + rm).min(CANVAS as f32 - 1.0)) as usize;
-    for py in y0..=y1 {
-        let dy = py as f32 + 0.5 - CC;
-        let sx = (rm * rm - dy * dy).sqrt().max(0.0);
-        let xa = (CC - sx).max(0.0) as usize;
-        let xb = ((CC + sx).min(CANVAS as f32 - 1.0)) as usize;
-        for px in xa..=xb {
-            let dx = px as f32 + 0.5 - CC;
-            let d = (dx * dx + dy * dy).sqrt();
-            let o = (py * w + px) * 4;
-            // 越靠盘心越接近全局均值（幂次 >1 让中心那块"糊"得更开，奇点不显形）
-            let u = d / rm;
-            let t = u * u * u.sqrt();
-            let (i0, i1, fr) = ang_lerp(dx, dy);
-            let (p0, p1) = (sm[i0], sm[i1]);
-            for c in 0..3 {
-                let v = gm[c] * (1.0 - t) + (p0[c] * (1.0 - fr) + p1[c] * fr) * t;
-                raw[o + c] = v.clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-}
-
-/// 方向 → 角度箱（0..NB）。约定与 `glass_px` 无关，只要自洽即可。
-fn ang_bin(dx: f32, dy: f32) -> usize {
-    const NB: usize = 96;
-    let th = dy.atan2(dx);                       // -π..π
-    let b = (th + std::f32::consts::PI) * (NB as f32 / (2.0 * std::f32::consts::PI));
-    (b as usize) % NB
-}
-
-/// 方向 → 相邻两箱 + 插值系数（避免 96 箱的分段感）
-fn ang_lerp(dx: f32, dy: f32) -> (usize, usize, f32) {
-    const NB: usize = 96;
-    let th = dy.atan2(dx);
-    let pos = (th + std::f32::consts::PI) * (NB as f32 / (2.0 * std::f32::consts::PI));
-    let f = pos.floor();
-    let i0 = (f as usize) % NB;
-    (i0, (i0 + 1) % NB, pos - f)
 }
 
 /// 抓桌面一块区域（`CANVAS²`，屏幕坐标）→ 模糊 → `st.glass_bg`。
@@ -2578,13 +2496,19 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
 /// 全黑（平均亮度 ≈ 0）→ 判失败。受保护窗口（DRM 视频 / 银行客户端）就这样，
 /// 与其显示一块黑玻璃，不如老老实实回到纸面 / 上一帧。
 fn mostly_black(raw: &[u8]) -> bool {
+    glass_mean(raw) < 4
+}
+
+/// 抓来那一帧的平均亮度（0~255，按 1/61 采样，够准又不要钱）。
+/// 写进日志用：光说「全黑」分不清是 DRM 真给黑屏，还是我们自己把盘拍进了画面。
+fn glass_mean(raw: &[u8]) -> u64 {
     let mut sum = 0u64;
     let mut cnt = 0u64;
     for i in (0..raw.len().saturating_sub(3)).step_by(4 * 61) {
         sum += (raw[i] as u64 + raw[i + 1] as u64 + raw[i + 2] as u64) / 3;
         cnt += 1;
     }
-    cnt == 0 || sum / cnt < 4
+    if cnt == 0 { 0 } else { sum / cnt }
 }
 
 /// 一块 Vec 存两层：原图在前、模糊图在后（`glass_px` 要同时采样两层）
@@ -2593,6 +2517,16 @@ fn build_glass(raw: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(raw);
     buf.extend_from_slice(&blur_glass(raw));
     buf
+}
+
+/// 诊断开关：某个 `RL_GLASS_*` 环境变量有没有被设成非空。
+fn glass_env(k: &str) -> bool {
+    std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// 诊断用：把 `RL_GLASSDUMP*` 的值当输出前缀（没设就 None）。
+fn glass_dump_prefix(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
 }
 
 /// 调试用：把抓到的 BGRA 写成 PPM（`RL_GLASSDUMP=<前缀>` 时才调）。
@@ -2627,20 +2561,6 @@ const GLASS_LIVE_MS: u64 = 33;
 static GLASS_LIVE_ON: AtomicBool = AtomicBool::new(false);
 static GLASS_LIVE_X: AtomicI32 = AtomicI32::new(0);
 static GLASS_LIVE_Y: AtomicI32 = AtomicI32::new(0);
-/// WDA 设不上（老系统 / 远程桌面 / 受管控的机器）→ 每帧自己把盘那一块从抓到的画面里
-/// 擦掉（`glass_scrub_self`）。以前是直接放弃实时，玻璃就整个不动了。
-static GLASS_SELF_MASK: AtomicBool = AtomicBool::new(false);
-/// 要擦掉的半径（**×10 定点**，画布坐标）。UI 线程每帧按「这一帧实际画到哪」更新；
-/// 0 = 还没画过，用 `GL_MASK_R_FALLBACK` 兜底。
-static GLASS_MASK_R: AtomicU32 = AtomicU32::new(0);
-/// 遮罩半径之外还要再让出这么多，才当作「干净的桌面」来取样 ——
-/// 遮罩本身已经把盘/外环的投影算进去了（`GL_MASK_SHAD`）。
-const GL_MASK_PAD: f32 = 6.0;
-/// 盘和外环都带一圈柔和投影（下移 6K + 模糊 18K，注释里实测最远 r+30）。
-/// 遮罩半径 = 实际画到哪 + 这一圈投影，否则擦完还留一圈自己的影子。
-const GL_MASK_SHAD: f32 = 26.0;
-/// UI 还没报过半径时的兜底 = 最坏绘制范围（盘 + 外环 + hover 抬升）。
-const GL_MASK_R_FALLBACK: f32 = DISC_R_MAX + 3.0 * K + RING_T + 2.0 * K + GL_MASK_SHAD;
 /// UI 线程取走了多少帧（只给 `RL_GLASSDBG` 的日志用）
 static GLASS_LIVE_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// **外部窗口正在被拖向环**（窗口捕获武装中）→ 暂停抓屏、冻结盘面色层。
@@ -2685,7 +2605,11 @@ fn glass_live_spawn() {
         let n = (CANVAS * CANVAS * 4) as usize;
         let dbg = std::env::var_os("RL_GLASSDBG").is_some();
         let dump = std::env::var("RL_GLASSDUMP").ok();
+        // 测试钩子：`RL_GLASS_FORCEBLACK=1` 把每一帧都当成「全黑」丢掉，
+        // 用来在正常机器上验「black 兜底到底记了几条日志」这条路径。
+        let force_black = glass_env("RL_GLASS_FORCEBLACK");
         let mut dump_i = 0u32;
+        let mut black_n = 0u64; // 这一轮里被判「全黑」的帧数（日志要把它写出去，见下面）
         let mut dib: Option<(*mut u8, HDC, HBITMAP)> = None;
         let mut on_since: Option<Instant> = None;
         let mut sig_last: Option<u64> = None;
@@ -2707,6 +2631,7 @@ fn glass_live_spawn() {
             if on_since.is_none() {
                 on_since = Some(Instant::now());
                 dump_i = 0;
+                black_n = 0;
                 sig_last = None;
                 if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
                     *s = None;
@@ -2741,23 +2666,25 @@ fn glass_live_spawn() {
                         // ⚠️ 这一段包含「等 DWM 下一次合成」（≈16ms），不是 CPU 耗时
                         let t1 = Instant::now();
                         let raw = std::slice::from_raw_parts_mut(bits, n);
-                        if GLASS_SELF_MASK.load(Ordering::Relaxed) {
-                            // WDA 没生效 → 把「自己」从这一帧里擦掉，否则玻璃里套一圈盘
-                            let rm = match GLASS_MASK_R.load(Ordering::Relaxed) {
-                                0 => GL_MASK_R_FALLBACK,
-                                t => t as f32 / 10.0,
-                            };
-                            glass_scrub_self(raw, rm);
+                        // 诊断：`RL_GLASSDUMPROW=<前缀>` 把抓到的原始帧落盘，
+                        // 排查「这台机器到底抓到了什么」时不用猜（WDA 正常时应该看不到轮盘自己）。
+                        if let Some(p) = glass_dump_prefix("RL_GLASSDUMPROW") {
+                            if matches!(dump_i, 0 | 12) {
+                                dump_ppm(&format!("{}-raw{:02}.ppm", p, dump_i + 1),
+                                         CANVAS as usize, CANVAS as usize, raw);
+                            }
                         }
-                        // 抓失败（受保护窗口全黑）→ 不发，UI 留着上一帧
-                        // 内容没变（粗签名相同）→ 也不发：省掉 blur，更省掉 UI 侧
-                        // 每次换帧固定 7ms 的盘内重采 —— 空闲时最大的那笔税。
-                        if !mostly_black(raw) && {
-                            let sig = glass_sig(raw);
-                            let changed = sig_last != Some(sig);
-                            sig_last = Some(sig);
-                            changed
-                        } {
+                        // 这一帧不发出去有两个**完全不同**的原因，日志必须分得开：
+                        //   ① 真·全黑（DRM/受保护窗口，或整块画面就是我们自己的深色盘面）；
+                        //   ② 内容没变（桌面本来就静止）—— 这是正常省税：跳过 blur，
+                        //      更跳过 UI 侧每次换帧固定 7ms 的盘内重采。
+                        // ⚠️ 以前两者挤在同一个 else 里、一律写成「抓出来全黑」，于是公司电脑
+                        //    发回来的日志把「桌面没动」误报成了「抓屏被保护」。
+                        let black = mostly_black(raw) || force_black;
+                        let sig = glass_sig(raw);
+                        let changed = sig_last != Some(sig);
+                        sig_last = Some(sig);
+                        if !black && changed {
                             let buf = build_glass(raw);
                             let t2 = Instant::now();
                             if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
@@ -2781,11 +2708,22 @@ fn glass_live_spawn() {
                                 stat_blit_us = 0;
                                 stat_blur_us = 0;
                             }
-                        } else {
-                            glass_note(GL_LIVE_BLACK, || {
-                                format!("GLASS reason=black live（抓出来全黑 = DRM/受保护窗口，玻璃退回上一帧）{}",
-                                         glass_where(x, y))
-                            });
+                        } else if black {
+                            // 只有**真的全黑**才记（内容没变那条是正常省税，不进这里）。
+                            // 一次运行只记一条的话，用户发回来的日志分不清「偶尔一帧」和
+                            // 「每帧都丢」—— 后者才是「玻璃看着不动」的真凶。按 1/10/60 递增记。
+                            black_n += 1;
+                            if matches!(black_n, 1 | 10 | 60) {
+                                diag_line(
+                                    &format!("{}\\radial_log.txt", log_dir()),
+                                    &format!(
+                                        "GLASS reason=black live 第{black_n}帧 亮度={}（近乎全黑 = \
+                                         DRM/受保护窗口 → 这一帧丢掉、玻璃留上一帧）{}",
+                                        glass_mean(raw),
+                                        glass_where(x, y),
+                                    ),
+                                );
+                            }
                         }
                     } else {
                         glass_note(GL_LIVE_CAP, || {
@@ -2812,25 +2750,34 @@ unsafe fn glass_live_start(st: &State, hwnd: HWND) {
         return;
     }
     // 轮盘窗口不参与抓屏 —— 实时抓背景时就不会把自己拍进去。
-    // ⚠️ 老系统（< Win10 2004）、远程桌面、被 DLP 管控的机器设不上这个属性。
-    //    以前设失败就整个关掉实时（用户看到的「玻璃不动」大半是这个），现在退一步：
-    //    照常抓，每帧把「自己画的那一圈」用外圈均色填掉（`glass_scrub_self`）。
-    //    不如 WDA 干净（看不见背景细节），但玻璃至少是活的。
-    let wda_ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok()
-        && std::env::var_os("RL_GLASS_NOWDA").is_none();
-    GLASS_SELF_MASK.store(!wda_ok, Ordering::Relaxed);
-    if wda_ok {
-        glass_note(GL_LIVE_ON, || "GLASS live=on（WDA 排除自己，抓屏干净）".to_string());
+    // ⚠️ 老系统（< Win10 2004）、远程桌面 / 云桌面会话、被 DLP 管控的机器设不上这个属性。
+    //    设不上就**不跑实时**，玻璃停在 `snap_glass` 那张呼出那一刻的真桌面快照。
+    //    为什么不给它自擦：那 475² 抓出来整块就是我们自己的盘，只能拿盘外 40px 的颜色
+    //    糊回去 —— 用户的评价是「乳白毛玻璃、透不出桌面」，比停在快照更难看，还白烧 CPU
+    //    （公司那台实测 UI_SLOW 900ms）。宁可不动，也不要糊。（用户 2026-10-28 拍板）
+    // `RL_GLASS_NOWDA=1` = **连试都不试**，用来在能设上的机器上如实复刻公司电脑那条路。
+    let nowda = glass_env("RL_GLASS_NOWDA");
+    let wda_err: u32 = if nowda {
+        0xFFFF_FFFF
     } else {
+        match SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+            Ok(()) => 0,
+            Err(e) => e.code().0 as u32,
+        }
+    };
+    if wda_err != 0 {
         glass_note(GL_WDA, || {
-            "GLASS reason=wda（SetWindowDisplayAffinity 设不上 → 每帧自擦盘区域，玻璃仍然实时）"
-                .to_string()
+            format!(
+                "GLASS reason=wda err=0x{wda_err:08X} {}（SetWindowDisplayAffinity 设不上 → \
+                 不跑实时，玻璃停在呼出那一刻的真桌面快照）",
+                wda_where()
+            )
         });
+        return;
     }
+    glass_note(GL_LIVE_ON, || "GLASS live=on（WDA 排除自己，抓屏干净）".to_string());
     GLASS_LIVE_X.store(st.win_x, Ordering::Relaxed);
     GLASS_LIVE_Y.store(st.win_y, Ordering::Relaxed);
-    // 上一轮的半径别带到这一轮（第一帧没画过就用兜底值）
-    GLASS_MASK_R.store(0, Ordering::Relaxed);
     // 别把上一轮（可能已关菜单）的残留帧喂给这一次
     if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
         *s = None;
@@ -3031,8 +2978,6 @@ struct GlassDiscLayer {
     /// 生成它时的盘面半径（`f32::to_bits`）—— 开合动画里每帧都变，自然每帧重建
     r: u32,
     dark: bool,
-    /// 生成它时是否走「自擦」模式（WDA 设不上）—— 那一档清晰度不同，缓存不能共用
-    mask: bool,
     x0: usize,
     y0: usize,
     w: usize,
@@ -3074,10 +3019,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let lw = x1 - x0 + 1;
     let lh = y1 - y0 + 1;
     let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
-    // WDA 设不上时，盘里的「原图」层是拿外圈均色填出来的（不是真桌面）。
-    // 那一层留 30% 只会把分箱的扇形条纹看得清清楚楚 → 干脆基本全用模糊层，读成磨砂玻璃。
-    let mask = GLASS_SELF_MASK.load(Ordering::Relaxed);
-    let sharp = if mask { GLASS_SHARP_MASK } else { GLASS_SHARP };
+    let sharp = GLASS_SHARP;
 
     // 缓存只装**盘内部**（`cov >= 0.999`，即整像素替换）。盘沿那道抗锯齿带只有
     // 不到 1px 宽、约 2k 像素（≈0.1ms），却依赖浮点覆盖率 —— 量化成 8 位会把整圈
@@ -3086,7 +3028,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     let hit = GLASS_DISC_CACHE.with(|c| {
         let b = c.borrow();
         matches!(b.as_ref(), Some(l)
-            if l.rev == rev && l.r == r.to_bits() && l.dark == dark && l.mask == mask
+            if l.rev == rev && l.r == r.to_bits() && l.dark == dark
                 && l.px.len() == lw * lh * 4)
     });
     if !hit {
@@ -3109,7 +3051,7 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
             }
         }
         GLASS_DISC_CACHE.with(|c| {
-            *c.borrow_mut() = Some(GlassDiscLayer { rev, r: r.to_bits(), dark, mask, x0, y0, w: lw, h: lh, px });
+            *c.borrow_mut() = Some(GlassDiscLayer { rev, r: r.to_bits(), dark, x0, y0, w: lw, h: lh, px });
         });
     }
 
@@ -3213,16 +3155,6 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     //    早了没盘可盖，晚了会把图标/头像一起盖掉。
     if st.glass {
         glass_disc(&*st, buf, disc_r, st.glass_liquid);
-    }
-    // WDA 设不上时抓屏线程要「自擦」的半径 —— 只有这一帧的绘制范围说了算：
-    // 外环展开时比盘面大一整圈，只按 disc_r 擦就会在玻璃里留下一圈自己的梯形。
-    if GLASS_SELF_MASK.load(Ordering::Relaxed) {
-        let drawn = if st.active_app.is_some() {
-            ring_radii(n).1 + 2.0 * K
-        } else {
-            disc_r
-        };
-        GLASS_MASK_R.store(((drawn + GL_MASK_SHAD) * 10.0) as u32, Ordering::Relaxed);
     }
 
     // 拖放感知指示：drop 模式下盘沿亮一圈绿环（证明 OLE 已找到我们）
@@ -14718,7 +14650,7 @@ unsafe fn s_paint_look(st: &mut State, dc: HDC, pal: &Pal) {
     }
     // 一句说明（玻璃的真实限制：实时刷新靠「把自己排除出抓屏」，录屏里就看不见轮盘）
     let hint = if st.glass_live {
-        "玻璃实时透出桌面；打开时轮盘不会被录屏/截图拍到"
+        "玻璃实时透出桌面、不被录屏拍到；受管控的机器自动退回快照"
     } else {
         "玻璃会透出呼出时的桌面；抓屏不可用（受保护窗口）会自动回到纸面"
     };
@@ -16472,8 +16404,8 @@ fn autostart_key() -> (Vec<u16>, Vec<u16>) {
     )
 }
 
-/// 注册表里**当前有没有**自启项（只查存在性，值内容不关心）
-fn autostart_reg_exists() -> bool {
+/// 注册表里自启项目前的值（去引号的 exe 路径）；没有这一项 = `None`
+fn autostart_reg_value() -> Option<String> {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
     let (sub, name) = autostart_key();
     let mut buf = [0u16; 1024];
@@ -16489,24 +16421,74 @@ fn autostart_reg_exists() -> bool {
             Some(&mut sz),
         )
     };
-    r.0 == 0
+    if r.0 != 0 {
+        return None;
+    }
+    let s = &buf[..(sz as usize / 2).min(buf.len())];
+    let n = s.iter().rposition(|c| *c != 0).map(|i| i + 1).unwrap_or(0);
+    let raw = String::from_utf16_lossy(&buf[..n]);
+    Some(raw.trim().trim_matches('"').to_string())
+}
+
+/// 自动化测试 / 沙箱实例（`RL_INSTANCE` 或显式指定了配置目录）：
+/// **一律不碰用户真实的注册表** —— 这些进程跑的是 `target\xxx\release\PiPie.exe`
+/// 这种临时路径，一写就把用户的开机自启项劫持走（实测踩过两次：`_tmptest`、`fix`）。
+fn autostart_sandbox() -> bool {
+    ["RL_INSTANCE", "PIPIE_CONFIG_DIR", "PIGO_CONFIG_DIR"]
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false))
+}
+
+/// 「这一次开机自启该怎么对齐」的判定 —— 抽成纯函数，`--autostart` 才能不改注册表
+/// 就把四条分支全演一遍给用户/我们看（回归脚本 `_autostarttest.py` 依赖这里）。
+/// 返回（给人看的说法，要写什么：`Some(true)` 写入 / `Some(false)` 删除 / `None` 不动）。
+/// `cur` = 注册表现值，`mine` = 当前进程 exe。
+fn autostart_plan(sandbox: bool, want: bool, cur: Option<&str>, mine: &str) -> (&'static str, Option<bool>) {
+    if sandbox {
+        return ("跳过（沙箱/测试实例，不动用户注册表）", None);
+    }
+    if !want {
+        return if cur.is_some() { ("删除", Some(false)) } else { ("无变化", None) };
+    }
+    match cur {
+        None => ("补写（原本没有这一项）", Some(true)),
+        Some(c) if c != mine => ("改指当前 exe（原值指向别的一份）", Some(true)),
+        Some(c) if !std::path::Path::new(c).exists() => ("改指当前 exe（原值那个文件已不在）", Some(true)),
+        Some(_) => ("无变化", None),
+    }
 }
 
 /// 启动时把注册表对齐到 `want`（ini 为准）。
 ///
-/// ⚠️⚠️ **只在「该有却没有 / 不该有却有」时才动注册表**，绝不无脑覆写。
-/// 原因：自启项的值是 `"<当前进程 exe 路径>"`，而沙箱 / 测试跑的是
-/// `_tmptest\PiPie.exe` —— 一启动就把**用户真实的自启项改指到沙箱**去
-/// （实测踩到：值被改成 `_tmptest`）。用「存在性差集」同步就完全避开了：
-/// 正常安装时值已存在且正确 → 一次都不写。
+/// 三种「该重写」的情况，缺一个就会出现「设了开机自启却起不来」：
+///  · 没有这一项 → 补上；
+///  · 有，但指向的 exe **已经不在了**（换文件夹 / 重装 / 清理过 target）→ 改指当前 exe；
+///  · 有，但指向**别的** exe（用户实际在用另一份）→ 改指当前 exe。
+/// 最后一条是这次踩的：值一直停在 `target\fix\...`，之后每次都是从 `target\pill\...`
+/// 启动，而旧的「只查存在性」逻辑一次都不写 → 开机起不来。
+/// 沙箱实例整个跳过（见 `autostart_sandbox`），所以「当前 exe」永远是用户真实跑的那份。
 fn autostart_sync(want: bool) {
-    autostart_drop_legacy();
-    let has = autostart_reg_exists();
-    if want && !has {
-        autostart_set(true);
-    } else if !want && has {
-        autostart_set(false);
+    let mine = exe_path();
+    let cur = autostart_reg_value();
+    let sandbox = autostart_sandbox();
+    let (plan, act) = autostart_plan(sandbox, want, cur.as_deref(), &mine);
+    if !sandbox {
+        autostart_drop_legacy();
     }
+    if let Some(on) = act {
+        autostart_set(on);
+    }
+    // 开机自启「设了却没生效」全靠这一行定位：下次用户只发日志就能看出是
+    // 没写进去、写成了别的路径、还是被系统拦了。
+    diag_line(
+        &format!("{}\\radial_log.txt", log_dir()),
+        &format!(
+            "AUTOSTART ini={} 原值={} → {plan} → 现值={}（我={mine}）",
+            if want { 1 } else { 0 },
+            cur.as_deref().unwrap_or("<无>"),
+            autostart_reg_value().as_deref().unwrap_or("<无>"),
+        ),
+    );
 }
 
 /// 删掉**改名前**留下的自启项（`Run` 下那个 `RadialMenu`）。
@@ -16539,6 +16521,10 @@ fn autostart_set(on: bool) {
             RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
             HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
         };
+    // 沙箱/测试实例点开关只改自己那份 ini，**绝不动用户真实注册表**（见 `autostart_sandbox`）。
+    if autostart_sandbox() {
+        return;
+    }
     let (sub, name) = autostart_key();
     unsafe {
         let mut hk = HKEY::default();
@@ -17586,6 +17572,39 @@ fn main() {
             UpdateOutcome::Failed(e) => {
                 eprintln!("[update] 检查失败: {e}");
                 std::process::exit(2);
+            }
+        }
+        return;
+    }
+    // 诊断：开机自启现在到底是什么状态（默认**只打印，不动注册表**）。
+    // 「设了自启却起不来」以前只能靠猜；现在一条命令就能看出值停在哪个 exe 上。
+    // 确认无误再加 `apply` 走一遍 `autostart_sync`（它会按判定补写/改指/删除）。
+    if args.len() >= 2 && args[1] == "--autostart" {
+        let apply = args.get(2).map(|s| s == "apply").unwrap_or(false);
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let mut st = State::new();
+            init_config_path(&mut st);
+            load_ini(&mut st);
+            let mine = exe_path();
+            let cur = autostart_reg_value();
+            let (plan, _) = autostart_plan(autostart_sandbox(), st.autostart, cur.as_deref(), &mine);
+            println!("ini autostart = {}", st.autostart);
+            println!("注册表现值    = {}", cur.as_deref().unwrap_or("<无>"));
+            println!("当前 exe      = {mine}");
+            println!("沙箱实例      = {}（沙箱一律不动用户注册表）", autostart_sandbox());
+            println!("判定          = {plan}");
+            if apply {
+                autostart_sync(st.autostart);
+                println!(
+                    "执行后现值    = {}",
+                    autostart_reg_value().as_deref().unwrap_or("<无>")
+                );
+            } else {
+                println!("（只打印，没动注册表；要按上面的判定去改，跑 `--autostart apply`）");
             }
         }
         return;
