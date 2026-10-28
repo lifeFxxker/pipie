@@ -9,6 +9,7 @@
 # ── Dev scratch (all underscore-prefixed entries at repo root) ──
 /_*
 _*.py
+_*.ps1
 _*.txt
 _*.ini
 # 测试沙箱（里面是真·开发者 settings.ini，绝不能进发布提交）
