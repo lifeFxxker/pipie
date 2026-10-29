@@ -7568,7 +7568,7 @@ unsafe fn dump_all(dir: &str) {
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_add.bmp", dir), &buf, CANVAS, CANVAS);
         // 2d-2) 气泡：发现新版本（用户 2026-10-27 要头像提醒）—— 文案必须和 `update_say` 一致
-        say(&mut st, "发现新版本 v1.0.7", "", 99.0);
+        say(&mut st, &format!("发现新版本 v{}", env!("CARGO_PKG_VERSION")), "", 99.0);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_update.bmp", dir), &buf, CANVAS, CANVAS);
         // 2e) 气泡：短消息（验证「按文字量收缩」而不是一律撑满）

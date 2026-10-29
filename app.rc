@@ -6,8 +6,8 @@
 // ⚠️ 值**只用 ASCII** —— 这个文件不是 UTF-8 BOM，rc.exe 会按本地代码页解释，
 //    写中文会变成乱码（注释无所谓，属性页上给人看的字不能花）。
 1 VERSIONINFO
-FILEVERSION 1,0,7,0
-PRODUCTVERSION 1,0,7,0
+FILEVERSION 1,0,8,0
+PRODUCTVERSION 1,0,8,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -17,12 +17,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "PiPie"
       VALUE "FileDescription", "PiPie"
-      VALUE "FileVersion", "1.0.7"
+      VALUE "FileVersion", "1.0.8"
       VALUE "InternalName", "PiPie"
       VALUE "LegalCopyright", "Copyright (C) 2026 PiPie"
       VALUE "OriginalFilename", "PiPie.exe"
       VALUE "ProductName", "PiPie"
-      VALUE "ProductVersion", "1.0.7"
+      VALUE "ProductVersion", "1.0.8"
     END
   END
   BLOCK "VarFileInfo"
