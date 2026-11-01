@@ -1353,7 +1353,8 @@ impl State {
             set_hover_prev: Ctl::None,
             set_hov_a: 1.0,
             set_page_a: 1.0,
-            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+            // `sw_a[5]` = 录屏模式 = `!glass_live`，而 glass_live 缺省开 → 初值 0
+            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
             tip: 0,
             // 默认开：ini 里没有 `autostart=` 时就是它（用户主动关才变 false）
             autostart: true,
@@ -14071,7 +14072,7 @@ enum Ctl {
     Theme(usize),
     /// 外观页「材质」：0 纸面 / 1 液态玻璃
     Mat(usize),
-    /// 外观页「录屏模式（玻璃不实时）」= `st.glass_live`
+    /// 外观页「录屏模式（玻璃不实时）」—— 开着 = `st.glass_live` 为**假**，见 `look_live_val`
     GlassLive,
     Key(usize),
     TrigCapture,         // 交互页「呼出方式」下的「自定义触发」行：点击进入录制态（再点取消）
@@ -14665,6 +14666,16 @@ fn act_sw_val(st: &State, i: usize) -> f32 {
     }
 }
 
+/// 外观页「录屏模式」开关的显示值 —— **和 ini 那个量正好反着**。
+///
+/// ini 存的是 `glass_live`（玻璃要不要实时刷新，缺省开）；这条开关的字面意思是
+/// 「录屏模式」，开着 = 能被录到 = 不实时。所以 `sw_a[5]` 走的是 `!glass_live`。
+/// ⚠️ 极性只写在这一个地方：之前三处各写各的，结果标签说「录屏模式」、
+///    显示和手感却是「实时模式」（用户 2026-11-01：「我关了就能录屏到，开了反而录不到」）。
+fn look_live_val(st: &State) -> f32 {
+    if st.glass_live { 0.0 } else { 1.0 }
+}
+
 // ═══════════════ 设置页「聚光灯引导」（coach marks）═══════════════
 //
 // 首次打开设置页自动播 4 步；标题栏「查看引导」可重播。
@@ -15219,9 +15230,9 @@ unsafe fn s_paint_look(st: &mut State, dc: HDC, pal: &Pal) {
     }
     // 一句说明（说清这条开关换来什么、失去什么）
     let hint = if st.glass_live {
-        "开着：玻璃实时透出桌面，但截图／录屏拍不到轮盘"
+        "关着：玻璃实时透出桌面，但截图／录屏拍不到轮盘"
     } else {
-        "关掉：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘"
+        "开着：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘"
     };
     g_text(dc, hint,
         RECT { left: S_X0, top: LOOK_LIVE_HINT_Y, right: S_X1, bottom: LOOK_LIVE_HINT_Y + 20 },
@@ -16587,7 +16598,8 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         st.sw_a[3],
         st.sw_a[4],
         // 录屏模式（外观页）：不按页门禁 → 第一次画之前就已经收敛到真值，不会「先亮后滑」
-        if st.glass_live { 1.0 } else { 0.0 },
+        // ⚠️ 取 `look_live_val`：这条开关是 `glass_live` 的**反面**
+        look_live_val(st),
     ];
     // 开机自启开关现画在**交互页**（第 1 页），高级页的旧位置也留着这条动画
     if st.set_page == 1 || st.set_page == 3 {
@@ -17435,7 +17447,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         st.set_scroll = 0;
         st.set_expanded = if page == 2 { 0 } else { usize::MAX };
         // 离屏不跑 `setup_tick` → 开关动画量还停在初值；「录屏模式」按 ini 置位，出图才对得上
-        st.sw_a[5] = if st.glass_live { 1.0 } else { 0.0 };
+        st.sw_a[5] = look_live_val(st);
         setup_render(st);
         let (dr, dtot) = s_rows(st);
         println!(
