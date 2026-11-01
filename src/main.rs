@@ -1092,7 +1092,7 @@ struct State {
     /// 开关的滑动动画值（0 关 / 1 开；中间态用于圆钮滑动过渡）。按序号：
     /// 0 常驻 / 1 监听 / 2 开机自启（交互页）/ 3 全屏放行(游戏模式)（交互页）
     /// / 4 显示应用名称（交互页）/ 5 录屏模式（外观页）/ 6 剪贴板总开关（应用页）
-    sw_a: [f32; 7],
+    sw_a: [f32; 8],
     /// 悬停中的「?」tooltip id（0 = 不显示）；见 `tip_lines`
     tip: u8,
     /// 开机自启（ini `autostart`；**缺失视为开** → 默认勾选）。
@@ -1284,6 +1284,12 @@ struct State {
     /// 轮盘上的「剪贴板」内置条目：`< 2` = 该有（老配置首次自动补一个），
     /// `2` = 用户自己把它拖出过环，**永远不再复活**。
     clip_app: u8,
+    /// 便签开关（ini `note=`，缺省 = 开）。和 `cl_on` 一样：关 = 轮盘上摘掉那条图标
+    note_on: bool,
+    /// 笔记条目被用户亲手拖出过环 → 永远不再塞回去（和 `clip_app` 同义）
+    note_app: u8,
+    /// 便签进环时的位置（和 `cl_ring_pos` 同义）
+    note_ring_pos: usize,
     /// 「剪贴板」开关关掉时，那条目在 `apps` 里原本排第几（重新打开塞回原位）。
     /// `usize::MAX` = 没记着（例如配置里压根关着一整个进程启动）→ 塞到末尾。
     cl_ring_pos: usize,
@@ -1431,7 +1437,7 @@ impl State {
             set_page_a: 1.0,
             // `sw_a[5]` = 录屏模式 = `!glass_live`，而 glass_live 缺省开 → 初值 0；
             // `sw_a[6]` = 剪贴板总开关，`cl_on` 缺省开 → 初值 1
-            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
             tip: 0,
             // 默认开：ini 里没有 `autostart=` 时就是它（用户主动关才变 false）
             autostart: true,
@@ -1530,6 +1536,9 @@ impl State {
             cl_y: 0,
             cl_pos_set: false,
             clip_app: 0,
+            note_on: true,
+            note_app: 0,
+            note_ring_pos: usize::MAX,
             cl_ring_pos: usize::MAX,
         }
     }
@@ -8959,6 +8968,13 @@ unsafe fn read_persistent(st: &mut State) {
             } else if let Some(v) = get("clip_app=") {
                 // 轮盘上的「剪贴板」条目：缺省 0 = 该有；2 = 用户自己删过，别再塞回去
                 st.clip_app = v.parse::<u8>().unwrap_or(0).min(2);
+            } else if let Some(v) = get("note=") {
+                // 缺省 = 开（和剪贴板同一个理由：装了就该有）
+                st.note_on = v != "0";
+            } else if let Some(v) = get("note_app=") {
+                st.note_app = v.parse::<u8>().unwrap_or(0).min(2);
+            } else if let Some(v) = get("note_ring_pos=") {
+                st.note_ring_pos = v.parse::<usize>().unwrap_or(usize::MAX);
             } else if let Some(v) = get("clip_pos=") {
                 // 用户拖过卡片 = 记住位置；没拖过就每次呼出居中（缺省）
                 st.cl_pos_set = v != "0";
@@ -9185,7 +9201,11 @@ unsafe fn load_ini(st: &mut State) {
     // 重复注入由「apps 里已有这个 target」挡住，所以不必先落一个标记才能防重。
     // ── 轮盘上的「便签」：和剪贴板不同，它没有开关，缺了就直接补上 ──
     // 出厂默认里也带着（`default_apps`），但存过配置的人不会再走那条路。
-    if st.apps.len() < MAX_APPS && !st.apps.iter().any(|a| a.target == "@act:note") {
+    if st.note_on
+        && st.note_app < 2
+        && st.apps.len() < MAX_APPS
+        && !st.apps.iter().any(|a| a.target == "@act:note")
+    {
         ini_insert_app(&st.ini_path, "便签", "@act:note");
         load_ini(st);
         return;
@@ -14201,10 +14221,12 @@ const S_X1: i32 = S_W - 26;          // 内容区右边界
 const S_LIST_TOP: i32 = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP;
 /// ⚠️ 列表底**不是**贴着页脚 —— 底下还要留一条独立的「剪贴板」开关卡（`clip_card_rect`）。
 /// 列表本身可滚，少给 72px 只是早一点开始滚。
-const S_LIST_BOT: i32 = S_H - 150;
-/// 应用页底部那张独立的「剪贴板」卡：和上面的应用行**故意长得不一样**
-/// （圆角卡 + 右侧开关），因为它管的不是某个应用，而是这个功能开不开。
-const CLIP_CARD_TOP: i32 = S_H - 134;
+const S_LIST_BOT: i32 = S_H - 214;
+/// 应用页底部两张独立的「总开关」卡（剪贴板 / 便签）：和上面的应用行**故意长得
+/// 不一样**（圆角卡 + 右侧开关），因为它管的不是某个应用，而是这个功能开不开。
+/// 用户 2026-11-02：「粘贴板和便签都是默认展示的，应用里粘贴板下边加上便签的开关」。
+const NOTE_CARD_TOP: i32 = S_H - 134;
+const CLIP_CARD_TOP: i32 = S_H - 198;
 const CLIP_CARD_H: i32 = 56;
 
 fn clip_card_rect() -> RECT {
@@ -14214,6 +14236,16 @@ fn clip_card_rect() -> RECT {
 /// 卡里那颗开关（右侧，离卡片边 14）
 fn clip_sw_rect() -> RECT {
     RECT { left: S_X1 - 60, top: CLIP_CARD_TOP + (CLIP_CARD_H - 26) / 2, right: S_X1 - 14, bottom: CLIP_CARD_TOP + (CLIP_CARD_H + 26) / 2 }
+}
+
+fn note_card_rect() -> RECT {
+    RECT { left: S_X0, top: NOTE_CARD_TOP, right: S_X1, bottom: NOTE_CARD_TOP + CLIP_CARD_H }
+}
+fn note_sw_rect() -> RECT {
+    RECT { left: S_X1 - 60, top: NOTE_CARD_TOP + (CLIP_CARD_H - 26) / 2, right: S_X1 - 14, bottom: NOTE_CARD_TOP + (CLIP_CARD_H + 26) / 2 }
+}
+fn note_tip_rect() -> RECT {
+    RECT { left: S_X0 + 50, top: NOTE_CARD_TOP + 18, right: S_X0 + 68, bottom: NOTE_CARD_TOP + 36 }
 }
 
 /// 卡里「剪贴板」标题右边那颗「?」
@@ -14338,6 +14370,8 @@ enum Ctl {
     UpdateCheck,
     /// 应用页底部那张独立卡：「剪贴板」总开关（状态 = `st.cl_on`，见 `cl_set_on`）
     ClipOn,
+    /// 便签总开关（和 `ClipOn` 同一个意思）
+    NoteOn,
 }
 
 // ══ 交互页几何（绘制与命中共用，别写第二份）══
@@ -14527,6 +14561,7 @@ fn tip_lines(id: u8) -> &'static [&'static str] {
         5 => &["选「白名单」模式时：只有列表里的程序呼出键才生效。", "拖 exe 进来添加；点卡片标题切换当前生效的是哪张。"],
         6 => &["鼠标悬停内环图标时，用头像旁的气泡显示它的应用名。", "关掉就只看图标（操作结果提示不受影响）。"],
         7 => &["关掉后不再记录，轮盘上的「剪贴板」图标一起消失。", "密码管理器里的复制始终不记录。"],
+        8 => &["关掉后轮盘上的「便签」图标一起消失。", "已经写下的便签不会丢，再打开接着写。"],
         _ => &[],
     }
 }
@@ -14553,6 +14588,10 @@ fn tip_anchor(id: u8) -> (i32, i32, bool) {
         }
         7 => {
             let r = clip_tip_rect();
+            (r.left, r.top - 6, true)
+        }
+        8 => {
+            let r = note_tip_rect();
             (r.left, r.top - 6, true)
         }
         _ => (0, 0, false),
@@ -15855,9 +15894,11 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
     // ── 底部独立卡：「剪贴板」总开关 ──
     // 故意不跟着上面的应用行走同一套样式：它管的不是某个应用开不开，
     // 是整个功能存不存在（关掉连轮盘上那条图标都没有），混进列表会被当成一条可删的条目。
-    {
-        let cr = clip_card_rect();
-        let hv = hov(st, Ctl::ClipOn);
+    for (cr, tip_r, sw_r, title, ctl, tip_id, anim) in [
+        (clip_card_rect(), clip_tip_rect(), clip_sw_rect(), "剪贴板", Ctl::ClipOn, 7u8, st.sw_a[6]),
+        (note_card_rect(), note_tip_rect(), note_sw_rect(), "便签", Ctl::NoteOn, 8u8, st.sw_a[7]),
+    ] {
+        let hv = hov(st, ctl);
         g_rrect(
             dc,
             cr,
@@ -15868,14 +15909,14 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
         );
         g_text(
             dc,
-            "剪贴板",
+            title,
             RECT { left: cr.left + 14, top: cr.top + 16, right: cr.left + 62, bottom: cr.top + 40 },
             pal.ink,
             st.sf_body,
             false,
         );
-        draw_tip_icon(st, dc, pal, clip_tip_rect(), 7);
-        g_switch(dc, pal, clip_sw_rect(), st.sw_a[6]);
+        draw_tip_icon(st, dc, pal, tip_r, tip_id);
+        g_switch(dc, pal, sw_r, anim);
     }
 
     // 底部：添加入口 + 备份提示（hover 在「描边态」和「实心态」之间渐变）
@@ -16221,6 +16262,12 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             // 走到下面那句「超出列表区 → None」就被吃掉了。
             if in_rect(clip_tip_rect(), x, y) {
                 return Ctl::Tip(7);
+            }
+            if in_rect(note_tip_rect(), x, y) {
+                return Ctl::Tip(8);
+            }
+            if in_rect(note_card_rect(), x, y) {
+                return Ctl::NoteOn;
             }
             if in_rect(clip_card_rect(), x, y) {
                 return Ctl::ClipOn;
@@ -16737,6 +16784,11 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             unsafe { cl_set_on(st, !st.cl_on) };
             setup_kick(st, hwnd);
         }
+        Ctl::NoteOn => {
+            // 便签总开关：关 = 轮盘上摘掉那条图标（内容不动）
+            unsafe { note_set_on(st, !st.note_on) };
+            setup_kick(st, hwnd);
+        }
         Ctl::AppHead(ai) => {
             st.set_expanded = if st.set_expanded == ai { usize::MAX } else { ai };
             st.set_scroll = st.set_scroll.min(s_scroll_max(st));
@@ -16946,6 +16998,8 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         look_live_val(st),
         // 剪贴板总开关（应用页）：同理不按页门禁，第一次画就对得上 `cl_on`
         if st.cl_on { 1.0 } else { 0.0 },
+        // 便签总开关：同上
+        if st.note_on { 1.0 } else { 0.0 },
     ];
     // 开机自启开关现画在**交互页**（第 1 页），高级页的旧位置也留着这条动画
     if st.set_page == 1 || st.set_page == 3 {
@@ -16955,7 +17009,7 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         targets[3] = if st.exc_fs { 1.0 } else { 0.0 };
         targets[4] = if st.hover_name { 1.0 } else { 0.0 };
     }
-    for i in 0..7 {
+    for i in 0..8 {
         let d = targets[i] - st.sw_a[i];
         if d.abs() > 0.003 {
             st.sw_a[i] += d * k;
@@ -17263,6 +17317,9 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("clip_pos={}\r\n", b(st.cl_pos_set)));
     out.push_str(&format!("clip_x={}\r\n", st.cl_x));
     out.push_str(&format!("clip_y={}\r\n", st.cl_y));
+    out.push_str(&format!("note={}\r\n", b(st.note_on)));
+    out.push_str(&format!("note_app={}\r\n", st.note_app));
+    out.push_str(&format!("note_ring_pos={}\r\n", st.note_ring_pos));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
@@ -17793,7 +17850,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         .map(|p| (p, 0u8, -1i32))
         .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1)])
         // 应用页底部「剪贴板」卡那个「?」
-        .chain([(2usize, 7u8, -1)])
+        .chain([(2usize, 7u8, -1), (2, 8, -1)])
         // 交互页的 4 个引导步骤也出图（离屏没法点按钮，直接置位核对）
         .chain([(1usize, 0u8, 0i32), (1, 0, 1), (1, 0, 2), (1, 0, 3)])
     {
@@ -17860,6 +17917,28 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         }
         st.cl_on = true;
         st.sw_a[6] = 1.0;
+    }
+
+    // 「便签」卡的关态（同上）：开关滑到左、且列表里那条「便签」已经没了
+    {
+        st.set_page = 2;
+        st.set_page_a = 1.0;
+        st.guide_step = -1;
+        st.tip = 0;
+        st.set_scroll = 0;
+        st.set_expanded = usize::MAX;
+        st.set_hover = Ctl::None;
+        st.note_on = false;
+        st.sw_a[7] = 0.0;
+        hide_note_ring(st);
+        setup_render(st);
+        s_dump_save(st, dir, "setup_note_off");
+        if st.note_app < 2 && !st.apps.iter().any(|a| a.target == "@act:note") {
+            let at = st.note_ring_pos.min(st.apps.len());
+            st.apps.insert(at, note_ring_entry());
+        }
+        st.note_on = true;
+        st.sw_a[7] = 1.0;
     }
 
     // 首启场景：**故意先停在外观页**，再走 `guide_start`（首启与「查看引导」共用这条路径），
@@ -18906,6 +18985,58 @@ fn hide_clip_ring(st: &mut State) {
         }
         st.active_app = None;
     }
+}
+
+fn note_ring_entry() -> AppEntry {
+    AppEntry {
+        name: "便签".to_string(),
+        target: "@act:note".to_string(),
+        icon: None,
+        items: Vec::new(),
+        grad: grad_for("便签"),
+    }
+}
+
+/// 把轮盘上那条「便签」摘下来（记住原槽位；不落盘）
+fn hide_note_ring(st: &mut State) {
+    if let Some(i) = st.apps.iter().position(|a| a.target == "@act:note") {
+        st.note_ring_pos = i;
+        st.apps.remove(i);
+        st.set_edit_ai = usize::MAX;
+        st.set_edit_buf.clear();
+        if st.set_expanded == i {
+            st.set_expanded = usize::MAX;
+        } else if st.set_expanded != usize::MAX && st.set_expanded > i {
+            st.set_expanded -= 1;
+        }
+        st.active_app = None;
+    }
+}
+
+/// 设置页那条「便签」开关的落点：关 = 轮盘上摘掉这条图标（也就没有入口了），
+/// 开 = 塞回原来那个槽位。便签内容一律不动，重新打开接着写。
+unsafe fn note_set_on(st: &mut State, on: bool) {
+    if st.note_on == on {
+        return;
+    }
+    st.note_on = on;
+    if on {
+        if st.note_app < 2
+            && st.apps.len() < MAX_APPS
+            && !st.apps.iter().any(|a| a.target == "@act:note")
+        {
+            let at = st.note_ring_pos.min(st.apps.len());
+            st.apps.insert(at, note_ring_entry());
+        }
+    } else {
+        if st.nt_shown {
+            close_note(st); // 关的这一刻它没有入口了
+        }
+        hide_note_ring(st);
+    }
+    save_settings(st);
+    load_icons(st);
+    println!("[*] 便签：{}", if on { "开" } else { "关（轮盘上不展示）" });
 }
 
 /// 设置页那条「剪贴板」开关**唯一**的落点：
