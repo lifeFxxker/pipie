@@ -34,11 +34,21 @@ use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, SetProcessWorkingSetSize};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL};
-use windows::Win32::UI::Shell::{AssocQueryStringW, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
+use windows::Win32::UI::Shell::{AssocQueryStringW, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, DROPFILES, HDROP, ShellExecuteW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+// 剪贴板：读（GetClipboardData 那三件套）+ 写（Empty/SetClipboardData）+ 变化监听
+// （Add/RemoveClipboardFormatListener，配 WM_CLIPBOARDUPDATE）。
+// `GetClipboardSequenceNumber` 是「自己刚写过」的判定依据 —— 写回后系统会再广播一次
+// WM_CLIPBOARDUPDATE，不认出它就是「PiPie 自己的写回」会把自己记进历史（无限套娃）。
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+    GetClipboardOwner, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RemoveClipboardFormatListener, SetClipboardData,
+};
+use windows::Win32::System::Memory::{
+    GlobalLock, GlobalSize, GlobalUnlock, GlobalAlloc, GMEM_MOVEABLE,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Ole::{DROPEFFECT, IDropTarget, IDropTarget_Impl, RegisterDragDrop, ReleaseStgMedium};
 use windows::Win32::System::Com::IDataObject;
@@ -216,6 +226,18 @@ const WM_APP_HITTEST: u32 = WM_APP + 37;
 const WM_APP_WINPROBE: u32 = WM_APP + 38;
 /// 后台抓 `<title>` 跑完了 → **设置窗口**把新名字回填进那条网址条目（见 `title_fetch_start`）。
 const WM_APP_TITLE: u32 = WM_APP + 39;
+/// 呼出/收起**剪贴板历史卡片**（w=1 显示 / 0 隐藏）。托盘菜单和 Ctrl+Alt+V 都走这条，
+/// 因为它可能来自钩子线程 / 托盘回调，直接操作窗口不安全。
+const WM_APP_CLIPSHOW: u32 = WM_APP + 40;
+/// 仅测试：回报卡片状态。w=0 条目总数 / 1 当前页+总页数（`(page<<16)|页数`）
+/// / 2 选中下标+1（0=没选）/ 3 监听开关 / 4 当前 tab / 5 可见 / 6 过滤后条数
+/// / 7 最新一条的类型+1（0=空）。
+const WM_APP_CLIPINFO: u32 = WM_APP + 41;
+/// 仅测试：把第 w 项**写回**剪贴板（和点块 / 按 1~6 完全同一条代码路径）。
+const WM_APP_CLIPFIRE: u32 = WM_APP + 42;
+/// 仅测试：往**真**剪贴板塞一条合成内容（w=0 文字 / 1 图片 / 2 文件），
+/// 让正常的 `WM_CLIPBOARDUPDATE` 采集链跑一遍 —— 不绕过任何门禁。
+const WM_APP_CLIPSIM: u32 = WM_APP + 43;
 
 /// `loading.1` 用这个哨兵值表示「loading 挂在内环**应用本体**上」（图标位置），
 /// 而不是某个外环胶囊 —— 与 `commit_chip == usize::MAX`（内环提交）同一套约定。
@@ -612,6 +634,8 @@ fn unpack_pt(v: i64) -> (i32, i32) {
     ((v >> 32) as i32, v as i32)
 }
 const HOTKEY_TOGGLE: i32 = 1;
+/// 剪贴板历史卡片的呼出键（Ctrl+Alt+V）
+const HOTKEY_CLIP: i32 = 2;
 const TIMER_FRAME: usize = 1;
 /// 「单击胶囊 → 延迟 `DBL_WAIT_MS` 再执行」用的定时器。
 /// 为什么必须延迟：单击与双击在事件层面**无法区分**，只有等第二击来了才知道。
@@ -681,6 +705,29 @@ const MENU_TOGGLE: u16 = 100;
 const MENU_QUIT: u16 = 103;
 const MENU_PERSIST: u16 = 106;
 const MENU_SETTINGS: u16 = 107;
+const MENU_CLIP: u16 = 108;
+/// 托盘：勾掉 = 不再采集（已有历史保留，卡片仍能翻）
+const MENU_CLIPREC: u16 = 109;
+
+/// 剪贴板历史卡片窗口（`RLClip`，GDI 自绘分层窗口）。
+static CLIP_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 「这一条是我们自己写回的」—— 记 `GetClipboardSequenceNumber()`。
+/// 写回后系统还会广播一次 `WM_CLIPBOARDUPDATE`，不认出来就会把 PiPie 的写回
+/// 再记一遍（套娃：历史里出现自己的历史）。
+static CLIP_SELF_SEQ: AtomicU32 = AtomicU32::new(0);
+/// 呼出卡片时的前台窗口 —— 卡片收起后要还回焦点，
+/// 用户选完条目是**要立刻去目标窗口按 Ctrl+V** 的（保守版语义），
+/// 焦点留在 PiPie 上就得自己再点一次目标窗口。
+static CLIP_PREV_FG: AtomicIsize = AtomicIsize::new(0);
+/// 卡片动画帧定时器（和设置页 `TIMER_SETUP_FRAME` 一样只在各自窗口上有意义）
+const TIMER_CLIP_FRAME: usize = 5;
+/// 采集竞态的重试定时器（宿主窗口）。见 `clip_capture` 的返回值。
+const TIMER_CLIP_RETRY: usize = 7;
+/// 本轮重试到第几次了（每次新的 `WM_CLIPBOARDUPDATE` 归零）。
+static CLIP_TRY: AtomicU8 = AtomicU8::new(0);
+/// 重试上限：4 次 × 120ms ≈ 半秒。超过就认了 —— 写入方真的没提交内容，
+/// 一直挂定时器只是白开着剪贴板。
+const CLIP_RETRY_MAX: u8 = 4;
 
 // ───────────────────────── 模型 ─────────────────────────
 
@@ -710,6 +757,31 @@ struct AppEntry {
     icon: Option<IconTex>, // mip 链纹理（加载时按 1/1.4 逐级降采样）
     items: Vec<ItemEntry>, // 外环内容（悬停展开）
     grad: usize,           // 磁贴渐变配色索引
+}
+
+/// 剪贴板历史的一条。设计上只有**三种**块，对应卡片上的三个类型 chip：
+/// `kind` 0 文字 / 1 图片 / 2 文件（夹）。
+/// ⚠️ 图片的像素**不进内存**（一张 4K 截图的 CF_DIB 有 30MB+，60 条就是 1GB+）：
+/// 采集时原样落盘到 `config_dir\clip\{seq}.dib`，内存里只留路径和尺寸；
+/// 缩略图是卡片开着时**按当前页**懒建、翻页/关窗即释放（`cl_thumbs`）。
+#[derive(Clone)]
+struct ClipItem {
+    kind: u8,
+    /// 文字内容（kind=0）；文件 = 换行拼接的路径列表（kind=2）；图片留空
+    text: String,
+    /// kind=1：`.dib` 文件绝对路径（写回时原样读回来喂 CF_DIB）
+    img: String,
+    /// 采集时刻（unix 秒）
+    ts: i64,
+    /// 来源进程名（`fg_proc_name`），空 = 认不出
+    src: String,
+    pinned: bool,
+    /// kind=1 的原始尺寸（显示「1920×1080」用）
+    w: i32,
+    h: i32,
+    /// kind=1：`.dib` 字节数。去重要靠它 —— 两张**同尺寸**的不同截图
+    /// 光比 w/h 会被误判成同一条（比 w/h+字节数就基本不会撞）。
+    n: i64,
 }
 
 /// 待确认移除的内容。设计要点：**请求移除的那一刻就从 `st.apps` 摘下**，
@@ -996,9 +1068,10 @@ struct State {
     set_hov_a: f32,
     /// 切页淡入进度 0→1
     set_page_a: f32,
-    /// 三个开关的滑动动画值（0 关 / 1 开）：常驻、监听、开机自启
-    /// 开关动画量：0 常驻 / 1 监听 / 2 开机自启（交互页）/ 3 全屏放行(游戏模式)（交互页）
-    sw_a: [f32; 5],
+    /// 开关的滑动动画值（0 关 / 1 开；中间态用于圆钮滑动过渡）。按序号：
+    /// 0 常驻 / 1 监听 / 2 开机自启（交互页）/ 3 全屏放行(游戏模式)（交互页）
+    /// / 4 显示应用名称（交互页）/ 5 录屏模式（外观页）
+    sw_a: [f32; 6],
     /// 悬停中的「?」tooltip id（0 = 不显示）；见 `tip_lines`
     tip: u8,
     /// 开机自启（ini `autostart`；**缺失视为开** → 默认勾选）。
@@ -1090,6 +1163,54 @@ struct State {
     /// 分层窗口的屏幕位置（UpdateLayeredWindow 要用）
     set_x: i32,
     set_y: i32,
+
+    // ── 剪贴板历史（方形卡片）──
+    /// 采集开关（ini `clip=`）。关掉时**停止录入**，已有历史仍可呼出查看。
+    cl_on: bool,
+    /// 密码管理器的复制内容不入历史（ini `clip_pwd=`，⚠️ 缺省 = 开）
+    cl_pwd: bool,
+    cl_items: Vec<ClipItem>,
+    /// 0 全部 / 1 文字 / 2 图片 / 3 文件
+    cl_tab: u8,
+    /// 搜索框内容（卡片一呼出就是聚焦态，不需要先点一下）
+    cl_q: String,
+    cl_page: usize,
+    /// 选中项下标（usize::MAX = 没选）
+    cl_sel: usize,
+    /// 卡片当前可见（`WM_CLIPBOARDUPDATE` 刷新时要判断，别给藏着的窗口算版面）
+    cl_shown: bool,
+    cl_hover: CCtl,
+    cl_hover_prev: CCtl,
+    cl_hov_a: f32,
+    cl_tracking: bool,
+    cl_last: Instant,
+    /// toast 文案 + 到期时刻（`now_s()`）
+    cl_toast: String,
+    cl_toast_at: f64,
+    /// 搜索框光标是否处于「亮」的那半拍（500ms 翻一次，见 `TIMER_CLIP_BLINK`）。
+    /// ⚠️ 用独立的慢定时器而不是让 16ms 帧循环去算相位：卡片是 480² 的画布，
+    ///    一帧要降采样 100 万像素，为了一闪一闪的光标空转它不值。
+    cl_blink: bool,
+    /// 卡片字体（和设置页一样：字号 ×SS，关窗删除）
+    cf_body: HFONT,
+    cf_tile: HFONT,
+    cf_small: HFONT,
+    cf_bold: HFONT,
+    /// 超采样画布（同设置页：hi = SS 倍 GDI 画布，lo = 降采样结果直接上屏）
+    c_hi_bits: *mut u8,
+    c_hi_dc: HDC,
+    c_hi_bmp: HBITMAP,
+    c_lo_bits: *mut u8,
+    c_lo_dc: HDC,
+    c_lo_bmp: HBITMAP,
+    /// 缩略图缓存（见 `ClipThumb`）。
+    /// ⚠️ 只存**当前页**用到的：翻页时整批释放（60 张全缓存 = 24MB 常驻，不能那么干）。
+    cl_thumbs: Vec<ClipThumb>,
+    cl_x: i32,
+    cl_y: i32,
+    /// 轮盘上的「剪贴板」内置条目：`< 2` = 该有（老配置首次自动补一个），
+    /// `2` = 用户自己把它拖出过环，**永远不再复活**。
+    clip_app: u8,
 }
 
 impl State {
@@ -1232,7 +1353,7 @@ impl State {
             set_hover_prev: Ctl::None,
             set_hov_a: 1.0,
             set_page_a: 1.0,
-            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0],
+            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
             tip: 0,
             // 默认开：ini 里没有 `autostart=` 时就是它（用户主动关才变 false）
             autostart: true,
@@ -1275,6 +1396,38 @@ impl State {
             s_lo_bmp: HBITMAP(ptr::null_mut()),
             set_x: 0,
             set_y: 0,
+            // ⚠️ `cl_on` 缺省 = 开：卡片里没东西就是一张空卡，第一次按 Ctrl+Alt+V 会
+            //    以为功能坏了。真要关是在设置里关（`clip=0`），不是靠默认。
+            cl_on: true,
+            cl_pwd: true,
+            cl_items: Vec::new(),
+            cl_tab: 0,
+            cl_q: String::new(),
+            cl_page: 0,
+            cl_sel: usize::MAX,
+            cl_shown: false,
+            cl_hover: CCtl::None,
+            cl_hover_prev: CCtl::None,
+            cl_hov_a: 0.0,
+            cl_tracking: false,
+            cl_last: Instant::now(),
+            cl_toast: String::new(),
+            cl_toast_at: 0.0,
+            cl_blink: true,
+            cf_body: HFONT(ptr::null_mut()),
+            cf_tile: HFONT(ptr::null_mut()),
+            cf_small: HFONT(ptr::null_mut()),
+            cf_bold: HFONT(ptr::null_mut()),
+            c_hi_bits: ptr::null_mut(),
+            c_hi_dc: HDC(ptr::null_mut()),
+            c_hi_bmp: HBITMAP(ptr::null_mut()),
+            c_lo_bits: ptr::null_mut(),
+            c_lo_dc: HDC(ptr::null_mut()),
+            c_lo_bmp: HBITMAP(ptr::null_mut()),
+            cl_thumbs: Vec::new(),
+            cl_x: 0,
+            cl_y: 0,
+            clip_app: 0,
         }
     }
 }
@@ -2513,9 +2666,14 @@ fn glass_mean(raw: &[u8]) -> u64 {
 
 /// 一块 Vec 存两层：原图在前、模糊图在后（`glass_px` 要同时采样两层）
 fn build_glass(raw: &[u8]) -> Vec<u8> {
+    build_glass_sq(raw, CANVAS as usize)
+}
+
+/// 同上，边长参数版（剪贴板卡片用 `CL_WW`）。
+fn build_glass_sq(raw: &[u8], cw: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(raw.len() * 2);
     buf.extend_from_slice(raw);
-    buf.extend_from_slice(&blur_glass(raw));
+    buf.extend_from_slice(&blur_glass_sq(raw, cw));
     buf
 }
 
@@ -2805,7 +2963,13 @@ unsafe fn glass_live_stop(hwnd: HWND) {
 ///
 /// 输出是**非预乘** BGRA（与 `flat_*` 的输入约定一致），直接喂 `glass_px`。
 fn blur_glass(src: &[u8]) -> Vec<u8> {
-    let cw = CANVAS as usize;
+    blur_glass_sq(src, CANVAS as usize)
+}
+
+/// `blur_glass` 的边长参数版：轮盘的缓冲是 `CANVAS²`，剪贴板卡片是 `CL_WW²`，
+/// 算法一个字节都不该有两份（缩 1/2 → 三次 1px 盒式 → 双线性放回）。
+/// ⚠️ 只支持**正方**缓冲 —— 两处用都是方的，`cw` 同时当宽和高用。
+fn blur_glass_sq(src: &[u8], cw: usize) -> Vec<u8> {
     let dw = cw / GLASS_DN;
     let mut small: Vec<[f32; 3]> = vec![[0.0; 3]; dw * dw];
     // ① 降采样（盒式均值）
@@ -3334,6 +3498,32 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 let py = cy + dy * (sz * 0.5 + g * 0.5);
                 flat_round_rect(
                     buf, px, py, sz * 0.5, sz * 0.5, sz * 0.22,
+                    pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, icon_a,
+                );
+            }
+        } else if st.apps[i].target == "@act:clip" {
+            // 剪贴板：一圈细边 + 顶上那根夹条 + 两行字。
+            // 这块画布没有「只描边不填充」的原语，所以边用四根实心墨条拼，
+            // 留出来的缝自然透出盘面 —— 描边宽度按「宁细勿粗」压到 1.3px 起。
+            let bw = icon_side * 0.46;
+            let bh = icon_side * 0.52;
+            let t = (icon_side * 0.055).max(1.3) * 0.5;
+            let by = cy + icon_side * 0.04;
+            let rd = t * 0.9;
+            for (x, y, hw, hh) in [
+                // 夹条跨在板顶正中
+                (cx, by - bh * 0.5, bw * 0.22, t * 1.6),
+                // 四条边
+                (cx, by - bh * 0.5 + t, bw * 0.5, t),
+                (cx, by + bh * 0.5 - t, bw * 0.5, t),
+                (cx - bw * 0.5 + t, by, t, bh * 0.5),
+                (cx + bw * 0.5 - t, by, t, bh * 0.5),
+                // 两行「内容」
+                (cx, by - bh * 0.10, bw * 0.28, t * 0.8),
+                (cx, by + bh * 0.14, bw * 0.22, t * 0.8),
+            ] {
+                flat_round_rect(
+                    buf, x, y, hw, hh, rd,
                     pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, icon_a,
                 );
             }
@@ -4616,6 +4806,24 @@ fn is_explorer_exe(exe: &str) -> bool {
     exe_name_of(exe).as_deref() == Some("explorer.exe")
 }
 
+/// 内环里的「浏览器 hub」索引 —— 拖进来的**网址**和**浏览器窗口**应归它，
+/// 而不是另开一个 `msedge` 内环（和上面 `folder_hub_index` 完全对称的那一条）。
+///
+/// 为什么需要它（用户 2026-10-29：「默认带着个浏览器，拖动网址后新增一个内环浏览器」）：
+/// 出厂默认的「浏览器」target 是 **URL**（`https://www.bing.com`），不是 exe；
+/// 而 `host_app_index()` 只按**可执行文件名**比（`exe_name_of("https://…")` 恒为 `None`）
+/// → 默认那个环**永远匹配不上** → 走「新建内环」分支，图标名直接取 exe 文件名（`msedge`）。
+/// 拖文件夹那条路早就有 `folder_hub_index` 兜着，浏览器这条一直缺，于是同类的东西
+/// 落在两个不同内环里 —— 用户看到的「对不上」。
+///
+/// 判据用 `app_accepts_url`（本体是 URL 或本体是浏览器 exe）+ 「已经聚合了网址条目」，
+/// 和拖网址那条路原来用的 `target.contains("://")` 是同一件事的说法，只是收成一处。
+fn browser_hub_index(st: &State) -> Option<usize> {
+    st.apps
+        .iter()
+        .position(|a| app_accepts_url(a) || a.items.iter().any(|it| is_url(&it.target)))
+}
+
 /// 当前拖拽会话「已算过预览的载荷签名」。同一会话里 DragOver 每 3px 就跑一次
 /// `compute_drop_preview`，而 .lnk 载荷每次都要 `resolve_host_exe`(COM 解析快捷方式)
 /// + `decode_icon`(~76ms) + `host_app_index`(逐 app 再解析 .lnk) —— 一次拖拽上百次
@@ -4682,6 +4890,17 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
             });
         }
         return;
+    }
+    // 拖**网址**：优先归到已有的「浏览器」hub（默认「浏览器」本体就是条 URL）→ 高亮它。
+    // 没有 hub 才让给下面那条通用逻辑（宿主=系统默认浏览器 → 浮「新建 msedge」幽灵）。
+    // ⚠️ 和上面 is_dir 一模一样的坑：`resolve_host_exe` 把网址解析成 `msedge.exe`，
+    //    而 `host_app_index` 按 exe 名比 → URL 型的默认「浏览器」匹配不上 → 幽灵说「给你
+    //    新开一个浏览器内环」，丢在盘心/空白就真建出来了（用户 2026-10-29 报的正是这条）。
+    if it.is_url {
+        if let Some(ai) = browser_hub_index(st) {
+            st.drop_suggest = Some(ai);
+            return;
+        }
     }
     // 载荷本身就是应用（exe/lnk）→ 也浮一个**图标占位符**（与底下「认不出宿主」同款幽灵）：
     // 拖动中就能看见「会落在哪」，松手 `create_from_ghost` 把它变实体（2026-10-18：
@@ -4810,9 +5029,7 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
             if ai < st.apps.len() { Some(ai) } else { None }
         } else if it.is_url {
             // 推荐：目标本身是 URL 或已有 URL 条目的应用（= 浏览器）
-            st.apps
-                .iter()
-                .position(|a| a.target.contains("://") || a.items.iter().any(|x| x.target.contains("://")))
+            browser_hub_index(st)
         } else if it.is_dir {
             // 推荐：已有的文件夹 hub（target=shell:UsersFilesFolder 的默认「文件夹」）
             // → 归它外环；没有 hub 才退到资源管理器（target 或已有条目是目录）
@@ -4894,6 +5111,7 @@ fn default_apps() -> Vec<(String, String)> {
     vec![
         ("文件夹".to_string(), "shell:UsersFilesFolder".to_string()),
         ("浏览器".to_string(), "https://www.bing.com".to_string()),
+        ("剪贴板".to_string(), "@act:clip".to_string()),
         ("开始菜单".to_string(), "@act:start".to_string()),
     ]
 }
@@ -5371,6 +5589,14 @@ fn ensure_host_app(st: &mut State, exe: &str) -> usize {
     //    否则新拖进来的文件夹窗口还会被塞回那个重复的 explorer 内环。
     if is_explorer_exe(exe) {
         if let Some(ai) = folder_hub_index(st) {
+            return ai;
+        }
+    }
+    // 浏览器窗口同理 → 归「浏览器」hub，而不是另开一个 msedge/chrome 内环。
+    // ⚠️ 同样排在 `host_app_index` 之前：历史 bug 建出来的重复 msedge 内环也要让位，
+    //    否则新拖进来的浏览器窗口会继续塞进那个重复环（默认环形同虚设）。
+    if is_browser_exe(exe) {
+        if let Some(ai) = browser_hub_index(st) {
             return ai;
         }
     }
@@ -5987,6 +6213,7 @@ unsafe fn find_window_of_exe(exe: &str) -> Option<HWND> {
                 | "Windows.UI.Core.CoreWindow"
                 | "RLHost"
                 | "RLRing"
+                | "RLClip"
         ) {
             return BOOL(1);
         }
@@ -6161,15 +6388,18 @@ fn title_score(tab: &str, page: &str) -> i32 {
     0
 }
 
-/// 收集某窗口类的可见顶层窗口（Chromium 系浏览器都是 `Chrome_WidgetWin_1`）。
-unsafe fn windows_of_class(cls: &str) -> Vec<HWND> {
+/// 收集某窗口类的顶层窗口（Chromium 系浏览器都是 `Chrome_WidgetWin_1`）。
+/// ⚠️ `vis_only=false` 只给诊断用：浏览器**最小化**时 `IsWindowVisible` 是 false，
+///    按可见过滤会把「开着但收在任务栏」误报成「没开」—— 日志要能看出这一环。
+unsafe fn windows_of_class(cls: &str, vis_only: bool) -> Vec<HWND> {
     struct Scan<'a> {
         cls: &'a str,
+        vis_only: bool,
         out: Vec<HWND>,
     }
     unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         let s = &mut *(lp.0 as *mut Scan);
-        if !IsWindowVisible(hwnd).as_bool() {
+        if s.vis_only && !IsWindowVisible(hwnd).as_bool() {
             return BOOL(1);
         }
         let mut b = [0u16; 64];
@@ -6179,7 +6409,7 @@ unsafe fn windows_of_class(cls: &str) -> Vec<HWND> {
         }
         BOOL(1)
     }
-    let mut s = Scan { cls, out: Vec::new() };
+    let mut s = Scan { cls, vis_only, out: Vec::new() };
     let _ = EnumWindows(Some(cb), LPARAM(&mut s as *mut _ as isize));
     s.out
 }
@@ -6474,7 +6704,10 @@ fn looks_like_path(s: &str) -> bool {
         || t.starts_with("\\\\")
 }
 
-/// 浏览器窗口**当前标签页的网址**（拖标题栏时用它当 relaunch）。
+/// 地址栏元素的**原文**（可能是 `https://x/y`，也可能被浏览器藏掉协议变成 `x.com/y`）。
+/// 拆出去是因为两件事要的严格度不同：
+/// · `browser_window_url`（拖窗口存 relaunch）必须是**带协议**的 URL；
+/// · 「切到已打开的标签」比的是去协议后的同一串，所以协议被藏掉也照样能用。
 ///
 /// Chromium 系（Edge / Chrome）的地址栏是 `ct = Edit(50004)`、
 /// `cls = OmniboxViewViews`、`name = "地址和搜索栏"`，`ValuePattern.CurrentValue`
@@ -6482,7 +6715,7 @@ fn looks_like_path(s: &str) -> bool {
 ///
 /// ⚠️ 必须走**后台线程**（UIA 首次 `ElementFromHandle` 实测 15~3300ms，
 ///    冷启动更慢）—— 调用点是 `wincap_probe_start`（只在松手落盘那一次）。
-unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
+unsafe fn omnibox_text(hwnd: HWND) -> Option<String> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Accessibility::{CUIAutomation, TreeScope_Descendants};
 
@@ -6554,8 +6787,11 @@ unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
                 }
             }
         }
+        // ⚠️ 这里**不筛协议**：Edge 对 `http://` 站点（尤其 127.0.0.1 这种）常把
+        //    `http://` 藏掉，只给 `127.0.0.1:8777/x.html`。协议在不在由调用方决定 ——
+        //    「切到已打开的标签」比的是**去掉协议之后的同一串**，所以它要的是原文。
         let t = url.trim();
-        if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("file://") {
+        if !t.is_empty() {
             return Some(t.to_string());
         }
     }
@@ -6565,8 +6801,27 @@ unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
     None
 }
 
+/// 浏览器窗口**当前标签页的网址**（拖标题栏时用它当 relaunch）。
+///
+/// Chromium 系（Edge / Chrome）的地址栏是 `ct = Edit(50004)`、
+/// `cls = OmniboxViewViews`、`name = "地址和搜索栏"`，`ValuePattern.CurrentValue`
+/// 直接给完整 URL（实测能拿到 `https://cn.bing.com/images/search?q=…`）。
+///
+/// ⚠️ 必须走**后台线程**（UIA 首次 `ElementFromHandle` 实测 15~3300ms，
+///    冷启动更慢）—— 调用点是 `wincap_probe_start`（只在松手落盘那一次）。
+unsafe fn browser_window_url(hwnd: HWND) -> Option<String> {
+    let t = omnibox_text(hwnd)?;
+    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("file://") {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 /// 在浏览器里找标题命中的标签页 → 选中它（= 切换过去）。返回该浏览器窗口。
-unsafe fn select_tab_by_title(page_title: &str) -> Option<HWND> {
+/// `tr` = 诊断轨迹（只往数组里塞文本，不参与判断）；漏判时日志要能看出
+/// 是「没找到标签元素」还是「找到了但对不上」。
+unsafe fn select_tab_by_title(page_title: &str, tr: &mut Vec<String>) -> Option<HWND> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern, TreeScope_Descendants,
@@ -6574,12 +6829,24 @@ unsafe fn select_tab_by_title(page_title: &str) -> Option<HWND> {
     };
     let p = norm_title(page_title);
     if p.chars().count() < 2 {
+        tr.push(format!("标题太短(<2字)“{p}”→ 不比对"));
         return None;
     }
-    let ui: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+    let ui: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+        Ok(u) => u,
+        Err(_) => {
+            tr.push("UIA 起不来(CoCreateInstance 失败)".to_string());
+            return None;
+        }
+    };
     let cond = ui.CreateTrueCondition().ok()?;
     let mut best: Option<(i32, HWND, IUIAutomationSelectionItemPattern)> = None;
-    for hw in windows_of_class("Chrome_WidgetWin_1") {
+    let mut seen = 0usize;
+    // 诊断用：命中的（带分）+ 扫到的一律留几个名字，漏判时日志才有东西可看
+    let mut named: Vec<(i32, String)> = Vec::new();
+    let mut sample: Vec<String> = Vec::new();
+    let mut nopattern = 0usize;
+    for hw in windows_of_class("Chrome_WidgetWin_1", true) {
         let Ok(root) = ui.ElementFromHandle(hw) else {
             continue;
         };
@@ -6592,47 +6859,181 @@ unsafe fn select_tab_by_title(page_title: &str) -> Option<HWND> {
             if e.CurrentControlType().map(|c| c.0).unwrap_or(-1) != UIA_TabItemControlTypeId.0 {
                 continue;
             }
-            let Ok(name) = e.CurrentName() else { continue };
-            let sc = title_score(&norm_title(&name.to_string()), &p);
-            if sc == 0 {
-                continue;
+            seen += 1;
+            let name = e.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+            if sample.len() < 24 {
+                // 标签名可能很长（GitHub 这种），截断保住整行的可读性
+                let cut: String = name.chars().take(40).collect();
+                sample.push(if name.chars().count() > 40 {
+                    format!("{cut}…")
+                } else {
+                    cut
+                });
             }
-            if best.as_ref().map(|(b, _, _)| sc > *b).unwrap_or(true) {
-                if let Ok(pat) = e
-                    .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
-                {
-                    best = Some((sc, hw, pat));
+            let sc = title_score(&norm_title(&name), &p);
+            if sc > 0 {
+                named.push((sc, name));
+                if best.as_ref().map(|(b, _, _)| sc > *b).unwrap_or(true) {
+                    if let Ok(pat) = e
+                        .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+                    {
+                        best = Some((sc, hw, pat));
+                    } else {
+                        nopattern += 1;
+                    }
                 }
             }
         }
     }
-    let (_, hw, pat) = best?;
+    named.sort_by(|a, b| b.0.cmp(&a.0));
+    let list = |v: &[(i32, String)]| {
+        v.iter()
+            .take(4)
+            .map(|(s, t)| format!("{s}:{t}"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    if seen == 0 {
+        tr.push("UIA 里一个 TabItem 都没扫到".to_string());
+    } else if named.is_empty() {
+        tr.push(format!(
+            "标签 {seen} 个，全对不上（对：{p}｜样：{}）",
+            sample.join(" / ")
+        ));
+    } else {
+        tr.push(format!("标签 {seen} 个，打分命中：{}", list(&named)));
+    }
+    if nopattern > 0 {
+        tr.push(format!("{nopattern} 个命中标签拿不到 SelectionItem 模式（选不了）"));
+    }
+    let (sc, hw, pat) = best?;
+    tr.push(format!("选定 打分={sc}"));
     if !pat.CurrentIsSelected().map(|b| b.as_bool()).unwrap_or(false) {
         let _ = pat.Select();
     }
     Some(hw)
 }
 
+/// `%XX` 解码 —— 只用于比对：地址栏里读到的是转义后的（`%E5%B7%A5…`），
+/// 而设置里存的是原文，不解码就没法比（中文网址 / 带空格的查询串都会栽在这）。
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 「同一个页面的两种写法」归一化，只用于比对，**不做任何模糊**（宁可漏、不可切错）：
+/// 解 %XX、小写、去 fragment、去协议、去结尾斜杠。
+/// 去协议是必须的：浏览器地址栏的无障碍值经常**不带** `http://`（实测 127.0.0.1 那种就不带），
+/// 而 https 站点普遍会把 http 升级成 https，比协议没有意义。
+fn norm_url(u: &str) -> String {
+    let t = pct_decode(u.trim()).to_lowercase();
+    let t = t.split('#').next().unwrap_or("");
+    let rest = match t.strip_prefix("https://") {
+        Some(r) => r,
+        None => match t.strip_prefix("http://") {
+            Some(r) => r,
+            // file:/// 这类没有「协议升级」问题，原样比
+            None => return t.to_string(),
+        },
+    };
+    rest.trim_end_matches('/').to_string()
+}
+
+/// **某个浏览器窗口「当前那个标签」的网址**正好就是 target → 直接置前这个窗口。
+///
+/// 为什么要有这一步（2026-10-29）：标题比对要先联网抓 `<title>`，实测 **1~3 秒**，
+/// 而且登录墙 / 内网 / SPA（运行时改标题 / 重定向后标题不一样）根本抓不到或对不上 ——
+/// 用户报的「还是会新开一个」大多掉在这里。地址栏读到的是**真 URL**：
+/// 不用联网、不受标题影响，是唯一「准」的那条路（见 `omnibox_text`）。
+/// 只能命中**当前标签**；后台标签仍交给后面的标题比对。
+unsafe fn hit_active_tab_url(target: &str, tr: &mut Vec<String>) -> bool {
+    let want = norm_url(target);
+    let t0 = Instant::now();
+    let mut got: Vec<String> = Vec::new();
+    for hw in windows_of_class("Chrome_WidgetWin_1", true) {
+        let Some(u) = omnibox_text(hw) else {
+            continue;
+        };
+        if norm_url(&u) == want {
+            tr.push(format!(
+                "地址栏命中({}ms)：当前标签={u} → 置前该窗口",
+                t0.elapsed().as_millis()
+            ));
+            focus_window(hw);
+            return true;
+        }
+        if got.len() < 3 {
+            got.push(u.chars().take(60).collect());
+        }
+    }
+    tr.push(format!(
+        "地址栏读到 {} 个窗口的当前标签({}ms)：{} → 没一个对得上",
+        got.len(),
+        t0.elapsed().as_millis(),
+        if got.is_empty() { "<一个都读不到>".to_string() } else { got.join(" / ") }
+    ));
+    false
+}
+
 /// 网址已经开着 → 切到那个标签并置前。返回 false = 没开（调用方照常打开）。
-/// ⚠️ 慢（联网 + UI Automation 共 0.5~2 秒）→ **只能从后台线程调**（见 `switch_bg`）。
-unsafe fn switch_to_open_tab(url: &str) -> bool {
-    // 没有 Chromium 系浏览器在跑就别联网抓标题了（省掉最贵的那一步）
-    if windows_of_class("Chrome_WidgetWin_1").is_empty() {
+/// ⚠️ 慢（UIA + 联网抓标题 共 0.5~3 秒）→ **只能从后台线程调**（见 `switch_bg`）。
+/// `tr` = 诊断轨迹，由调用方交给 `tab_log` 落一行 `TABHIT`。
+unsafe fn switch_to_open_tab(url: &str, tr: &mut Vec<String>) -> bool {
+    let vis = windows_of_class("Chrome_WidgetWin_1", true).len();
+    let all = windows_of_class("Chrome_WidgetWin_1", false).len();
+    tr.push(format!("Chromium 窗口 可见={vis} 全部={all}"));
+    // 没有 Chromium 系浏览器窗口就别费劲了。
+    // ⚠️ 注意「可见」这里指 WS_VISIBLE：**最小化仍然算可见**（实测确认），
+    //    所以不可见的那些是 webview2 / about:blank 的后台宿主窗口，不是收起来的浏览器。
+    if vis == 0 {
+        tr.push(if all == 0 {
+            "浏览器没在跑 → 新开".to_string()
+        } else {
+            "只有不可见的 Chromium 宿主窗口（webview2 之类）→ 新开".to_string()
+        });
         return false;
     }
-    // ① 先试标题缓存（不联网，最快）
-    if let Some(t) = cache_get(url) {
-        if let Some(hw) = select_tab_by_title(&t) {
+    // ⓪ 最准也最便宜的一条：某个窗口的**当前标签**网址就是这个网址 → 直接置前
+    if hit_active_tab_url(url, tr) {
+        return true;
+    }
+    // ① 再试标题缓存（不联网，最快）
+    let cached = cache_get(url);
+    tr.push(format!(
+        "缓存标题={}",
+        cached.as_deref().unwrap_or("<无>")
+    ));
+    if let Some(t) = &cached {
+        if let Some(hw) = select_tab_by_title(t, tr) {
             focus_window(hw);
             return true;
         }
     }
     // ② 缓存没中（或标题变了）→ 联网重抓一次再试
+    let t0 = Instant::now();
     let Some(t) = fetch_page_title(url) else {
+        tr.push(format!("联网抓标题失败({}ms) → 新开", t0.elapsed().as_millis()));
         return false;
     };
+    tr.push(format!(
+        "联网抓到标题“{t}”({}ms)",
+        t0.elapsed().as_millis()
+    ));
     cache_put(url, &t);
-    match select_tab_by_title(&t) {
+    match select_tab_by_title(&t, tr) {
         Some(hw) => {
             focus_window(hw);
             true
@@ -6641,18 +7042,34 @@ unsafe fn switch_to_open_tab(url: &str) -> bool {
     }
 }
 
+/// 把一次「网址是不是已经开着」的完整判定轨迹落进主日志。
+/// 只在诊断用，不参与任何判断 —— 用户报「又新开一个标签」时，答案应该能在日志里读出来。
+fn tab_log(src: &str, url: &str, hit: bool, tr: &[String]) {
+    diag_line(
+        &format!("{}\\radial_log.txt", log_dir()),
+        &format!(
+            "TABHIT [{src}] hit={} url={url} | {}",
+            hit as u8,
+            tr.join(" | ")
+        ),
+    );
+}
+
 /// **后台**执行上面那件事，完成后 post `WM_APP_LOADED` 让 UI 线程收尾。
 /// ⚠️ 必须有自己的 `CoInitializeEx`（UIA 的 `CUIAutomation` 是 COM 对象；
 /// 拿 UI 线程的 COM 公寓跨线程用会直接失败）。
 fn switch_bg(url: String) {
     std::thread::spawn(move || {
-        let hit = unsafe {
+        let (hit, tr) = unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
                 None,
                 windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
             );
-            switch_to_open_tab(&url)
+            let mut tr = Vec::new();
+            let hit = switch_to_open_tab(&url, &mut tr);
+            (hit, tr)
         };
+        tab_log("bg", &url, hit, &tr);
         LOAD_HIT.store(hit, Ordering::SeqCst);
         unsafe { post(WM_APP_LOADED, 0, 0) };
     });
@@ -6749,13 +7166,12 @@ unsafe fn update_exempt(st: &State) {
 
 // ───────────────────── 执行 ─────────────────────
 
-fn launch(target: &str) {
+/// 「打开」本体：程序已经在跑就只置前窗口，否则 `ShellExecuteW`。
+/// ⚠️ **不含**网址的「已开着就切过去」判定 —— 那条由 `launch()`（同步入口）或
+///    `switch_bg()`（点击路径的异步查询）负责；查过之后的第二次打开必须走这里，
+///    否则会在 UI 线程上再联网抓一遍标题（= 环冻住 1~3 秒）。
+fn open_target(target: &str) {
     unsafe {
-        // 网址已经开着 → 切到那个标签并置前
-        if is_url(target) && switch_to_open_tab(target) {
-            println!("[*] 切到已打开网页 · {target}");
-            return;
-        }
         // 目标程序**已经在跑** → 只把它的窗口弹到最前，不再重复启动
         if let Some(exe) = resolve_target_exe(target) {
             if let Some(hw) = find_window_of_exe(&exe) {
@@ -6774,6 +7190,20 @@ fn launch(target: &str) {
             SW_SHOWNORMAL,
         );
     }
+}
+
+fn launch(target: &str) {
+    // 网址已经开着 → 切到那个标签并置前
+    if is_url(target) {
+        let mut tr = Vec::new();
+        let hit = unsafe { switch_to_open_tab(target, &mut tr) };
+        tab_log("launch", target, hit, &tr);
+        if hit {
+            println!("[*] 切到已打开网页 · {target}");
+            return;
+        }
+    }
+    open_target(target);
 }
 
 /// 挂上 loading（任何"慢操作"开始时调）。
@@ -6953,8 +7383,8 @@ fn commit(st: &mut State) {
         return;
     }
     unlock(st);
-    // ── 内置动作（目前只有「开始菜单」）──
-    // target 是 `@act:start` 这种前缀，根本不是 exe —— 必须在走 launch 之前分派，
+    // ── 内置动作（「开始菜单」和「剪贴板」）──
+    // target 是 `@act:xxx` 这种前缀，根本不是 exe —— 必须在走 launch 之前分派，
     // 否则会去 `ShellExecuteW` 一个 "@act:start"。
     if let Some(ai) = st.active_app {
         let t = st.apps.get(ai).map(|a| a.target.clone()).unwrap_or_default();
@@ -6963,6 +7393,12 @@ fn commit(st: &mut State) {
                 hide_menu(st);
                 open_start_menu();
             }
+            return;
+        }
+        if t == "@act:clip" {
+            // 剪贴板卡片：不走淡出 —— `open_clip` 要在卡片出现前抓这一块桌面做玻璃底，
+            // 轮盘还留在屏幕上就会被拍进玻璃里（`snap_glass` 那条老规矩）。
+            unsafe { open_clip(st) };
             return;
         }
     }
@@ -6999,7 +7435,7 @@ fn commit(st: &mut State) {
     // 这里先挂上 loading 状态并**保持菜单可见**（宠物切「忙碌」、该段显示跳动的点），
     // 查完由 `WM_APP_LOADED` 收尾。
     if let Some((ai, ci, label, target)) = action.clone() {
-        if is_url(&target) && unsafe { !windows_of_class("Chrome_WidgetWin_1").is_empty() } {
+        if is_url(&target) && unsafe { !windows_of_class("Chrome_WidgetWin_1", true).is_empty() } {
             if let Some(cix) = ci {
                 start_loading(st, ai, cix, LOAD_KIND_URL);
                 st.loading_url = target.clone();
@@ -8372,6 +8808,15 @@ unsafe fn read_persistent(st: &mut State) {
                 st.onb_scroll = v != "0";
             } else if let Some(v) = get("guide_seen=") {
                 st.guide_seen = v != "0";
+            } else if let Some(v) = get("clip=") {
+                // 缺省 = 开：卡片空着比「默认不录」更让人以为坏了
+                st.cl_on = v != "0";
+            } else if let Some(v) = get("clip_pwd=") {
+                // 缺省 = 开（密码管理器的复制内容不进历史）
+                st.cl_pwd = v != "0";
+            } else if let Some(v) = get("clip_app=") {
+                // 轮盘上的「剪贴板」条目：缺省 0 = 该有；2 = 用户自己删过，别再塞回去
+                st.clip_app = v.parse::<u8>().unwrap_or(0).min(2);
             } else if let Some(v) = get("update_auto=") {
                 st.update_auto = v != "0";
             } else if let Some(v) = get("update_last_check=") {
@@ -8574,6 +9019,25 @@ unsafe fn load_ini(st: &mut State) {
     // 每次重载都重算「用户是否自己配过环」：他可能刚拖进来一个新应用，
     // 也可能刚删掉了默认项 —— 两个方向都该立刻停止"拖进来添加"的引导。
     st.onb_customized = apps_customized(st);
+    // ── 轮盘上的「剪贴板」：老配置首次自动补一个 ──
+    // 出厂默认里已经带着它（`default_apps`），但存过配置的人不会再走那条路。
+    // `clip_app`：0/缺省 = 该有；2 = 他自己把它拖出过环 → **永远不再塞回去**。
+    // 重复注入由「apps 里已有这个 target」挡住，所以不必先落一个标记才能防重。
+    if st.clip_app < 2
+        && st.apps.len() < MAX_APPS
+        && !st.apps.iter().any(|a| a.target == "@act:clip")
+    {
+        st.apps.push(AppEntry {
+            name: "剪贴板".to_string(),
+            target: "@act:clip".to_string(),
+            // 图标：这个 target 不是文件，`decode_icon` 取不到东西 ——
+            // 轮盘对 `@act:` 一律自绘（见画内环图标那一支）。
+            icon: None,
+            items: Vec::new(),
+            grad: grad_for("剪贴板"),
+        });
+        ini_insert_app(&st.ini_path, "剪贴板", "@act:clip");
+    }
     load_icons(st);
     // 窗口条目（kind==1）的 live_hwnd 不持久化，重启后这里按「exe + 标题」重新
     // 匹配一个还活着的活动窗口，没匹配到（已关）就保持 0（渲染灰显、点击重开）。
@@ -10139,6 +10603,10 @@ fn cancel_remove(st: &mut State) {
         match p {
             PendingRm::App { pos, entry, .. } => {
                 let pos = pos.min(st.apps.len());
+                // 放回「剪贴板」= 撤销了那次删除，标记跟着清掉
+                if entry.target == "@act:clip" {
+                    st.clip_app = 0;
+                }
                 st.apps.insert(pos, entry);
                 println!("[remove] 已取消，放回：{}", st.apps[pos].name);
                 let nm = st.apps[pos].name.clone();
@@ -10249,6 +10717,10 @@ fn drag_end(st: &mut State, x: i32, y: i32) {
         // 拖走一个之后要能立刻拖下一个（用户 2026-10-09 要求）。
         if ai < st.apps.len() && remove_zone(st, x, y) {
             let entry = st.apps.remove(ai);
+            // 「剪贴板」被拖出环 = 用户不要这个入口了。记一笔，`load_ini` 就不再自动补
+            if entry.target == "@act:clip" {
+                st.clip_app = 2;
+            }
             // 槽位收缩：被摘槽位之后的索引整体左移，别让选中态指错应用
             match st.active_app {
                 Some(a) if a > ai => st.active_app = Some(a - 1),
@@ -12480,8 +12952,50 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let on = !st.running;
                 let st2 = state_of(hwnd);
                 set_running(st2, on);
+            } else if w.0 as i32 == HOTKEY_CLIP {
+                // Ctrl+Alt+V：卡片自己 toggle（`open_clip` 已显示时就是收起）
+                let h = CLIP_HWND.load(Ordering::SeqCst);
+                if h != 0 {
+                    let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLIPSHOW, WPARAM(1), LPARAM(0));
+                }
             }
             LRESULT(0)
+        }
+        WM_CLIPBOARDUPDATE_MSG => {
+            // 采集只做本地读 + 有上限的落盘（见 `clip_capture` 的门禁），不碰网络/UIA，
+            // 所以留在 UI 线程上；卡片正显示时它会自己翻页到第 1 页。
+            // 新的广播 = 新的一次复制，重试计数归零。
+            let st = state_of(hwnd);
+            CLIP_TRY.store(0, Ordering::Relaxed);
+            let retry = clip_capture(st);
+            clip_retry_arm(hwnd, retry);
+            LRESULT(0)
+        }
+        WM_APP_CLIPINFO => {
+            let st = state_of(hwnd);
+            let vis = cl_visible(st);
+            let v = match w.0 as u32 {
+                0 => st.cl_items.len(),
+                1 => (st.cl_page << 16) | cl_pages(vis.len()),
+                2 => st.cl_sel.wrapping_add(1),
+                3 => st.cl_on as usize,
+                4 => st.cl_tab as usize,
+                5 => st.cl_shown as usize,
+                6 => vis.len(),
+                // 最新一条的类型（+1，0 = 历史为空）—— 采集链断言用
+                7 => st.cl_items.first().map(|i| i.kind as usize + 1).unwrap_or(0),
+                _ => usize::MAX,
+            };
+            LRESULT(v as isize)
+        }
+        WM_APP_CLIPFIRE => {
+            let st = state_of(hwnd);
+            let ok = clip_paste(st, w.0);
+            LRESULT(ok as isize)
+        }
+        WM_APP_CLIPSIM => {
+            // 仅测试：往真剪贴板塞一条合成内容，让正常的 WM_CLIPBOARDUPDATE 采集链跑一遍
+            LRESULT(clip_sim(w.0) as isize)
         }
         WM_APP_TRIGCAP | WM_APP_TRIGSIM => {
             let st = state_of(hwnd);
@@ -13104,8 +13618,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 if hit {
                     println!("[*] 已切到打开着的网页 · {url}");
                 } else {
-                    // 没开着 → 照常打开
-                    launch(&url);
+                    // 没开着 → 照常打开。
+                    // ⚠️ 走 `open_target` 而不是 `launch`：上面已经查过一遍了，
+                    //    `launch` 会在 UI 线程上再联网抓一次标题（环冻 1~3 秒）。
+                    open_target(&url);
                     println!("[*] 启动 · {url}");
                 }
                 unsafe {
@@ -13361,6 +13877,12 @@ WM_APP_DISMISS_FG => {
                 {
                     start_update_check(st, false);
                 }
+            } else if w.0 as usize == TIMER_CLIP_RETRY {
+                // 上一刻「有格式但取不到内容」/ 剪贴板被别人占着 → 120ms 后再读一次。
+                // 到了上限还读不到就自己杀定时器（`clip_retry_arm`），不会常驻。
+                let st = state_of(hwnd);
+                let retry = clip_capture(st);
+                clip_retry_arm(hwnd, retry);
             }
             LRESULT(0)
         }
@@ -13376,6 +13898,11 @@ WM_APP_DISMISS_FG => {
                 let _ = AppendMenuW(menu, mif(false), MENU_TOGGLE as usize, PCWSTR(t1.as_ptr()));
                 let t2: Vec<u16> = wide("常驻模式（松开后保持）");
                 let _ = AppendMenuW(menu, mif(st.persistent), MENU_PERSIST as usize, PCWSTR(t2.as_ptr()));
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let t8: Vec<u16> = wide("剪贴板历史（Ctrl+Alt+V）");
+                let _ = AppendMenuW(menu, mif(false), MENU_CLIP as usize, PCWSTR(t8.as_ptr()));
+                let t9: Vec<u16> = wide("记录剪贴板");
+                let _ = AppendMenuW(menu, mif(st.cl_on), MENU_CLIPREC as usize, PCWSTR(t9.as_ptr()));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let t7: Vec<u16> = wide("退出");
                 let _ = AppendMenuW(menu, mif(false), MENU_QUIT as usize, PCWSTR(t7.as_ptr()));
@@ -13408,6 +13935,17 @@ WM_APP_DISMISS_FG => {
                         save_settings(st);
                         println!("[*] 常驻模式：{}", if st.persistent { "开" } else { "关" });
                     }
+                    MENU_CLIP => {
+                        let h = CLIP_HWND.load(Ordering::SeqCst);
+                        if h != 0 {
+                            let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLIPSHOW, WPARAM(1), LPARAM(0));
+                        }
+                    }
+                    MENU_CLIPREC => {
+                        st.cl_on = !st.cl_on;
+                        save_settings(st);
+                        println!("[*] 剪贴板记录：{}", if st.cl_on { "开" } else { "关" });
+                    }
                     MENU_QUIT => unsafe { quit_app() },
                     _ => {}
                 }
@@ -13416,7 +13954,9 @@ WM_APP_DISMISS_FG => {
         }
         WM_DESTROY => {
             remove_tray_icon(hwnd);
+            let _ = RemoveClipboardFormatListener(hwnd);
             let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_CLIP);
             unsafe { quit_app() };
         }
         _ => DefWindowProcW(hwnd, msg, w, l),
@@ -13531,6 +14071,8 @@ enum Ctl {
     Theme(usize),
     /// 外观页「材质」：0 纸面 / 1 液态玻璃
     Mat(usize),
+    /// 外观页「录屏模式（玻璃不实时）」= `st.glass_live`
+    GlassLive,
     Key(usize),
     TrigCapture,         // 交互页「呼出方式」下的「自定义触发」行：点击进入录制态（再点取消）
     TrigClear,           // 自定义触发已设置时的「✕」清除按钮
@@ -13577,6 +14119,10 @@ enum Ctl {
 /// 外观页：「材质」段（第二行）
 const LOOK_MAT_LABEL_Y: i32 = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP + ACT_CHIPS_H + ACT_GAP;
 const LOOK_MAT_Y: i32 = LOOK_MAT_LABEL_Y + ACT_LABEL_H + ACT_GAP;
+/// 外观页「录屏模式」开关行：紧跟材质胶囊。`+8` —— 行矩形比内容顶高 8（与交互页同一套）
+const LOOK_LIVE_Y: i32 = LOOK_MAT_Y + ACT_CHIPS_H + ACT_GAP + 8;
+/// 行下方的说明 —— 与开关行**同属一块**，所以只隔 4px（同 `TRIG_ROW_Y` 的道理）
+const LOOK_LIVE_HINT_Y: i32 = LOOK_LIVE_Y + 34 + 4;
 const ACT_GAP: i32 = 16;       // **统一间距**：段标题↔内容、内容↔下一段标题 都用它
 const ACT_LABEL_H: i32 = 22;   // 段标题行高
 
@@ -13603,6 +14149,11 @@ fn act_sw_rect(i: usize) -> RECT {
 fn act_sw_row(i: usize) -> RECT {
     let y = act_sw_y(i);
     RECT { left: S_X0, top: y - 8, right: S_X1, bottom: y + 34 }
+}
+
+/// 外观页「录屏模式」开关行（绘制与命中共用）
+fn look_live_row() -> RECT {
+    RECT { left: S_X0, top: LOOK_LIVE_Y - 8, right: S_X1, bottom: LOOK_LIVE_Y + 34 }
 }
 
 fn trig_row_rect() -> RECT {
@@ -14648,14 +15199,37 @@ unsafe fn s_paint_look(st: &mut State, dc: HDC, pal: &Pal) {
         let on = st.glass == (i == 1);
         g_chip(dc, pal, r, on, mats[i], st.sf_body, hov(st, Ctl::Mat(i)));
     }
-    // 一句说明（玻璃的真实限制：实时刷新靠「把自己排除出抓屏」，录屏里就看不见轮盘）
+
+    // ── 录屏模式：玻璃要不要实时刷新（ini `glass_live`）──
+    // 实时玻璃必须把轮盘窗口**排除出抓屏**（`WDA_EXCLUDEFROMCAPTURE`）才不会被自己
+    // 糊住 —— 代价是截图／录屏里轮盘是个洞。关掉实时就退回「呼出那一刻的快照」，
+    // 和腾讯桌面整理、GlassBoard 一样能被拍到（用户 2026-11-01 要录宣传片）。
+    {
+        let rr = look_live_row();
+        let hv = hov(st, Ctl::GlassLive);
+        if hv > 0.01 {
+            g_rrect(dc, rr, 10, mixc(pal.paper, pal.ink, 0.05 * hv), None, 0);
+        }
+        // 材质是纸面时这条不起作用 → 压暗表示「当前不生效」，但照常可点（设置照样存）
+        let dim = if st.glass { 1.0 } else { 0.45 };
+        g_text(dc, "录屏模式（玻璃不实时）",
+            RECT { left: S_X0 + 8, top: rr.top + 12, right: S_X1 - 60, bottom: rr.top + 32 },
+            mixc(pal.paper, pal.ink, dim), st.sf_body, false);
+        g_switch(dc, pal, s_sw_rect_at(LOOK_LIVE_Y), st.sw_a[5]);
+    }
+    // 一句说明（说清这条开关换来什么、失去什么）
     let hint = if st.glass_live {
-        "玻璃实时透出桌面、不被录屏拍到；受管控的机器自动退回快照"
+        "开着：玻璃实时透出桌面，但截图／录屏拍不到轮盘"
     } else {
-        "玻璃会透出呼出时的桌面；抓屏不可用（受保护窗口）会自动回到纸面"
+        "关掉：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘"
     };
-    let hy = LOOK_MAT_Y + ACT_CHIPS_H + 14;
-    g_text(dc, hint, RECT { left: S_X0, top: hy, right: S_X1, bottom: hy + 20 },
+    g_text(dc, hint,
+        RECT { left: S_X0, top: LOOK_LIVE_HINT_Y, right: S_X1, bottom: LOOK_LIVE_HINT_Y + 20 },
+        mixc(pal.paper, pal.ink, 0.42), st.sf_small, false);
+    // 第二行：玻璃退化的另一条路（与这条开关无关，只是讲清「为什么有时是纸面」）
+    g_text(dc, "抓屏被系统挡住（受保护窗口）时自动回到纸面",
+        RECT { left: S_X0, top: LOOK_LIVE_HINT_Y + ACT_LABEL_H,
+               right: S_X1, bottom: LOOK_LIVE_HINT_Y + ACT_LABEL_H + 20 },
         mixc(pal.paper, pal.ink, 0.42), st.sf_small, false);
 }
 
@@ -15044,6 +15618,11 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
 /// 返回**逻辑像素**（已除去超采样倍率）——「产品名后面紧跟一枚版本胶囊」这种
 /// 贴边排版不能靠估中文字宽，估偏一点就是错位。
 unsafe fn s_text_w(dc: HDC, text: &str, font: HFONT) -> i32 {
+    // ⚠️ 空串要给 0 直接返回：`Vec<u16>` 空时 `as_ptr()` 是**悬垂**指针（不是 null），
+    // windows-rs 会把它当 `PCWSTR` 传给 `DrawTextW` —— 长度 0 也一样会解引用，直接崩。
+    if text.is_empty() {
+        return 0;
+    }
     let op = SelectObject(dc, HGDIOBJ(font.0));
     let mut t: Vec<u16> = text.encode_utf16().collect();
     let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
@@ -15238,6 +15817,9 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
                 if in_rect(s_strip(i, LOOK_MAT_Y, 108, 10, ACT_CHIPS_H), x, y) {
                     return Ctl::Mat(i);
                 }
+            }
+            if in_rect(look_live_row(), x, y) {
+                return Ctl::GlassLive;
             }
         }
         1 => {
@@ -15605,6 +16187,10 @@ unsafe fn s_do_del(st: &mut State, t: Ctl) {
             // 不然下标全体左移，输入框会「隐形」挂在另一个应用上。
             st.set_edit_ai = usize::MAX;
             st.set_edit_buf.clear();
+            // 删掉轮盘上的「剪贴板」入口 → 记一笔，以后不再自动补（见 `load_ini`）
+            if st.apps.get(ai).map(|a| a.target == "@act:clip").unwrap_or(false) {
+                st.clip_app = 2;
+            }
             st.apps.remove(ai);
             if st.set_expanded == ai {
                 st.set_expanded = usize::MAX;
@@ -15686,6 +16272,21 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
                     glass_disc_drop();
                 }
                 save_settings(st);
+            }
+        }
+        Ctl::GlassLive => {
+            st.glass_live = !st.glass_live;
+            save_settings(st);
+            // 轮盘可能正开着（常驻模式 / 从轮盘进的设置）：立刻把这条改动落实到窗口上，
+            // 否则「关了还在录屏里留个洞」或「开了要等下次呼出才生效」。
+            let rh = RING_HWND.load(Ordering::Relaxed);
+            let ring = HWND(rh as *mut c_void);
+            if rh != 0 && IsWindowVisible(ring).as_bool() {
+                if st.glass_live {
+                    glass_live_start(st, ring);
+                } else {
+                    glass_live_stop(ring);
+                }
             }
         }
         Ctl::Key(i) => {
@@ -15985,6 +16586,8 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         st.sw_a[2],
         st.sw_a[3],
         st.sw_a[4],
+        // 录屏模式（外观页）：不按页门禁 → 第一次画之前就已经收敛到真值，不会「先亮后滑」
+        if st.glass_live { 1.0 } else { 0.0 },
     ];
     // 开机自启开关现画在**交互页**（第 1 页），高级页的旧位置也留着这条动画
     if st.set_page == 1 || st.set_page == 3 {
@@ -15994,7 +16597,7 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         targets[3] = if st.exc_fs { 1.0 } else { 0.0 };
         targets[4] = if st.hover_name { 1.0 } else { 0.0 };
     }
-    for i in 0..5 {
+    for i in 0..6 {
         let d = targets[i] - st.sw_a[i];
         if d.abs() > 0.003 {
             st.sw_a[i] += d * k;
@@ -16290,6 +16893,9 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("key_rhold={}\r\n", b(st.key_rhold)));
     out.push_str(&format!("autostart={}\r\n", b(st.autostart)));
     out.push_str(&format!("guide_seen={}\r\n", b(st.guide_seen)));
+    out.push_str(&format!("clip={}\r\n", b(st.cl_on)));
+    out.push_str(&format!("clip_pwd={}\r\n", b(st.cl_pwd)));
+    out.push_str(&format!("clip_app={}\r\n", st.clip_app));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
@@ -16828,6 +17434,8 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         st.set_hover = Ctl::None;
         st.set_scroll = 0;
         st.set_expanded = if page == 2 { 0 } else { usize::MAX };
+        // 离屏不跑 `setup_tick` → 开关动画量还停在初值；「录屏模式」按 ini 置位，出图才对得上
+        st.sw_a[5] = if st.glass_live { 1.0 } else { 0.0 };
         setup_render(st);
         let (dr, dtot) = s_rows(st);
         println!(
@@ -17284,6 +17892,1960 @@ fn check_update_sync() -> UpdateOutcome {
     }
 }
 
+// ═════════════════════ 剪贴板历史（方形卡片 · GDI 自绘） ═════════════════════
+//
+// 为什么不是轮盘：轮盘的槽位是**环形扇区**，放不下一段要横着读的文字、
+// 更放不下一张图。用户 2026-10-28 拍板：「我希望是一个方形卡片而不是轮盘形式」。
+//
+// 视觉延续设置页那一套（同一张 paper 卡、同一套黑白灰、同一条
+// 「SS 倍 GDI 画布 → 盒式降采样 → SDF 补 alpha → 投影」管线）。
+// ⚠️ 因此这里**直接复用** `g_*` 画布工具：它们经 `sxv()` 依赖 `S_M`，
+//    而卡片四周的投影留边也正是 `S_M`，所以逻辑坐标 → 设备坐标的换算不用另写一份。
+//    （反过来：不把 `setup_render` 的降采样/alpha 段抽成公共函数 —— 那条路要走
+//     `_pixcmp.py` 的像素一致性回归，动它就是白送一次回归风险。宁可写一遍平行代码。）
+//
+// 交互 = 用户验收过的设计稿（clipcard-square.html）：
+//   一页 **6 块（3×2）** · 顶部搜索 + 类型 chip · 底部页点 · 滚轮翻页 ·
+//   1~6 / 方向键 / Enter / Del / P · 点一下 = **写回剪贴板并收起**。
+//   ⚠️ **保守版**：绝不替你按 Ctrl+V
+//   （用户 2026-10-28：「就直接保守就行，不需要直接自动」）。
+
+/// 采集开关（ini `clip=`）。
+/// ⚠️ `WM_CLIPBOARDUPDATE` 显式自带常量，理由和 `WM_MOUSELEAVE_MSG` 一模一样：
+/// windows-rs 的常量散在多个模块里，match 臂里写一个**没导入成功**的标识符不会报错，
+/// 它会静默退化成「匹配一切」的绑定臂 —— 那条臂把 `WM_NCCREATE` 也吃掉，
+/// 而那时 `GWLP_USERDATA` 还没设 → `state_of()` 空指针 → 崩在窗口过程里。
+const WM_CLIPBOARDUPDATE_MSG: u32 = 0x031D;
+
+// ── 卡片几何（逻辑坐标以卡片左上为 0,0；窗口 = 卡片 + 四周各 S_M 的投影留边）──
+const CL_W: i32 = 480;
+const CL_H: i32 = 480;
+const CL_WW: i32 = CL_W + S_M * 2;
+const CL_HH: i32 = CL_H + S_M * 2;
+const CL_PAD: i32 = 16;
+const CL_GAP: i32 = 12;
+/// 头部（搜索 + 类型 chip）那一行的高
+const CL_HEAD_H: i32 = 34;
+/// chip / 搜索框的高（设计稿 26）
+const CL_CTRL_H: i32 = 26;
+const CL_FOOT_H: i32 = 14;
+const CL_COLS: i32 = 3;
+const CL_ROWS: i32 = 2;
+/// 一页 6 块（用户验收：「6 块可以」）
+const CL_PER: usize = (CL_COLS * CL_ROWS) as usize;
+/// 块圆角 / 内边距 / 元信息行高（设计稿 12 / 9 / 11px 字）
+const CL_RAD: i32 = 12;
+const CL_TP: i32 = 9;
+const CL_META: i32 = 14;
+const CL_GRID_TOP: i32 = CL_PAD + CL_HEAD_H + CL_GAP;
+const CL_GRID_BOT: i32 = CL_H - CL_PAD - CL_FOOT_H - CL_GAP;
+const CL_TW: i32 = (CL_W - CL_PAD * 2 - (CL_COLS - 1) * CL_GAP) / CL_COLS;
+const CL_TH: i32 = (CL_GRID_BOT - CL_GRID_TOP - (CL_ROWS - 1) * CL_GAP) / CL_ROWS;
+/// 类型 chip：4 颗靠右排，宽度 = (卡片宽 - 内边距×2 - 搜索框 - 间隙) 里分给它们的份
+const CL_TAB_N: u8 = 4;
+const CL_TAB_W: i32 = 40;
+const CL_TAB_G: i32 = 4;
+const CL_TAB_X0: i32 = CL_W - CL_PAD - (CL_TAB_N as i32 * CL_TAB_W + (CL_TAB_N as i32 - 1) * CL_TAB_G);
+const CL_TABS: [&str; 4] = ["全部", "文字", "图片", "文件"];
+
+/// 内存里最多留多少条（图片像素在磁盘，见 `ClipItem` 注释；60 条 = 一屏滚动都翻不完）。
+const CL_CAP: usize = 60;
+/// 单条文字的最长字符数。**超长直接不收**，而不是截断后收进历史 ——
+/// 截断了还存进历史，用户选中写回时拿到的是残缺内容，比"没进历史"更坑。
+const CL_MAX_CHARS: usize = 20_000;
+/// 一次复制最多记多少个文件路径
+const CL_MAX_FILES: usize = 20;
+/// CF_DIB 字节上限（一张 4K 截图 ≈ 33MB；再大的多半是位图套壳的怪东西）
+const CL_MAX_DIB: usize = 64 * 1024 * 1024;
+/// 缩略图长边上限。块内图片区是 123×147 **逻辑**px，SS=2 的画布上要 246×294 像素，
+/// 320 留了余量又不会让 60 张图吃满内存（何况只缓存当前页那 6 张）。
+const CL_THUMB: i32 = 320;
+
+const TIMER_CLIP_BLINK: usize = 6;
+
+/// 卡片控件标识 —— 和设置页 `Ctl` 同一条铁律：**绘制与命中共用同一个枚举**，
+/// 杜绝「画在这、点在那」。
+#[derive(Clone, Copy, PartialEq)]
+enum CCtl {
+    None,
+    /// 括号里是 `cl_items` 的**全局下标**（不是页内序号）—— 翻页/排序都不影响它指向谁
+    Tile(usize),
+    Pin(usize),
+    Del(usize),
+    Tab(u8),
+    Dot(usize),
+}
+
+/// 块内图片那一格的缩略图：从 `.dib` 解出来的 32bpp DIB 段。
+/// ⚠️ 生命周期 = **卡片开着 且 在当前页**。翻页即整批释放（见 `clip_thumbs_clear`）：
+///    60 张全缓存是 24MB 常驻，这个项目的内存底线不允许那么干。
+struct ClipThumb {
+    path: String,
+    bmp: HBITMAP,
+    dc: HDC,
+    bits: *mut u8,
+    w: i32,
+    h: i32,
+}
+
+/// 诊断日志：`%LOCALAPPDATA%\PiPie\logs\cliplog.txt`。
+/// **每条门禁都要落一行 reason=**（本项目排障铁律：把门禁列全，证不到的一环如实说）。
+fn clip_log(line: &str) {
+    use std::io::Write;
+    let dir = log_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let mut p = std::path::PathBuf::from(dir);
+    p.push("cliplog.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "[{:.2}] {}", now_s(), line);
+    }
+}
+
+fn clip_dir() -> String {
+    format!("{}\\clip", config_dir())
+}
+fn clip_store_path() -> String {
+    format!("{}\\clipstore.txt", config_dir())
+}
+
+/// 存盘用的转义：内容里有换行（复制一段代码太常见了），所以整个字段用
+/// `\t` 分隔 + `\\` `\t` `\n` `\r` 四个转义。**不能裸存**：一条多行文字会把
+/// 「一行一条」的格式直接撑坏。
+fn cl_esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '\t' => o.push_str("\\t"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+fn cl_unesc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            o.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('\\') => o.push('\\'),
+            Some('t') => o.push('\t'),
+            Some('n') => o.push('\n'),
+            Some('r') => o.push('\r'),
+            Some(x) => o.push(x),
+            None => {}
+        }
+    }
+    o
+}
+
+/// 历史落盘（`config_dir\clipstore.txt`）。每次增删改都整体重写 ——
+/// 条目上限 60、图片像素在独立文件里，这个文本本身就几百字节。
+fn clip_save(st: &State) {
+    let mut out = String::from("clipstore v1\n");
+    for it in &st.cl_items {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}x{}\n",
+            it.pinned as u8,
+            it.kind,
+            it.ts,
+            it.n,
+            cl_esc(&it.src),
+            cl_esc(&it.img),
+            cl_esc(&it.text),
+            it.w,
+            it.h
+        ));
+    }
+    if let Err(e) = std::fs::write(clip_store_path(), out) {
+        clip_log(&format!("save FAIL {e}"));
+    }
+}
+
+/// 读历史。⚠️ 图片项如果 `.dib` 文件已经没了（用户清了 %APPDATA%、或手删过），
+/// 这条要**丢掉**而不是留着 —— 留着一块永远画不出来的死图，点它写回还必然失败。
+fn clip_load(st: &mut State) {
+    st.cl_items.clear();
+    let Ok(txt) = std::fs::read_to_string(clip_store_path()) else {
+        return;
+    };
+    for ln in txt.lines().skip(1) {
+        let f: Vec<&str> = ln.split('\t').collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let mut wh = f[7].split('x');
+        let (w, h) = (
+            wh.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0),
+            wh.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0),
+        );
+        let img = cl_unesc(f[5]);
+        if !img.is_empty() && !std::path::Path::new(&img).exists() {
+            continue;
+        }
+        st.cl_items.push(ClipItem {
+            kind: f[1].parse::<u8>().unwrap_or(0),
+            text: cl_unesc(f[6]),
+            img,
+            ts: f[2].parse::<i64>().unwrap_or(0),
+            src: cl_unesc(f[4]),
+            pinned: f[0] == "1",
+            w,
+            h,
+            n: f[3].parse::<i64>().unwrap_or(0),
+        });
+    }
+    let n = st.cl_items.len();
+    clip_log(&format!("load items={n}"));
+    clip_sweep(st);
+}
+
+/// 清掉「没有任何条目引用」的图片文件（删条目 / 超上限淘汰时已经各自删过，
+/// 这里兜的是崩溃、断电、以及改小 `CL_CAP` 之后留下的孤儿）。
+fn clip_sweep(st: &State) {
+    let Ok(rd) = std::fs::read_dir(clip_dir()) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        // 演示图（`--clip-dump` 造的）带前缀，别把它当孤儿删了
+        if name.starts_with('_') {
+            continue;
+        }
+        let keep = st.cl_items.iter().any(|it| {
+            it.img
+                .rsplit(['\\', '/'])
+                .next()
+                .map(|f| f == name)
+                .unwrap_or(false)
+        });
+        if !keep {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+/// 密码管理器：这些进程的复制内容**根本不进历史**（用户在设计稿里勾的那条）。
+/// 判定用**进程名前缀**，因为同款软件常有 `KeePass.exe` / `KeePassXC.exe` 这种变体。
+fn is_pwd_mgr(lower: &str) -> bool {
+    const NAMES: [&str; 10] = [
+        "1password", "keepass", "bitwarden", "lastpass", "dashlane", "roboform", "enpass",
+        "northpass", "kwallet", "passky",
+    ];
+    NAMES.iter().any(|n| lower.starts_with(n))
+}
+
+// ── 读剪贴板 ──
+
+/// CF_DIB 的字节 → `(BITMAPINFO, 像素起点偏移)`。
+/// 真实世界会出现的都在这里了：BI_RGB 的 16/24/32bpp、BI_BITFIELDS（16bpp 必须带掩码，
+/// 32bpp 的掩码就是标准 BGRA → 当 BI_RGB 画）、以及 ≤8bpp 的调色板。
+/// ⚠️ BI_RLE4/RLE8/JPEG/PNG **返回 None 不收**：解不了还硬塞，块里就是一片花屏。
+fn dib_info(b0: &[u8]) -> Option<(BITMAPINFO, usize)> {
+    // 有些程序（少数截图工具/浏览器）给的是**整个 BMP 文件**，前面多 14 字节文件头
+    let b = if b0.len() > 14 && b0[0] == b'B' && b0[1] == b'M' {
+        &b0[14..]
+    } else {
+        b0
+    };
+    if b.len() < 40 {
+        return None;
+    }
+    let g = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let gs = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let hsz = g(0) as usize;
+    if hsz < 40 || b.len() < hsz {
+        return None;
+    }
+    let (w, h) = (gs(4), gs(8));
+    let bpp = u16::from_le_bytes([b[14], b[15]]);
+    let comp = g(16);
+    if w == 0 || h == 0 || w.abs() > 16384 || h.abs() > 16384 {
+        return None;
+    }
+    if !(1..=32).contains(&bpp) {
+        return None;
+    }
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = 40;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = bpp;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    let mut off = hsz;
+    if comp == BI_BITFIELDS.0 {
+        // 掩码：V4/V5 头里自带（偏移 40 起）；40 字节头 + BI_BITFIELDS 时掩码紧贴头后，
+        // 并且**它算在像素数据之前**。
+        if b.len() < 52 {
+            return None;
+        }
+        if bpp == 16 {
+            bmi.bmiHeader.biCompression = BI_BITFIELDS.0;
+            for i in 0..3usize {
+                let m = g(40 + i * 4).to_le_bytes();
+                bmi.bmiColors[i] = RGBQUAD {
+                    rgbBlue: m[0],
+                    rgbGreen: m[1],
+                    rgbRed: m[2],
+                    rgbReserved: m[3],
+                };
+            }
+        } else if bpp != 32 {
+            return None; // 256 色 BI_BITFIELDS 不存在；8/24bpp 带掩码的是怪东西
+        }
+        if hsz == 40 {
+            off = 52;
+        }
+    }
+    if bpp <= 8 {
+        let mut cnt = g(32) as usize; // biClrUsed
+        if cnt == 0 {
+            cnt = 1 << bpp;
+        }
+        if b.len() < off + cnt * 4 {
+            return None;
+        }
+        for i in 0..cnt.min(256) {
+            bmi.bmiColors[i] = RGBQUAD {
+                rgbBlue: b[off + i * 4],
+                rgbGreen: b[off + i * 4 + 1],
+                rgbRed: b[off + i * 4 + 2],
+                rgbReserved: b[off + i * 4 + 3],
+            };
+        }
+        off += cnt * 4;
+    }
+    Some((bmi, off))
+}
+
+/// 把一份 DIB 字节压成不超过 `CL_THUMB` 边长的 32bpp 缩略图（DIB 段，直接可 StretchDIBits）。
+unsafe fn clip_make_thumb(path: &str, bytes: &[u8]) -> Option<ClipThumb> {
+    let (bmi, off) = dib_info(bytes)?;
+    let sw = bmi.bmiHeader.biWidth;
+    let sh = bmi.bmiHeader.biHeight.abs();
+    if sw <= 0 || sh <= 0 {
+        return None;
+    }
+    let k = (CL_THUMB as f32 / (sw.max(sh) as f32)).min(1.0);
+    let tw = ((sw as f32 * k).round() as i32).max(1);
+    let th = ((sh as f32 * k).round() as i32).max(1);
+    let (bits, dc, bmp) = make_dib(tw, th);
+    if bits.is_null() {
+        return None;
+    }
+    let _ = SetStretchBltMode(dc, HALFTONE);
+    // 源 header 的 biHeight 保持原样：它描述的是**源图**，缩放由目标矩形负责
+    let _ = StretchDIBits(
+        dc,
+        0,
+        0,
+        tw,
+        th,
+        0,
+        0,
+        sw,
+        sh,
+        Some(bytes.as_ptr().add(off) as *const c_void),
+        &bmi as *const BITMAPINFO,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+    Some(ClipThumb {
+        path: path.to_string(),
+        bmp,
+        dc,
+        bits,
+        w: tw,
+        h: th,
+    })
+}
+
+/// 当前页用到的缩略图：按需从 `.dib` 解，命中缓存直接给下标。
+unsafe fn clip_thumb_get(st: &mut State, path: &str) -> Option<usize> {
+    if let Some(i) = st.cl_thumbs.iter().position(|t| t.path == path) {
+        return Some(i);
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let t = clip_make_thumb(path, &bytes)?;
+    st.cl_thumbs.push(t);
+    Some(st.cl_thumbs.len() - 1)
+}
+
+unsafe fn clip_thumbs_clear(st: &mut State) {
+    for t in st.cl_thumbs.drain(..) {
+        let _ = DeleteDC(t.dc);
+        let _ = DeleteObject(HGDIOBJ(t.bmp.0));
+    }
+}
+
+/// 删掉一条历史（连带它的图片文件）。下标越界就当没发生。
+unsafe fn clip_del(st: &mut State, idx: usize) {
+    if idx >= st.cl_items.len() {
+        return;
+    }
+    let it = st.cl_items.remove(idx);
+    if !it.img.is_empty() {
+        let _ = std::fs::remove_file(&it.img);
+    }
+    st.cl_thumbs.retain(|t| t.path != it.img);
+    if st.cl_sel == idx {
+        st.cl_sel = usize::MAX;
+    } else if st.cl_sel != usize::MAX && st.cl_sel > idx {
+        st.cl_sel -= 1; // 删的是选中项**前面**的条目 → 下标整体前移
+    }
+    cl_clamp(st);
+    clip_save(st);
+    clip_log(&format!("del idx={idx} kind={}", it.kind));
+}
+
+/// 超出上限就从**末尾**淘汰非置顶条目（末尾 = 最旧；置顶的永远不掉）。
+unsafe fn clip_evict(st: &mut State) {
+    while st.cl_items.len() > CL_CAP {
+        match st.cl_items.iter().rposition(|x| !x.pinned) {
+            Some(i) => clip_del(st, i),
+            None => break, // 全置顶了：宁可超一点也不删用户钉住的东西
+        }
+    }
+}
+
+/// 采集一条剪贴板变更。**每条门禁都写一行 reason=**，顺序即判定顺序。
+///
+/// 返回值 = **是否需要重试**：`false` = 定论（关着 / 自己的写回 / 密码管理器 /
+/// 重复 / 成功 / 系统压根没报过我们认的格式）；`true` = 「系统说有这个格式、
+/// 但这一刻取不到内容」—— 这是外部写入方还在提交（延迟渲染），不是不支持。
+unsafe fn clip_capture(st: &mut State) -> bool {
+    if !st.cl_on {
+        clip_log("skip reason=off");
+        return false;
+    }
+    let seq = GetClipboardSequenceNumber();
+    if seq == CLIP_SELF_SEQ.load(Ordering::SeqCst) {
+        // 我们**自己**写回的那一次（选完条目系统又广播了一遍）—— 不认出来就是套娃
+        clip_log(&format!("skip reason=self seq={seq}"));
+        return false;
+    }
+    if OpenClipboard(HWND(ptr::null_mut())).is_err() {
+        // 别的进程占着剪贴板（常见：远端桌面/同步工具正在传）—— 这一刻读不到，
+        // 但它稍后就会松手，所以要求重试；次数用尽还是忙就认了（这条复制本来也没成）。
+        clip_log("skip reason=open-busy");
+        return true;
+    }
+    let src = fg_proc_name();
+    if st.cl_pwd && is_pwd_mgr(&src.to_ascii_lowercase()) {
+        let _ = CloseClipboard();
+        clip_log(&format!("skip reason=pwd src={src}"));
+        return false;
+    }
+    // 优先级：文件 > 图片 > 文字。同一次复制常常同时挂好几种格式，
+    // 取**信息量最大**的那种（截图也带文字描述时，用户要的是那张图）。
+    let mut got: Option<ClipItem> = None;
+    if IsClipboardFormatAvailable(15).is_ok() {
+        got = clip_read_files();
+    }
+    if got.is_none() && (IsClipboardFormatAvailable(8).is_ok() || IsClipboardFormatAvailable(2).is_ok())
+    {
+        got = clip_read_image();
+    }
+    if got.is_none() && IsClipboardFormatAvailable(13).is_ok() {
+        got = clip_read_text();
+    }
+    let _ = CloseClipboard();
+    let Some(mut it) = got else {
+        // 四种格式都没有 → 把**系统实际报的**那几位记下来：外部进程写入时这里最容易看出
+        // 是「格式没有」还是「有格式但取不到数据」（延迟渲染的写入方已经退了就是这样）
+        let (f, i, t) = (
+            IsClipboardFormatAvailable(15).is_ok() as u8,
+            (IsClipboardFormatAvailable(8).is_ok() || IsClipboardFormatAvailable(2).is_ok()) as u8,
+            IsClipboardFormatAvailable(13).is_ok() as u8,
+        );
+        clip_log(&format!("skip reason=unsupported src={src} fmt(文件{f} 图{i} 文本{t})"));
+        // 全 0 = 真是我们不收的格式（定论）；有格式却空手 = 还没提交完，重试
+        return f + i + t > 0;
+    };
+    it.ts = unix_now() as i64;
+    it.src = src.clone();
+    // 去重：和**最新一条**内容相同 = 同一次复制又广播了一遍
+    //（不止一个应用一次 Ctrl+C 触发两次 WM_CLIPBOARDUPDATE）。
+    if let Some(top) = st.cl_items.first().filter(|x| !x.pinned) {
+        if same_content(top, &it) {
+            clip_log(&format!("skip reason=dup kind={}", it.kind));
+            return false;
+        }
+    }
+    st.cl_items.insert(0, it);
+    clip_evict(st);
+    clip_save(st);
+    cl_clamp(st);
+    clip_log(&format!(
+        "add kind={} src={} n={} len={} total={}",
+        it_kind(&st.cl_items[0]),
+        st.cl_items[0].src,
+        st.cl_items[0].n,
+        st.cl_items[0].text.chars().count(),
+        st.cl_items.len()
+    ));
+    if st.cl_shown {
+        st.cl_page = 0; // 新内容进来 = 回到第一页，否则用户看不见刚复制的东西
+    }
+    false
+}
+
+/// 采集要求重试时挂一颗 120ms 的一次性定时器；不需要（或次数用尽）就杀掉复位。
+/// ⚠️ 只在**宿主窗口**上用（`TIMER_CLIP_RETRY` 这个 id 归它）。
+unsafe fn clip_retry_arm(hwnd: HWND, retry: bool) {
+    let tried = CLIP_TRY.load(Ordering::Relaxed);
+    if retry && tried < CLIP_RETRY_MAX {
+        CLIP_TRY.store(tried + 1, Ordering::Relaxed);
+        let _ = SetTimer(hwnd, TIMER_CLIP_RETRY, 120, None);
+        return;
+    }
+    let _ = KillTimer(hwnd, TIMER_CLIP_RETRY);
+    CLIP_TRY.store(0, Ordering::Relaxed);
+    // 只在「重试过」的场景留痕，普通广播不多刷一行日志
+    if tried > 0 {
+        clip_log(&format!(
+            "retry=end tried={tried}{}",
+            if retry { " give-up" } else { "" }
+        ));
+    }
+}
+
+fn it_kind(it: &ClipItem) -> u8 {
+    it.kind
+}
+
+fn same_content(a: &ClipItem, b: &ClipItem) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+    match a.kind {
+        1 => a.w == b.w && a.h == b.h && a.n == b.n,
+        _ => a.text == b.text,
+    }
+}
+
+/// 必须在 `OpenClipboard` 之后调用（读的是当前剪贴板）。
+unsafe fn clip_read_text() -> Option<ClipItem> {
+    let Ok(h) = GetClipboardData(13) else {
+        // 格式在、句柄拿不到：写入方走的是延迟渲染且已经退出（clip.exe 这类）
+        clip_log(&format!(
+            "text=render-fail（GetClipboardData(13) 空句柄 err={} owner={:p} seq={}）",
+            windows::Win32::Foundation::GetLastError().0,
+            GetClipboardOwner().map(|h| h.0).unwrap_or(ptr::null_mut()),
+            GetClipboardSequenceNumber()
+        ));
+        return None;
+    };
+    let hg = HGLOBAL(h.0);
+    let cap = (GlobalSize(hg) / 2).min(CL_MAX_CHARS + 1);
+    let p = GlobalLock(hg) as *const u16;
+    if p.is_null() || cap == 0 {
+        clip_log(&format!("text=lock-fail（句柄有效但锁不住 size={}", GlobalSize(hg)));
+        return None;
+    }
+    let mut n = 0usize;
+    while n < cap && *p.add(n) != 0 {
+        n += 1;
+    }
+    let raw = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+    let _ = GlobalUnlock(hg);
+    if raw.trim().is_empty() {
+        return None;
+    }
+    if n > CL_MAX_CHARS {
+        clip_log(&format!("skip reason=too-long chars={n}"));
+        return None;
+    }
+    Some(ClipItem {
+        kind: 0,
+        text: raw,
+        img: String::new(),
+        ts: 0,
+        src: String::new(),
+        pinned: false,
+        w: 0,
+        h: 0,
+        n: 0,
+    })
+}
+
+unsafe fn clip_read_files() -> Option<ClipItem> {
+    let h = GetClipboardData(15).ok()?;
+    let hd = HDROP(HGLOBAL(h.0).0);
+    let cnt = DragQueryFileW(hd, u32::MAX, None);
+    let mut paths: Vec<String> = Vec::new();
+    for i in 0..cnt.min(CL_MAX_FILES as u32) {
+        let mut buf = [0u16; 1024];
+        let len = DragQueryFileW(hd, i, Some(&mut buf)) as usize;
+        if len > 0 {
+            paths.push(String::from_utf16_lossy(&buf[..len]));
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    Some(ClipItem {
+        kind: 2,
+        text: paths.join("\n"),
+        img: String::new(),
+        ts: 0,
+        src: String::new(),
+        pinned: false,
+        w: 0,
+        h: 0,
+        n: 0,
+    })
+}
+
+/// 图片：优先原样取 CF_DIB 的字节（写回时一字不改还回去，保真且不重编码）；
+/// 只有 CF_BITMAP（GDI 位图句柄，没有 DIB 字节）才用 GetDIBits 转成一份 32bpp DIB。
+unsafe fn clip_read_image() -> Option<ClipItem> {
+    let bytes: Vec<u8> = if IsClipboardFormatAvailable(8).is_ok() {
+        let h = GetClipboardData(8).ok()?;
+        let hg = HGLOBAL(h.0);
+        let len = GlobalSize(hg);
+        if len == 0 || len > CL_MAX_DIB {
+            clip_log(&format!("skip reason=img-size len={len}"));
+            return None;
+        }
+        let p = GlobalLock(hg) as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        let v = std::slice::from_raw_parts(p, len).to_vec();
+        let _ = GlobalUnlock(hg);
+        v
+    } else {
+        dib_from_cf_bitmap()?
+    };
+    let (bmi, _) = dib_info(&bytes)?;
+    let (w, h) = (bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight.abs());
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let dir = clip_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let name = format!(
+        "{}\\c{}_{}.dib",
+        dir,
+        unix_now() as i64,
+        CLIP_FILE_SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    if std::fs::write(&name, &bytes).is_err() {
+        clip_log("skip reason=img-write");
+        return None;
+    }
+    Some(ClipItem {
+        kind: 1,
+        text: String::new(),
+        img: name,
+        ts: 0,
+        src: String::new(),
+        pinned: false,
+        w,
+        h,
+        n: bytes.len() as i64,
+    })
+}
+
+static CLIP_FILE_SEQ: AtomicU32 = AtomicU32::new(1);
+
+/// CF_BITMAP → CF_DIB 字节。少数老程序只给位图句柄。
+unsafe fn dib_from_cf_bitmap() -> Option<Vec<u8>> {
+    let h = GetClipboardData(2).ok()?;
+    let hb = HBITMAP(h.0);
+    let mut bm = BITMAP::default();
+    if GetObjectW(
+        hb,
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bm as *mut _ as *mut c_void),
+    ) == 0
+    {
+        return None;
+    }
+    let (w, sh) = (bm.bmWidth, bm.bmHeight.abs());
+    if w <= 0 || sh <= 0 || w > 16384 || sh > 16384 {
+        return None;
+    }
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = 40;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -sh; // 自上而下：拿到的行序就是屏幕上那行序
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits = vec![0u8; (w * sh * 4) as usize];
+    let dc = GetDC(None);
+    let got = GetDIBits(
+        dc,
+        hb,
+        0,
+        sh as u32,
+        Some(bits.as_mut_ptr() as *mut c_void),
+        &mut bmi,
+        DIB_RGB_COLORS,
+    );
+    let _ = ReleaseDC(None, dc);
+    if got == 0 {
+        return None;
+    }
+    let hdr = BITMAPINFOHEADER {
+        biSize: 40,
+        biWidth: w,
+        biHeight: -sh,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        biSizeImage: bits.len() as u32,
+        ..Default::default()
+    };
+    let mut out = vec![0u8; 40 + bits.len()];
+    std::ptr::write(out.as_mut_ptr() as *mut BITMAPINFOHEADER, hdr);
+    out[40..].copy_from_slice(&bits);
+    Some(out)
+}
+
+// ── 写回（保守版：只写剪贴板，**绝不**代按 Ctrl+V）──
+
+/// 把第 idx 条**放回剪贴板**。成功 = 系统剪贴板已经是它了。
+/// ⚠️ 三个坑：
+///   1) `SetClipboardData` 成功后**内存归系统所有**，绝不能再 GlobalFree（会写坏剪贴板）；
+///      只有失败才要自己收尸。
+///   2) 写完必须记 `CLIP_SELF_SEQ`，否则系统广播回来的那次 `WM_CLIPBOARDUPDATE`
+///      会把 PiPie 自己的写回再记一遍（历史里长出自己的历史）。
+///   3) 全程不碰输入合成 —— 没有 `SendInput`、没有 `keybd_event`、不发消息给别人。
+///      「保守版」的定义就是：东西我放到剪贴板了，按 Ctrl+V 的是你。
+unsafe fn clip_paste(st: &mut State, idx: usize) -> bool {
+    let Some(it) = st.cl_items.get(idx).cloned() else {
+        return false;
+    };
+    let (fmt, data): (u32, Vec<u8>) = match it.kind {
+        1 => match std::fs::read(&it.img) {
+            Ok(b) => (8, b), // CF_DIB：原字节原样还回去
+            Err(_) => {
+                clip_log(&format!("paste FAIL kind=img read path={}", it.img));
+                return false;
+            }
+        },
+        2 => (15, dropfiles(&it.text)), // CF_HDROP：路径列表重新拼一份
+        _ => {
+            let mut u: Vec<u16> = it.text.encode_utf16().collect();
+            u.push(0);
+            let mut b = Vec::with_capacity(u.len() * 2);
+            for x in u {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            (13, b) // CF_UNICODETEXT
+        }
+    };
+    if !clip_put(fmt, &data) {
+        return false;
+    }
+    CLIP_SELF_SEQ.store(GetClipboardSequenceNumber(), Ordering::SeqCst);
+    clip_log(&format!("paste OK kind={} idx={idx}", it.kind));
+    true
+}
+
+/// `OpenClipboard → EmptyClipboard → SetClipboardData → CloseClipboard`。
+/// ⚠️ 成功即**所有权归系统**，绝不能再 `GlobalFree`；只有失败才自己收尸。
+unsafe fn clip_put(fmt: u32, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let hg = match GlobalAlloc(GMEM_MOVEABLE, data.len()) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let p = GlobalLock(hg);
+    if p.is_null() {
+        let _ = GlobalFree(hg);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
+    let _ = GlobalUnlock(hg);
+    if OpenClipboard(HWND(ptr::null_mut())).is_err() {
+        let _ = GlobalFree(hg);
+        clip_log("put FAIL open");
+        return false;
+    }
+    let _ = EmptyClipboard();
+    let r = SetClipboardData(fmt, HANDLE(hg.0));
+    let _ = CloseClipboard();
+    if r.is_err() {
+        let _ = GlobalFree(hg); // 只有失败才归我们
+        clip_log(&format!("put FAIL set fmt={fmt}"));
+        return false;
+    }
+    true
+}
+
+/// 仅测试：把一条合成内容塞进**真**剪贴板，让正常的 `WM_CLIPBOARDUPDATE` 采集链
+/// 自己走一遍 —— 门禁一条都不绕过。⚠️ 故意不记 `CLIP_SELF_SEQ`：要的就是它被
+/// 当成「别的程序写的」。
+unsafe fn clip_sim(kind: usize) -> bool {
+    let (fmt, data) = match kind {
+        1 => (8u32, demo_dib(64, 48)),
+        2 => {
+            let p = std::env::current_exe()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_else(|_| clip_store_path());
+            (15, dropfiles(&p))
+        }
+        _ => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let mut u: Vec<u16> = format!("sim-text-{nanos}").encode_utf16().collect();
+            u.push(0);
+            let mut b = Vec::with_capacity(u.len() * 2);
+            for x in u {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            (13, b)
+        }
+    };
+    clip_put(fmt, &data)
+}
+
+/// 路径列表（`\n` 分隔）→ CF_HDROP 的字节：`DROPFILES` + 双 null 结尾的宽字符列表。
+fn dropfiles(list: &str) -> Vec<u8> {
+    let hdr = std::mem::size_of::<DROPFILES>() as u32;
+    let df = DROPFILES {
+        pFiles: hdr,
+        pt: POINT { x: 0, y: 0 },
+        fNC: BOOL(0),
+        fWide: BOOL(1), // 宽字符表 —— 我们本来就只存 Unicode 路径
+    };
+    let mut out = vec![0u8; hdr as usize];
+    // DROPFILES 是 packed(1)：用 ptr::write 落到缓冲区头部，别按对齐猜偏移
+    unsafe { std::ptr::write(out.as_mut_ptr() as *mut DROPFILES, df) };
+    for line in list.lines().filter(|l| !l.is_empty()) {
+        for u in line.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+    }
+    out.extend_from_slice(&[0, 0]); // 空串 = 列表结束
+    out
+}
+
+/// 触发第 idx 块 = 写回 + 收起 + 把焦点还给呼出卡片之前的那个窗口。
+unsafe fn clip_fire(st: &mut State, idx: usize) {
+    st.cl_sel = idx;
+    let ok = clip_paste(st, idx);
+    if !ok {
+        clip_toast(st, "写回失败：剪贴板被别的程序占着");
+        clip_present(st);
+        clip_kick(st);
+        return;
+    }
+    let prev = CLIP_PREV_FG.swap(0, Ordering::SeqCst);
+    close_clip(st);
+    // 用户选完是**要立刻去目标窗口按 Ctrl+V** 的；焦点留在卡片上他就得多点一下。
+    if prev != 0 {
+        let h = HWND(prev as *mut c_void);
+        if IsWindow(h).as_bool() {
+            let _ = SetForegroundWindow(h);
+        }
+    }
+}
+
+fn clip_toast(st: &mut State, msg: &str) {
+    st.cl_toast = msg.to_string();
+    st.cl_toast_at = now_s() + 1.8;
+}
+
+/// 可见序列（类型过滤 + 搜索 + 置顶优先）。返回 `cl_items` 的下标，顺序即卡片顺序。
+fn cl_visible(st: &State) -> Vec<usize> {
+    let tab = st.cl_tab;
+    let kw = st.cl_q.to_lowercase();
+    let mut v: Vec<usize> = (0..st.cl_items.len())
+        .filter(|i| {
+            let it = &st.cl_items[*i];
+            if tab != 0 && it.kind != tab - 1 {
+                return false;
+            }
+            if kw.is_empty() {
+                return true;
+            }
+            let hay = format!("{}\n{}", it.text, it.src).to_lowercase();
+            hay.contains(&kw)
+        })
+        .collect();
+    // 置顶的排前面，其余保持「新→旧」（stable = 不打乱采集顺序）
+    v.sort_by(|a, b| st.cl_items[*b].pinned.cmp(&st.cl_items[*a].pinned));
+    v
+}
+
+fn cl_pages(n: usize) -> usize {
+    (n + CL_PER - 1) / CL_PER
+}
+
+/// 增删条目 / 切类型 / 改搜索之后都要调用：页码不能悬在有效页之外。
+fn cl_clamp(st: &mut State) {
+    let np = cl_pages(cl_visible(st).len());
+    if st.cl_page > np - 1 {
+        st.cl_page = np - 1;
+    }
+}
+
+/// 相对时间（设计稿那列「刚刚 / 2 分 / 1 小时 / 昨天 / 3 天」）。
+fn cl_ago(ts: i64) -> String {
+    let d = (unix_now() as i64 - ts).max(0);
+    if d < 60 {
+        "刚刚".into()
+    } else if d < 3600 {
+        format!("{} 分", d / 60)
+    } else if d < 86400 {
+        format!("{} 小时", d / 3600)
+    } else if d < 172800 {
+        "昨天".into()
+    } else {
+        format!("{} 天", d / 86400)
+    }
+}
+
+/// 块底部那行元信息：`86 字 · PiPie · 刚刚`
+fn cl_meta(it: &ClipItem) -> String {
+    let head = match it.kind {
+        1 => format!("{}×{}", it.w, it.h),
+        2 => {
+            let n = it.text.lines().count();
+            if n > 1 {
+                format!("{n} 项")
+            } else if it.text.ends_with('\\') || std::path::Path::new(&it.text).is_dir() {
+                "文件夹".into()
+            } else {
+                "文件".into()
+            }
+        }
+        _ => format!("{} 字", it.text.chars().count()),
+    };
+    let src = if it.src.is_empty() {
+        String::new()
+    } else {
+        // 进程名带 .exe 后缀，显示时去掉（元信息那一行很窄，一个字都要省）
+        let s = it.src.strip_suffix(".exe").unwrap_or(&it.src);
+        format!(" · {s}")
+    };
+    format!("{head}{src} · {}", cl_ago(it.ts))
+}
+
+// ── 版面（绘制与命中**共用**，别写第二份）──
+
+/// 第 k 块（当前页内 0..5）的矩形
+fn cl_tile_rect(k: usize) -> RECT {
+    let c = k as i32 % CL_COLS;
+    let rw = k as i32 / CL_COLS;
+    let x = CL_PAD + c * (CL_TW + CL_GAP);
+    let y = CL_GRID_TOP + rw * (CL_TH + CL_GAP);
+    RECT { left: x, top: y, right: x + CL_TW, bottom: y + CL_TH }
+}
+/// 块内正文区（文字 / 图片）
+fn cl_body_rect(r: RECT) -> RECT {
+    RECT { left: r.left + CL_TP, top: r.top + CL_TP, right: r.right - CL_TP, bottom: r.bottom - CL_TP - CL_META - 2 }
+}
+/// 元信息行。**右边固定让出 22px**：右下角那个数字键（1~6）和它同一行，
+/// 不让就会叠成「…260 · Snipaste · …1」这种读不通的东西（离屏 dump 抓到的）。
+fn cl_meta_rect(r: RECT) -> RECT {
+    RECT { left: r.left + CL_TP, top: r.bottom - CL_TP - CL_META, right: r.right - CL_TP - 22, bottom: r.bottom - CL_TP }
+}
+/// 悬停才露的两颗小操作（22×22，块内右上角横排）
+fn cl_act_rect(r: RECT, which: u8) -> RECT {
+    // which: 0 = 左那颗（置顶）/ 1 = 右那颗（删除）
+    let s = 22i32;
+    let right = r.right - CL_TP;
+    let left = if which == 1 { right - s } else { right - s * 2 - 4 };
+    RECT { left, top: r.top + CL_TP, right: left + s, bottom: r.top + CL_TP + s }
+}
+fn cl_search_rect() -> RECT {
+    RECT { left: CL_PAD, top: CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2, right: CL_TAB_X0 - 8, bottom: CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2 + CL_CTRL_H }
+}
+fn cl_tab_rect(i: u8) -> RECT {
+    let x = CL_TAB_X0 + i as i32 * (CL_TAB_W + CL_TAB_G);
+    let y = CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2;
+    RECT { left: x, top: y, right: x + CL_TAB_W, bottom: y + CL_CTRL_H }
+}
+fn cl_dot_rect(i: usize) -> RECT {
+    let y = CL_H - CL_PAD - CL_FOOT_H;
+    let x = CL_PAD + i as i32 * 11;
+    RECT { left: x, top: y + (CL_FOOT_H - 6) / 2, right: x + 6, bottom: y + (CL_FOOT_H - 6) / 2 + 6 }
+}
+/// 标题条可拖区（头部整条，但搜索框和四颗 chip 除外 —— 否则点了没反应，
+/// 窗口跟着鼠标跑，正是设置页 2026-10-11 那个「拖不动/点不动」的坑）
+fn cl_drag_band(x: i32, y: i32) -> bool {
+    let p = (x, y);
+    let in_head = p.1 >= 0 && p.1 < CL_GRID_TOP;
+    in_head && !in_rect(cl_search_rect(), p.0, p.1) && !(0..CL_TAB_N).any(|i| in_rect(cl_tab_rect(i), p.0, p.1))
+}
+
+/// 控件当前的 hover 强度 0..1（新 hover 淡入、旧 hover 淡出）—— 和设置页同一套手感。
+fn c_hov(st: &State, c: CCtl) -> f32 {
+    if st.cl_hover == c {
+        st.cl_hov_a
+    } else if st.cl_hover_prev == c {
+        1.0 - st.cl_hov_a
+    } else {
+        0.0
+    }
+}
+
+/// 块的两颗操作该不该露出来（绘制用它；命中见 `cl_hit` 的注释）
+fn cl_acts_on(st: &State, idx: usize) -> bool {
+    st.cl_sel == idx || cl_tile_hov(st, idx) > 0.02
+}
+
+/// 「悬停在这一块上」的强度：块体、它自己的置顶钮、删除钮**算同一个区域**取最大。
+/// 只用 `c_hov(Tile)` 会出问题：鼠标从块体挪到右上角那颗钮，`cl_hover` 一变就把
+/// `cl_hov_a` 归零，Tile 的强度瞬间落到 0 → 钮消失 → 命中又退回 Tile → 钮回来，
+/// 手抖一下就在原地闪（用户 2026-11-01 报「右上角图标经常识别不到 hover」）。
+fn cl_tile_hov(st: &State, idx: usize) -> f32 {
+    [CCtl::Tile(idx), CCtl::Pin(idx), CCtl::Del(idx)]
+        .iter()
+        .map(|c| c_hov(st, *c))
+        .fold(0.0f32, f32::max)
+}
+
+// ── 画布小工具（卡片专用；圆角矩形/文字沿用 `g_*`）──
+
+/// 单行文字，align: 0 左 1 中 2 右（左右都带省略号）
+unsafe fn c_text(dc: HDC, text: &str, r: RECT, color: (u8, u8, u8), font: HFONT, align: u8) {
+    c_text_xy(dc, text, r, color, font, align, 0, 0);
+}
+
+/// 多行文字（自动换行、超出矩形即裁掉 —— 对应设计稿的 line-clamp）
+unsafe fn c_mtext(dc: HDC, text: &str, r: RECT, color: (u8, u8, u8), font: HFONT) {
+    if text.is_empty() {
+        return;
+    }
+    let _ = SelectObject(dc, HGDIOBJ(font.0));
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, rgb(color));
+    let mut t: Vec<u16> = text.encode_utf16().collect();
+    let mut rr = RECT { left: sxv(r.left), top: sxv(r.top), right: sxv(r.right), bottom: sxv(r.bottom) };
+    let _ = DrawTextW(dc, &mut t, &mut rr, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
+}
+
+/// 单行文字（hi 画布上可再挪 `ox/oy` 个**物理**像素 —— 挪 1 px 是阴影，不是位移）
+unsafe fn c_text_xy(dc: HDC, text: &str, r: RECT, color: (u8, u8, u8), font: HFONT,
+                    align: u8, ox: i32, oy: i32) {
+    if text.is_empty() {
+        return; // 同 `s_text_w`：空 `Vec<u16>` 的指针是悬垂的，别交给 DrawTextW
+    }
+    let _ = SelectObject(dc, HGDIOBJ(font.0));
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, rgb(color));
+    let mut t: Vec<u16> = text.encode_utf16().collect();
+    let mut rr = RECT {
+        left: sxv(r.left) + ox,
+        top: sxv(r.top) + oy,
+        right: sxv(r.right) + ox,
+        bottom: sxv(r.bottom) + oy,
+    };
+    let fmt = DT_SINGLELINE
+        | DT_VCENTER
+        | DT_NOPREFIX
+        | match align {
+            1 => DT_CENTER,
+            2 => DT_RIGHT | DT_END_ELLIPSIS,
+            _ => DT_LEFT | DT_END_ELLIPSIS,
+        };
+    let _ = DrawTextW(dc, &mut t, &mut rr, fmt);
+}
+
+/// 一根线（SS 倍画布上画，降采样后就是抗锯齿的细线）。描边宁细勿粗：默认 1 逻辑 px。
+unsafe fn c_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, w: i32, c: (u8, u8, u8)) {
+    let pen = CreatePen(PS_SOLID, w.max(1) * SS, rgb(c));
+    let op = SelectObject(dc, HGDIOBJ(pen.0));
+    let _ = MoveToEx(dc, sxv(x1), sxv(y1), None);
+    let _ = LineTo(dc, sxv(x2), sxv(y2));
+    let _ = SelectObject(dc, op);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+}
+
+// ── 资源 ──
+
+/// 卡片字体：字号 ×SS（同设置页，关窗即删）。
+unsafe fn ensure_clip_fonts(st: &mut State) {
+    if !st.cf_body.0.is_null() {
+        return;
+    }
+    let face: Vec<u16> = wide("Microsoft YaHei UI");
+    st.cf_body = CreateFontW(-13 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_tile = CreateFontW(-12 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_small = CreateFontW(-11 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_bold = CreateFontW(-12 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+}
+
+unsafe fn ensure_clip_surfaces(st: &mut State) {
+    ensure_clip_fonts(st);
+    if st.c_hi_dc.0.is_null() {
+        let (b, d, m) = make_dib(CL_WW * SS, CL_HH * SS);
+        st.c_hi_bits = b;
+        st.c_hi_dc = d;
+        st.c_hi_bmp = m;
+    }
+    if st.c_lo_dc.0.is_null() {
+        let (b, d, m) = make_dib(CL_WW, CL_HH);
+        st.c_lo_bits = b;
+        st.c_lo_dc = d;
+        st.c_lo_bmp = m;
+    }
+}
+
+/// 关窗把超采样画布 / 字体 / 缩略图全部还回去（和 `setup_free` 同理：
+/// hi 那张是 SS² 倍大，常驻纯浪费）。
+unsafe fn clip_free(st: &mut State) {
+    clip_thumbs_clear(st);
+    for f in [&mut st.cf_body, &mut st.cf_tile, &mut st.cf_small, &mut st.cf_bold] {
+        if !f.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ((*f).0));
+            *f = HFONT(ptr::null_mut());
+        }
+    }
+    if !st.c_hi_dc.0.is_null() {
+        let _ = DeleteDC(st.c_hi_dc);
+        let _ = DeleteObject(HGDIOBJ(st.c_hi_bmp.0));
+        st.c_hi_dc = HDC(ptr::null_mut());
+        st.c_hi_bmp = HBITMAP(ptr::null_mut());
+        st.c_hi_bits = ptr::null_mut();
+    }
+    if !st.c_lo_dc.0.is_null() {
+        let _ = DeleteDC(st.c_lo_dc);
+        let _ = DeleteObject(HGDIOBJ(st.c_lo_bmp.0));
+        st.c_lo_dc = HDC(ptr::null_mut());
+        st.c_lo_bmp = HBITMAP(ptr::null_mut());
+        st.c_lo_bits = ptr::null_mut();
+    }
+}
+
+// ── 绘制 ──
+
+unsafe fn clip_draw(st: &mut State, dc: HDC) {
+    let pal = pal_of(st.glass_liquid);
+    // 卡片底：材质跟轮盘共用 `glass=`。能透就是液体玻璃（`clip_render` 已把卡身铺好），
+    // 透不出（纸质 / 抓屏失败）就是和设置页一样的 paper。
+
+    // ── 头部：搜索框 + 四颗类型 chip ──
+    let sr = cl_search_rect();
+    let sf = mixc(pal.paper, pal.ink, 0.05);
+    g_rrect(dc, sr, 10, sf, Some(mixc(pal.edge, pal.ink, 0.25)), 1);
+    let q: String = st.cl_q.chars().take(48).collect();
+    if q.is_empty() {
+        c_text(dc, "搜内容 / 来源（打字即搜 · 1~6 直接选）", RECT { left: sr.left + 9, top: sr.top, right: sr.right - 8, bottom: sr.bottom }, pal.edge, st.cf_body, 0);
+    } else {
+        c_text(dc, &q, RECT { left: sr.left + 9, top: sr.top, right: sr.right - 8, bottom: sr.bottom }, pal.ink, st.cf_body, 0);
+    }
+    // 光标：搜索框**永远是焦点**（呼出即输），所以不用等用户点它才闪
+    if st.cl_blink {
+        let txw = s_text_w(dc, if q.is_empty() { "" } else { &q }, st.cf_body);
+        let cx = (sr.left + 9 + txw).min(sr.right - 10);
+        c_line(dc, cx, sr.top + 5, cx, sr.bottom - 5, 1, pal.ink);
+    }
+    for i in 0..CL_TAB_N {
+        let r = cl_tab_rect(i);
+        let on = st.cl_tab == i;
+        let hv = c_hov(st, CCtl::Tab(i));
+        if on {
+            g_rrect(dc, r, 9, pal.block, Some(pal.block), 1);
+            c_text(dc, CL_TABS[i as usize], r, pal.paper, st.cf_small, 1);
+        } else {
+            g_rrect(dc, r, 9, mixc(pal.paper, pal.ink, 0.06 * hv), Some(mixc(pal.edge, pal.ink, 0.4 * hv)), 1);
+            c_text(dc, CL_TABS[i as usize], r, pal.ink, st.cf_small, 1);
+        }
+    }
+
+    // ── 6 块 ──
+    let vis = cl_visible(st);
+    let start = (st.cl_page * CL_PER).min(vis.len());
+    let slice: Vec<usize> = vis[start..(start + CL_PER).min(vis.len())].to_vec();
+    if slice.is_empty() {
+        let r = RECT { left: CL_PAD, top: CL_GRID_TOP, right: CL_W - CL_PAD, bottom: CL_GRID_BOT };
+        g_rrect_stroke(dc, r, CL_RAD, mixc(pal.edge, pal.ink, 0.1), 1);
+        c_text(dc, "没有匹配的条目（清空搜索或换个类型）", r, pal.edge, st.cf_body, 1);
+    }
+    for (k, idx) in slice.iter().enumerate() {
+        // 克隆一份：下面 `clip_thumb_get` 要往里写缩略图缓存（`&mut`），
+        // 借着一个 `&st.cl_items[i]` 不放会让借用检查器直接判死。
+        let it = st.cl_items[*idx].clone();
+        let r = cl_tile_rect(k);
+        let hv = cl_tile_hov(st, *idx);
+        let sel = st.cl_sel == *idx;
+        let fill = mixc(pal.paper, pal.ink, 0.055 + 0.05 * hv);
+        let edge = if sel {
+            pal.block
+        } else {
+            mixc(pal.edge, pal.ink, 0.4 * hv)
+        };
+        g_rrect(dc, r, CL_RAD, fill, Some(edge), if sel { 2 } else { 1 });
+        if it.pinned {
+            // 置顶标记：左边一根 3px 通高条（设计稿同款）
+            g_fill(dc, RECT { left: r.left + 1, top: r.top + 4, right: r.left + 4, bottom: r.bottom - 4 }, pal.block);
+        }
+        let br = cl_body_rect(r);
+        match it.kind {
+            1 => {
+                // 图片格：先铺一个略深的「井」，再把缩略图**等比放进**（不裁切：
+                // 截图看的就是整体内容，裁掉边角比留白更糟）
+                g_rrect(dc, br, 8, mixc(pal.paper, pal.wall, 0.6), None, 0);
+                let p = it.img.clone();
+                if let Some(ti) = clip_thumb_get(st, &p) {
+                    let t = &st.cl_thumbs[ti];
+                    let bw = br.right - br.left;
+                    let bh = br.bottom - br.top;
+                    let f = (bw as f32 / t.w as f32).min(bh as f32 / t.h as f32);
+                    let dw = ((t.w as f32 * f).round() as i32).max(1);
+                    let dh = ((t.h as f32 * f).round() as i32).max(1);
+                    let dx = br.left + (bw - dw) / 2;
+                    let dy = br.top + (bh - dh) / 2;
+                    let mut bmi = BITMAPINFO::default();
+                    bmi.bmiHeader.biSize = 40;
+                    bmi.bmiHeader.biWidth = t.w;
+                    bmi.bmiHeader.biHeight = -t.h; // 缩略图段是自建的上→下 32bpp
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 32;
+                    bmi.bmiHeader.biCompression = BI_RGB.0;
+                    let _ = SetStretchBltMode(dc, HALFTONE);
+                    let _ = StretchDIBits(
+                        dc,
+                        sxv(dx),
+                        sxv(dy),
+                        dw * SS,
+                        dh * SS,
+                        0,
+                        0,
+                        t.w,
+                        t.h,
+                        Some(t.bits as *const c_void),
+                        &bmi as *const BITMAPINFO,
+                        DIB_RGB_COLORS,
+                        SRCCOPY,
+                    );
+                } else {
+                    c_text(dc, "（图片文件已不在）", br, pal.edge, st.cf_small, 1);
+                }
+            }
+            2 => {
+                let mut ls = it.text.lines();
+                let first = ls.next().unwrap_or("");
+                let name = first.rsplit(['\\', '/']).next().unwrap_or(first);
+                let more = it.text.lines().count() - 1;
+                c_text(dc, name, RECT { left: br.left, top: br.top, right: br.right, bottom: br.top + 18 }, pal.ink, st.cf_tile, 0);
+                let sub = if more > 0 {
+                    format!("＋{more} 项")
+                } else {
+                    first.rsplit(['\\', '/']).next().unwrap_or(first).to_string()
+                };
+                c_mtext(dc, &sub, RECT { left: br.left, top: br.top + 20, right: br.right, bottom: br.bottom }, pal.edge, st.cf_small);
+            }
+            _ => {
+                c_mtext(dc, &cl_body(&it.text), br, pal.ink, st.cf_tile);
+            }
+        }
+        c_text(dc, &cl_meta(&it), cl_meta_rect(r), pal.edge, st.cf_small, 0);
+        // 右下角数字（操作按钮没露出来时才画，两者会叠在同一角上）
+        if k < 9 && !cl_acts_on(st, *idx) {
+            let mr = cl_meta_rect(r);
+            c_text(dc, &format!("{}", k + 1), RECT { left: r.right - 26, top: mr.top, right: r.right - 6, bottom: mr.bottom }, pal.edge, st.cf_small, 2);
+        }
+        if cl_acts_on(st, *idx) {
+            for which in 0..2u8 {
+                let ar = cl_act_rect(r, which);
+                // 每颗钮自己的强度：光标点在哪颗，哪颗往墨色压深一档（跟 chip/tab 同一套手感）
+                let bhv = c_hov(st, if which == 0 { CCtl::Pin(*idx) } else { CCtl::Del(*idx) });
+                let base = mixc(pal.paper, pal.wall, 0.55);
+                let bedge = mixc(pal.edge, pal.ink, 0.35);
+                g_rrect(dc, ar, 7, mixc(base, pal.ink, 0.14 * bhv), Some(mixc(bedge, pal.ink, 0.5 * bhv)), 1);
+                let cx = (ar.left + ar.right) / 2;
+                let cy = (ar.top + ar.bottom) / 2;
+                if which == 0 {
+                    // 置顶：向上的一根针 + 两笔短翅
+                    c_line(dc, cx, cy + 6, cx, cy - 6, 1, pal.ink);
+                    c_line(dc, cx - 4, cy - 2, cx, cy - 6, 1, pal.ink);
+                    c_line(dc, cx + 4, cy - 2, cx, cy - 6, 1, pal.ink);
+                    c_line(dc, cx - 4, cy + 2, cx + 4, cy + 2, 1, pal.ink);
+                } else {
+                    c_line(dc, cx - 4, cy - 4, cx + 4, cy + 4, 1, pal.ink);
+                    c_line(dc, cx + 4, cy - 4, cx - 4, cy + 4, 1, pal.ink);
+                }
+            }
+        }
+    }
+
+    // ── 底部：页点 + 计数/按键提示 ──
+    let np = cl_pages(vis.len());
+    for i in 0..np {
+        let d = cl_dot_rect(i);
+        let on = i == st.cl_page;
+        g_rrect(dc, d, 3, if on { pal.block } else { mixc(pal.edge, pal.paper, 0.4) }, None, 0);
+    }
+    let fr = RECT { left: CL_PAD + 130, top: CL_H - CL_PAD - CL_FOOT_H, right: CL_W - CL_PAD, bottom: CL_H - CL_PAD };
+    c_text(dc, &format!("共 {} 条 · 滚轮翻页 · Enter 写回 · Del 删 · P 置顶", vis.len()), fr, pal.edge, st.cf_small, 2);
+
+    // ── toast（删除/置顶/失败反馈；写回是立刻收起卡片的，没有 toast）──
+    if !st.cl_toast.is_empty() {
+        let txt = st.cl_toast.clone();
+        let tw = (s_text_w(dc, &txt, st.cf_body) + 28).min(CL_W - CL_PAD * 2);
+        let r = RECT { left: (CL_W - tw) / 2, top: CL_GRID_BOT - 32, right: (CL_W + tw) / 2, bottom: CL_GRID_BOT - 6 };
+        g_rrect(dc, r, 13, pal.block, None, 0);
+        c_text(dc, &txt, r, pal.paper, st.cf_body, 1);
+    }
+}
+
+// ── 渲染管线（与设置页同一条：hi 上 SS× 画 → 盒式降采样 → SDF 补 alpha → 投影）──
+
+unsafe fn clip_render(st: &mut State) {
+    ensure_clip_surfaces(st);
+    if st.c_hi_dc.0.is_null() || st.c_lo_dc.0.is_null() || st.c_hi_bits.is_null() {
+        return;
+    }
+    let pal = pal_of(st.glass_liquid);
+    let hi_w = (CL_WW * SS) as usize;
+    let lo_w = CL_WW as usize;
+    let lo_h = CL_HH as usize;
+
+    g_fill(st.c_hi_dc, RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M }, pal.paper);
+    clip_draw(st, st.c_hi_dc);
+
+    let hi = std::slice::from_raw_parts(st.c_hi_bits, hi_w * (CL_HH * SS) as usize * 4);
+    let lo = std::slice::from_raw_parts_mut(st.c_lo_bits, lo_w * lo_h * 4);
+    let n = (SS * SS) as u32;
+    for y in 0..lo_h {
+        for x in 0..lo_w {
+            let (mut a0, mut a1, mut a2) = (0u32, 0u32, 0u32);
+            for dy in 0..SS as usize {
+                let row = ((y * SS as usize + dy) * hi_w + x * SS as usize) * 4;
+                for dx in 0..SS as usize {
+                    let o = row + dx * 4;
+                    a0 += hi[o] as u32;
+                    a1 += hi[o + 1] as u32;
+                    a2 += hi[o + 2] as u32;
+                }
+            }
+            let o = (y * lo_w + x) * 4;
+            lo[o] = (a0 / n) as u8;
+            lo[o + 1] = (a1 / n) as u8;
+            lo[o + 2] = (a2 / n) as u8;
+        }
+    }
+
+    let hw = CL_W as f32 / 2.0;
+    let hh = CL_H as f32 / 2.0;
+    let ccx = (S_M + CL_W / 2) as f32;
+    let ccy = (S_M + CL_H / 2) as f32;
+    let (sh_dy, sh_blur, sh_a) = (8.0f32, 14.0f32, 0.26f32);
+    let shc = [SHADOW.2 as f32, SHADOW.1 as f32, SHADOW.0 as f32];
+    for y in 0..lo_h {
+        for x in 0..lo_w {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let o = (y * lo_w + x) * 4;
+            let ac = cov1(-sdf_rounded_rect(fx - ccx, fy - ccy, hw + 1.0, hh + 1.0, CARD_RAD as f32));
+            if ac >= 0.999 {
+                lo[o + 3] = 255;
+                continue;
+            }
+            let ds = -sdf_rounded_rect(fx - ccx, fy - ccy - sh_dy, (hw - 6.0).max(2.0), (hh - 4.0).max(2.0), CARD_RAD as f32);
+            let ash = if ds > 0.0 {
+                let t = 1.0 - (ds / sh_blur).clamp(0.0, 1.0);
+                t * t * sh_a
+            } else {
+                sh_a
+            };
+            let a = (ac + (1.0 - ac) * ash).clamp(0.0, 1.0);
+            if a < 0.002 {
+                lo[o + 3] = 0;
+                continue;
+            }
+            let inv = 1.0 / a;
+            for k in 0..3 {
+                let c = lo[o + k] as f32;
+                lo[o + k] = ((c * ac + shc[k] * (1.0 - ac) * ash) * inv).clamp(0.0, 255.0) as u8;
+            }
+            lo[o + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    if std::env::var("RL_SETDBG").is_ok() {
+        eprintln!("[clipdbg] clip_render");
+    }
+}
+
+/// 渲染 + 上屏。⚠️ `pptDst` 传 `None` 的理由和设置页完全一样：传坐标会把窗口
+/// 每帧拽回居中位置，用户一拖就弹回去。
+unsafe fn clip_present(st: &mut State) {
+    let h = CLIP_HWND.load(Ordering::SeqCst);
+    if h == 0 || !st.cl_shown {
+        return;
+    }
+    clip_render(st);
+    if st.c_lo_bits.is_null() {
+        return;
+    }
+    {
+        let buf = std::slice::from_raw_parts_mut(st.c_lo_bits, (CL_WW * CL_HH * 4) as usize);
+        premultiply(buf);
+    }
+    let src = POINT::default();
+    let size = SIZE { cx: CL_WW, cy: CL_HH };
+    let blend = BLENDFUNCTION { BlendOp: 0u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1u8 };
+    let _ = UpdateLayeredWindow(
+        HWND(h as *mut c_void),
+        HDC(ptr::null_mut()),
+        None,
+        Some(&size),
+        st.c_lo_dc,
+        Some(&src),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+}
+
+unsafe fn clip_kick(st: &mut State) {
+    let h = CLIP_HWND.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    st.cl_last = Instant::now();
+    let _ = SetTimer(HWND(h as *mut c_void), TIMER_CLIP_FRAME, 16, None);
+}
+
+unsafe fn clip_tick(st: &mut State, hwnd: HWND) {
+    let now = Instant::now();
+    let dt = (now - st.cl_last).as_secs_f32().clamp(0.001, 0.10);
+    st.cl_last = now;
+    let k = 1.0 - (-26.0 * dt).exp();
+    let mut busy = false;
+    if st.cl_hov_a < 1.0 {
+        st.cl_hov_a += (1.0 - st.cl_hov_a) * k;
+        if st.cl_hov_a > 0.99 {
+            st.cl_hov_a = 1.0;
+        } else {
+            busy = true;
+        }
+    }
+    if !st.cl_toast.is_empty() {
+        if now_s() > st.cl_toast_at {
+            st.cl_toast.clear();
+        } else {
+            busy = true;
+        }
+    }
+    if !busy {
+        st.cl_hover_prev = CCtl::None;
+        let _ = KillTimer(hwnd, TIMER_CLIP_FRAME);
+    }
+    clip_present(st);
+}
+
+// ── 命中 / 动作 ──
+
+fn cl_hit(st: &State, x: i32, y: i32) -> CCtl {
+    for i in 0..CL_TAB_N {
+        if in_rect(cl_tab_rect(i), x, y) {
+            return CCtl::Tab(i);
+        }
+    }
+    let vis = cl_visible(st);
+    for i in 0..cl_pages(vis.len()) {
+        if in_rect(cl_dot_rect(i), x, y) {
+            return CCtl::Dot(i);
+        }
+    }
+    let start = (st.cl_page * CL_PER).min(vis.len());
+    for (k, idx) in vis[start..(start + CL_PER).min(vis.len())].iter().enumerate() {
+        let r = cl_tile_rect(k);
+        if !in_rect(r, x, y) {
+            continue;
+        }
+        // 两颗钮：不按 `cl_acts_on` 卡命中。卡着的话，光标一下甩到钮上、落定前没再动过，
+        // 这帧命中还是 Tile（钮当时并未 hover），点下去执行的是「写回」而不是置顶/删除。
+        // 改成先测钮 —— 同一帧鼠标移动就已经把这块点亮，用户点到的就是看到的。
+        // 命中区外扩 2px（22 的钮本身偏小；两颗正好相接，不会互相吞）。
+        for which in 0..2u8 {
+            let ar = cl_act_rect(r, which);
+            let hit = RECT {
+                left: ar.left - 2,
+                top: ar.top - 2,
+                right: ar.right + 2,
+                bottom: ar.bottom + 2,
+            };
+            if in_rect(hit, x, y) {
+                return if which == 0 { CCtl::Pin(*idx) } else { CCtl::Del(*idx) };
+            }
+        }
+        return CCtl::Tile(*idx);
+    }
+    CCtl::None
+}
+
+/// 当前页第 k 块对应的条目下标（键盘 1~6 / 方向键要用）
+fn cl_slot(st: &State, k: usize) -> Option<usize> {
+    let vis = cl_visible(st);
+    let start = (st.cl_page * CL_PER).min(vis.len());
+    vis.get(start + k).copied()
+}
+
+fn cl_slot_of(st: &State, idx: usize) -> Option<usize> {
+    let vis = cl_visible(st);
+    let start = (st.cl_page * CL_PER).min(vis.len());
+    (start..(start + CL_PER).min(vis.len()))
+        .find(|i| vis[*i] == idx)
+        .map(|i| i - start)
+}
+
+/// 翻页 / 换类型 / 改搜索 = 页内条目全换了，选中项和缩略图缓存都得跟着清
+unsafe fn cl_repage(st: &mut State) {
+    st.cl_sel = usize::MAX;
+    clip_thumbs_clear(st);
+    cl_clamp(st);
+}
+
+/// 翻转置顶并返回新状态；下标越界（含 `usize::MAX` = 没选中）给 `None`。
+/// 单独抽出来是因为 `st.cl_items.get_mut()` 的借用会和同一块的 `clip_toast(st)` 打架。
+fn cl_toggle_pin(st: &mut State, i: usize) -> Option<bool> {
+    let it = st.cl_items.get_mut(i)?;
+    it.pinned = !it.pinned;
+    Some(it.pinned)
+}
+
+unsafe fn cl_click(st: &mut State, x: i32, y: i32) {
+    match cl_hit(st, x, y) {
+        CCtl::Tab(t) => {
+            st.cl_tab = t;
+            st.cl_page = 0;
+            cl_repage(st);
+        }
+        CCtl::Dot(p) => {
+            if p != st.cl_page {
+                st.cl_page = p;
+                cl_repage(st);
+            }
+        }
+        CCtl::Pin(i) => {
+            if let Some(on) = cl_toggle_pin(st, i) {
+                clip_toast(st, if on { "已置顶 · 关掉程序也不掉" } else { "已取消置顶" });
+            }
+            clip_save(st);
+        }
+        CCtl::Del(i) => {
+            clip_del(st, i);
+            clip_toast(st, "已从历史删除");
+        }
+        CCtl::Tile(i) => {
+            clip_fire(st, i);
+            return; // 写回会收起卡片，不用再刷帧
+        }
+        CCtl::None => {}
+    }
+    clip_present(st);
+    clip_kick(st);
+}
+
+// ── 开 / 收 ──
+
+unsafe fn open_clip(st: &mut State) {
+    let h = CLIP_HWND.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    let hwnd = HWND(h as *mut c_void);
+    if st.cl_shown {
+        close_clip(st); // 再按一次 = 收起
+        return;
+    }
+    // 记住呼出前的前台窗口：写回后要把焦点还回去（保守版的整个意义就在这）
+    CLIP_PREV_FG.store(GetForegroundWindow().0 as isize, Ordering::SeqCst);
+    st.cl_shown = true;
+    st.cl_tab = 0;
+    st.cl_q.clear();
+    st.cl_page = 0;
+    st.cl_sel = usize::MAX;
+    st.cl_hover = CCtl::None;
+    st.cl_hover_prev = CCtl::None;
+    st.cl_hov_a = 1.0;
+    st.cl_toast.clear();
+    st.cl_toast_at = 0.0;
+    st.cl_blink = true;
+    st.cl_tracking = false;
+    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    st.cl_x = (sw - CL_WW) / 2;
+    st.cl_y = (sh - CL_HH) / 2;
+    let _ = SetWindowPos(hwnd, None, st.cl_x, st.cl_y, CL_WW, CL_HH, SWP_NOZORDER);
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+    let _ = SetTimer(hwnd, TIMER_CLIP_BLINK, 500, None);
+    clip_present(st);
+    clip_kick(st);
+}
+
+unsafe fn close_clip(st: &mut State) {
+    if !st.cl_shown {
+        return; // 幂等：Esc、点空白、失去焦点、写回都会走到这里
+    }
+    st.cl_shown = false;
+    let h = CLIP_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        let hwnd = HWND(h as *mut c_void);
+        let _ = KillTimer(hwnd, TIMER_CLIP_FRAME);
+        let _ = KillTimer(hwnd, TIMER_CLIP_BLINK);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    clip_free(st);
+}
+
+/// 造一张裸 DIB（32bpp · 自上而下 · BI_RGB）当演示图。
+/// 走的是采集链同一个解码器（`dib_info`），所以 dump 出来的缩略图和真截图一致。
+fn demo_dib(w: usize, h: usize) -> Vec<u8> {
+    let mut hdr = [0u8; 40];
+    hdr[0..4].copy_from_slice(&40u32.to_le_bytes());
+    hdr[4..8].copy_from_slice(&(w as u32).to_le_bytes());
+    hdr[8..12].copy_from_slice(&(h as i32).wrapping_neg().to_le_bytes());
+    hdr[12..14].copy_from_slice(&1u16.to_le_bytes());
+    hdr[14..16].copy_from_slice(&32u16.to_le_bytes());
+    hdr[20..24].copy_from_slice(&((w * h * 4) as u32).to_le_bytes());
+    let mut v = hdr.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            let u = x as f32 / w as f32;
+            let t = y as f32 / h as f32;
+            v.extend_from_slice(&[
+                (28.0 + 200.0 * t) as u8,
+                (70.0 + 150.0 * u) as u8,
+                (140.0 + 100.0 * (1.0 - u * t)) as u8,
+                255,
+            ]);
+        }
+    }
+    v
+}
+
+/// 离屏出图（`--clip-dump`）：深浅 × 图片页 × 选中/提示 × 空态各一张。
+/// ⚠️ 条目是**造的**，只为核对版面；真实采集见 `clip_capture`。
+unsafe fn clip_dump(dir: &str, st: &mut State) {
+    let it = |kind: u8, text: &str, img: &str, src: &str, ago: i64, pinned: bool, w: i32, h: i32| ClipItem {
+        kind,
+        text: text.into(),
+        img: img.into(),
+        ts: unix_now() as i64 - ago,
+        src: src.into(),
+        pinned,
+        w,
+        h,
+        n: 0,
+    };
+    let d1 = format!("{dir}\\_clip_demo0.dib");
+    let d2 = format!("{dir}\\_clip_demo1.dib");
+    let _ = std::fs::write(&d1, demo_dib(420, 260));
+    let _ = std::fs::write(&d2, demo_dib(300, 300));
+    st.cl_items = vec![
+        it(0, "帮我核对一下：剪贴板卡片 480×480，一页 6 块，3×2。\n选中只写回，不自动粘贴。", "", "Google Chrome", 30, true, 0, 0),
+        it(1, "", &d1, "Snipaste", 90, false, 420, 260),
+        it(2, "D:\\工作\\IDEA\\pigo\\src\\main.rs\nD:\\工作\\IDEA\\pigo\\Cargo.toml\nD:\\工作\\IDEA\\pigo\\README.md", "", "explorer.exe", 200, false, 0, 0),
+        it(0, "https://github.com/lifeFxxker/pipie/issues/1", "", "Google Chrome", 400, false, 0, 0),
+        it(1, "", &d2, "WeChat", 3600 * 5, false, 300, 300),
+        it(0, &"很长的文字".repeat(60), "", "notepad.exe", 3600 * 30, false, 0, 0),
+        it(2, "E:\\下载\\PiPie-1.0.8-win-x64.zip", "", "explorer.exe", 3600 * 26, false, 0, 0),
+        it(0, "已解决：液体玻璃在 WDA 设不上的机器退回真桌面快照。", "", "Code", 86400 * 2, false, 0, 0),
+    ];
+    ensure_clip_fonts(st);
+    let snap = |name: &str, st: &mut State| {
+        clip_render(st);
+        let bg = (205u8, 205u8, 208u8);
+        let mut px = std::slice::from_raw_parts(st.c_lo_bits, (CL_WW * CL_HH * 4) as usize).to_vec();
+        for p in px.chunks_mut(4) {
+            let a = p[3] as f32 / 255.0;
+            let ia = 1.0 - a;
+            p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
+            p[3] = 255;
+        }
+        let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, CL_WW, CL_HH);
+        println!("[clip] {name} {}", if ok { "OK" } else { "FAIL" });
+    };
+    for (name, dark) in [("clip_dark", true), ("clip_light", false)] {
+        st.glass_liquid = dark;
+        st.cl_tab = 0;
+        st.cl_page = 0;
+        st.cl_q.clear();
+        st.cl_hover = CCtl::Tile(1);
+        st.cl_hov_a = 1.0;
+        st.cl_hover_prev = CCtl::None;
+        st.cl_sel = usize::MAX;
+        st.cl_toast.clear();
+        cl_clamp(st);
+        snap(name, st);
+    }
+    // 图片 tab（整页都是缩略图，看「井」和等比放法）
+    st.glass_liquid = true;
+    st.cl_tab = 2;
+    st.cl_page = 0;
+    st.cl_hover = CCtl::None;
+    st.cl_hov_a = 0.0;
+    cl_clamp(st);
+    snap("clip_image", st);
+    // 选中 + 提示（Enter 写回那一瞬的观感）
+    st.cl_tab = 0;
+    cl_clamp(st);
+    st.cl_sel = cl_visible(st)[1];
+    clip_toast(st, "已写回剪贴板 · Ctrl+V 粘贴");
+    snap("clip_sel", st);
+    // 空态（搜索无结果）
+    st.cl_sel = usize::MAX;
+    st.cl_toast.clear();
+    st.cl_q = "zzzzz".into();
+    cl_clamp(st);
+    snap("clip_empty", st);
+    clip_thumbs_clear(st);
+}
+
+// ── 窗口过程 ──
+
+unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        // 分层窗口自己 ULW 上屏，这里只把无效区交还系统
+        let mut ps = PAINTSTRUCT::default();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    // 鼠标坐标是**窗口**坐标（卡片外还有一圈 S_M 投影留白），布局用卡片内逻辑坐标
+    let lx = || ((l.0 & 0xFFFF) as i16 as i32) - S_M;
+    let ly = || (((l.0 >> 16) & 0xFFFF) as i16 as i32) - S_M;
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCHITTEST => {
+            // ⚠️ lParam 是**屏幕**坐标（和设置页同一个坑）
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let x = ((l.0 & 0xFFFF) as i16 as i32) - wr.left - S_M;
+            let y = (((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top - S_M;
+            if cl_drag_band(x, y) {
+                return LRESULT(HTCAPTION as isize);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_MOUSEMOVE => {
+            let st = state_of(hwnd);
+            if !st.cl_tracking {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{
+                    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+                };
+                st.cl_tracking = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            let c = cl_hit(st, lx(), ly());
+            if c != st.cl_hover {
+                st.cl_hover_prev = st.cl_hover;
+                st.cl_hover = c;
+                st.cl_hov_a = 0.0;
+                clip_kick(st);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            let st = state_of(hwnd);
+            st.cl_tracking = false;
+            if st.cl_hover != CCtl::None {
+                st.cl_hover_prev = st.cl_hover;
+                st.cl_hover = CCtl::None;
+                st.cl_hov_a = 0.0;
+                clip_kick(st);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let st = state_of(hwnd);
+            cl_click(st, lx(), ly());
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let st = state_of(hwnd);
+            let d = ((w.0 >> 16) & 0xFFFF) as i16 as i32 / 120;
+            let np = cl_pages(cl_visible(st).len());
+            // 向下滚 = 往后翻页：Win32 里向下滚的 delta 是 **-120**，所以是 `page - d`
+            // （和内环 `ring_scroll(st, -(d/120))` 同符号；别照搬浏览器的 `deltaY`，那个是反的）
+            let p = (st.cl_page as i32 - d).clamp(0, np as i32 - 1) as usize;
+            if p != st.cl_page {
+                st.cl_page = p;
+                cl_repage(st);
+                clip_present(st);
+                clip_kick(st);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let st = state_of(hwnd);
+            match w.0 as usize {
+                TIMER_CLIP_FRAME => clip_tick(st, hwnd),
+                TIMER_CLIP_BLINK => {
+                    if st.cl_shown {
+                        st.cl_blink = !st.cl_blink;
+                        clip_present(st);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            let st = state_of(hwnd);
+            let c = w.0 as u32;
+            if c == 0x08 {
+                // Backspace 归搜索框（删条请用 Del —— 和 Windows 自己的资源管理器一致）
+                st.cl_q.pop();
+                cl_repage(st);
+                clip_present(st);
+                clip_kick(st);
+                return LRESULT(0);
+            }
+            if c == 0x1B {
+                if st.cl_q.is_empty() {
+                    close_clip(st);
+                } else {
+                    st.cl_q.clear();
+                    cl_repage(st);
+                    clip_present(st);
+                }
+                return LRESULT(0);
+            }
+            // 空搜索时：数字 1~6 = 直接选第几块，P = 置顶选中项（和鼠标 hover 一致）
+            if st.cl_q.is_empty() {
+                if (0x31..=0x36).contains(&c) {
+                    if let Some(idx) = cl_slot(st, (c - 0x31) as usize) {
+                        clip_fire(st, idx);
+                    }
+                    return LRESULT(0);
+                }
+                if c == 0x50 || c == 0x70 {
+                    if let Some(on) = cl_toggle_pin(st, st.cl_sel) {
+                        clip_toast(st, if on { "已置顶 · 关掉程序也不掉" } else { "已取消置顶" });
+                        clip_save(st);
+                        clip_present(st);
+                        clip_kick(st);
+                    }
+                    return LRESULT(0);
+                }
+            }
+            if let Some(ch) = char::from_u32(c) {
+                if !ch.is_control() && st.cl_q.chars().count() < 48 {
+                    st.cl_q.push(ch);
+                    st.cl_page = 0;
+                    cl_repage(st);
+                    clip_present(st);
+                    clip_kick(st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            // ⚠️ Esc 不在这里处理 —— 按键顺序是 KEYDOWN 先到、CHAR 后到，
+            // 在这儿收窗会让「有搜索词时按 Esc 只清词」那条逻辑永远轮不上。
+            let st = state_of(hwnd);
+            match w.0 as u32 {
+                0x0D => {
+                    let idx = if st.cl_sel != usize::MAX { st.cl_sel } else { cl_slot(st, 0).unwrap_or(usize::MAX) };
+                    if idx != usize::MAX {
+                        clip_fire(st, idx);
+                    }
+                }
+                0x25 | 0x26 | 0x27 | 0x28 => {
+                    // 方向键按**页内格子**走（←→ 横、↑↓ 竖），到边界回卷，和 3×2 版面一致
+                    let vis = cl_visible(st);
+                    let n = (vis.len() - (st.cl_page * CL_PER).min(vis.len())).min(CL_PER);
+                    if n > 0 {
+                        let cur = if st.cl_sel == usize::MAX { None } else { cl_slot_of(st, st.cl_sel) };
+                        let step = match w.0 as u32 {
+                            0x27 => 1,
+                            0x25 => -1,
+                            0x28 => CL_COLS,
+                            _ => -CL_COLS,
+                        };
+                        let k = match cur {
+                            None => 0,
+                            Some(c) => ((c as i32 + step).rem_euclid(n as i32) as usize).min(n - 1),
+                        };
+                        if let Some(idx) = cl_slot(st, k) {
+                            st.cl_sel = idx;
+                            clip_present(st);
+                        }
+                    }
+                }
+                0x2E => {
+                    // Delete（不是 Backspace，那个归搜索框）
+                    if st.cl_sel != usize::MAX {
+                        clip_del(st, st.cl_sel);
+                        clip_toast(st, "已从历史删除");
+                        clip_present(st);
+                        clip_kick(st);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            // 卡片是「呼出型」窗口：焦点一走就收起，不然一张 480² 的卡会一直压在桌上。
+            // （这也是为什么呼出时必须 SetForegroundWindow —— 它得真拿到焦点。）
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                close_clip(state_of(hwnd));
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            close_clip(state_of(hwnd));
+            LRESULT(0)
+        }
+        WM_APP_CLIPSHOW => {
+            let st = state_of(hwnd);
+            if w.0 == 0 {
+                close_clip(st);
+            } else {
+                open_clip(st);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+/// 块内显示的文字：制表符换成空格、`\r` 丢掉，超过 1200 字截断加省略号。
+/// ⚠️ 截断只影响**显示**，`it.text` 一直是原文（写回的是完整内容）。
+/// 画一整段 2 万字对 GDI 是白烧 CPU，而块里本来也只能显示 9 行。
+fn cl_body(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '\t' => ' ',
+            '\r' => '\n',
+            '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' => ' ',
+            x => x,
+        })
+        .collect();
+    let mut out: String = cleaned.chars().take(1200).collect();
+    if cleaned.chars().count() > 1200 {
+        out.push('…');
+    }
+    out
+}
+
 /// unix 秒（用于 `update_last_check`；注意 `now_s()` 是进程内相对时间，不是这个）。
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
@@ -17697,6 +20259,143 @@ fn main() {
         }
         return;
     }
+    // 诊断：每个 Chromium 窗口的地址栏元素到底能不能读到值（为什么有的窗口读到、有的读不到）。
+    if args.len() >= 2 && args[1] == "--omnidump" {
+        unsafe {
+            use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+            use windows::Win32::UI::Accessibility::{
+                CUIAutomation, IUIAutomation, IUIAutomationLegacyIAccessiblePattern,
+                IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+                UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId,
+            };
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let Ok(ui) =
+                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+            else {
+                println!("UIA 起不来");
+                return;
+            };
+            let Ok(cond) = ui.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &windows_core::VARIANT::from(UIA_EDIT_CT),
+            ) else {
+                println!("条件建不出来");
+                return;
+            };
+            for hw in windows_of_class("Chrome_WidgetWin_1", true) {
+                let mut tb = [0u16; 256];
+                let tl = GetWindowTextW(hw, &mut tb).max(0) as usize;
+                println!(
+                    "窗口 hwnd={:#x} 标题={}",
+                    hw.0 as usize,
+                    String::from_utf16_lossy(&tb[..tl.min(256)])
+                );
+                let Ok(root) = ui.ElementFromHandle(hw) else {
+                    println!("  ElementFromHandle 失败");
+                    continue;
+                };
+                let Ok(arr) = root.FindAll(TreeScope_Descendants, &cond) else {
+                    println!("  FindAll 失败");
+                    continue;
+                };
+                let n = arr.Length().unwrap_or(0);
+                println!("  Edit {n} 个");
+                for i in 0..n {
+                    let Ok(e) = arr.GetElement(i) else { continue };
+                    let g = |r: windows::core::Result<windows::core::BSTR>| {
+                        r.map(|b| b.to_string()).unwrap_or_default()
+                    };
+                    let name = g(e.CurrentName());
+                    let cls = g(e.CurrentClassName());
+                    let vp = e
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId);
+                    let val = vp
+                        .as_ref()
+                        .map(|p| g(p.CurrentValue()))
+                        .unwrap_or_default();
+                    let lia = e
+                        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                            UIA_LegacyIAccessiblePatternId,
+                        )
+                        .map(|l| g(l.CurrentValue()))
+                        .unwrap_or_default();
+                    println!(
+                        "    [{i:>2}] cls={cls} name={name} | ValuePattern={val} | LIA={lia}"
+                    );
+                }
+            }
+        }
+        return;
+    }
+    // 诊断：把每个浏览器标签页元素在 UIA 里能读到的**全部**属性打出来。
+    // 目的：确认除了标题以外 Chromium 到不暴露标签的真实 URL ——
+    // 暴露的话，匹配就能从「猜标题（要联网、SPA 会变）」升级成「比 URL（本地、精确）」。
+    if args.len() >= 2 && args[1] == "--tabdump" {
+        unsafe {
+            use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+            use windows::Win32::UI::Accessibility::{
+                CUIAutomation, IUIAutomation, IUIAutomationLegacyIAccessiblePattern,
+                IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+                UIA_LegacyIAccessiblePatternId, UIA_TabItemControlTypeId, UIA_ValuePatternId,
+            };
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let Ok(ui) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+            else {
+                println!("UIA 起不来");
+                return;
+            };
+            let Ok(cond) = ui.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &windows_core::VARIANT::from(UIA_TabItemControlTypeId.0),
+            ) else {
+                println!("条件建不出来");
+                return;
+            };
+            for hw in windows_of_class("Chrome_WidgetWin_1", true) {
+                let Ok(root) = ui.ElementFromHandle(hw) else { continue };
+                let Ok(arr) = root.FindAll(TreeScope_Descendants, &cond) else { continue };
+                let n = arr.Length().unwrap_or(0);
+                println!("窗口 hwnd={:#x} TabItem {n} 个", hw.0 as usize);
+                for i in 0..n {
+                    let Ok(e) = arr.GetElement(i) else { continue };
+                    let g = |r: windows::core::Result<windows::core::BSTR>| {
+                        r.map(|b| b.to_string()).unwrap_or_default()
+                    };
+                    let name = g(e.CurrentName());
+                    let help = g(e.CurrentHelpText());
+                    let status = g(e.CurrentItemStatus());
+                    let val = e
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                        .and_then(|p| p.CurrentValue())
+                        .map(|b| b.to_string())
+                        .unwrap_or_default();
+                    let legacy = match e
+                        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                            UIA_LegacyIAccessiblePatternId,
+                        ) {
+                        Ok(l) => format!(
+                            "LIA value={} desc={} shortcut={} act={}",
+                            g(l.CurrentValue()),
+                            g(l.CurrentDescription()),
+                            g(l.CurrentKeyboardShortcut()),
+                            g(l.CurrentDefaultAction())
+                        ),
+                        Err(_) => "LIA <无>".to_string(),
+                    };
+                    println!(
+                        "  [{i:>2}] name={name} | help={help} | status={status} | value={val} | {legacy}"
+                    );
+                }
+            }
+        }
+        return;
+    }
     // 诊断：完整的「网址已打开就切过去」（抓标题 → UIA 找标签 → 选中 + 置前）
     if args.len() >= 2 && args[1] == "--focusurl" {
         unsafe {
@@ -17707,10 +20406,14 @@ fn main() {
                 windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
             );
             let u = args.get(2).cloned().unwrap_or_default();
-            println!("browser windows = {}", windows_of_class("Chrome_WidgetWin_1").len());
             let t0 = Instant::now();
-            let hit = switch_to_open_tab(&u);
+            let mut tr = Vec::new();
+            let hit = switch_to_open_tab(&u, &mut tr);
             println!("switch = {hit}   (耗时 {:?})", t0.elapsed());
+            for line in &tr {
+                println!("  · {line}");
+            }
+            tab_log("cli", &u, hit, &tr);
         }
         return;
     }
@@ -17758,6 +20461,24 @@ fn main() {
             read_persistent(&mut st);
             init_fonts(&mut st);
             settings_dump(&dir, &mut st);
+        }
+        return;
+    }
+
+    // 诊断：把剪贴板历史卡片离屏渲染成 BMP（配 bmp2png.py 核对排版）
+    if args.len() >= 2 && args[1] == "--clip-dump" {
+        let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let mut st = State::new();
+            st.ini_path = format!("{}\\settings.ini", dir);
+            load_ini(&mut st);
+            read_persistent(&mut st);
+            init_fonts(&mut st);
+            clip_dump(&dir, &mut st);
         }
         return;
     }
@@ -18118,6 +20839,39 @@ fn main() {
         SET_HWND.store(shwnd.0 as isize, Ordering::SeqCst);
         // 接受从资源管理器拖进来的文件（拖进黑白名单卡片）
         DragAcceptFiles(shwnd, true);
+
+        // 剪贴板历史卡片：第 4 个窗口。和设置页同一套（分层 + 自绘 + ULW 上屏），
+        // 但**不带** `WS_EX_NOACTIVATE` —— 它得真拿到焦点，搜索框才收得到 `WM_CHAR`。
+        let ccls: Vec<u16> = wide("RLClip");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(clip_proc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(ccls.as_ptr()),
+            ..Default::default()
+        });
+        let chwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0),
+            PCWSTR(ccls.as_ptr()),
+            PCWSTR(wide(&format!("PiPieClip{}", suffix)).as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            CL_WW,
+            CL_HH,
+            HWND(ptr::null_mut()),
+            HMENU(ptr::null_mut()),
+            hinst,
+            None,
+        )
+        .unwrap_or(HWND(ptr::null_mut()));
+        SetWindowLongPtrW(chwnd, GWLP_USERDATA, p as isize);
+        CLIP_HWND.store(chwnd.0 as isize, Ordering::SeqCst);
+        // 历史从 `%APPDATA%\PiPie\clipstore.txt` 恢复（`.dib` 已丢的图片项会被丢掉）
+        clip_load(&mut st);
+        if args.iter().any(|a| a == "--clip-show") {
+            open_clip(&mut st);
+        }
+
         // --settings：启动后直接把设置页调出来（便于做快捷方式 / 自动化核对）
         if args.iter().any(|a| a == "--settings") {
             open_settings(&mut st);
@@ -18139,6 +20893,14 @@ fn main() {
 
         add_tray_icon(hwnd);
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, 0x52); // Ctrl+Alt+R
+        // 剪贴板变化监听挂在**宿主窗口**上：它不可见但一直活着，`WM_CLIPBOARDUPDATE`
+        // 才有地方落。开关（`st.cl_on`）判在 `clip_capture` 里 —— 这样托盘勾选即时生效。
+        let _ = AddClipboardFormatListener(hwnd);
+        let hk = RegisterHotKey(hwnd, HOTKEY_CLIP, MOD_CONTROL | MOD_ALT, 0x56); // Ctrl+Alt+V
+        if hk.is_err() {
+            // 撞键（别的程序也占了 Ctrl+Alt+V）时托盘那一项仍然能用，只提醒一句
+            println!("[!] 剪贴板热键 Ctrl+Alt+V 注册失败，可用托盘菜单「剪贴板历史」");
+        }
 
         // 钩子装在专用线程里（见 set_running 注释）
         let listen_on = st.listening;
