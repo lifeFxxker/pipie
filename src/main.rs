@@ -33,7 +33,12 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, SetProcessWorkingSetSize};
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL};
+// 输入法：自绘窗口没有原生 EDIT，组字串得自己取（见便签卡片的 WM_IME_COMPOSITION）
+use windows::Win32::UI::Input::Ime::{
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, COMPOSITIONFORM,
+    CFS_POINT, GCS_COMPSTR, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
+};
 use windows::Win32::UI::Shell::{AssocQueryStringW, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, DROPFILES, HDROP, ShellExecuteW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
@@ -226,7 +231,7 @@ const WM_APP_HITTEST: u32 = WM_APP + 37;
 const WM_APP_WINPROBE: u32 = WM_APP + 38;
 /// 后台抓 `<title>` 跑完了 → **设置窗口**把新名字回填进那条网址条目（见 `title_fetch_start`）。
 const WM_APP_TITLE: u32 = WM_APP + 39;
-/// 呼出/收起**剪贴板历史卡片**（w=1 显示 / 0 隐藏）。托盘菜单和 Ctrl+Alt+V 都走这条，
+/// 呼出/收起**剪贴板历史卡片**（w=1 显示 / 0 隐藏）。托盘菜单和轮盘上那格「剪贴板」都走这条，
 /// 因为它可能来自钩子线程 / 托盘回调，直接操作窗口不安全。
 const WM_APP_CLIPSHOW: u32 = WM_APP + 40;
 /// 仅测试：回报卡片状态。w=0 条目总数 / 1 当前页+总页数（`(page<<16)|页数`）
@@ -238,6 +243,16 @@ const WM_APP_CLIPFIRE: u32 = WM_APP + 42;
 /// 仅测试：往**真**剪贴板塞一条合成内容（w=0 文字 / 1 图片 / 2 文件），
 /// 让正常的 `WM_CLIPBOARDUPDATE` 采集链跑一遍 —— 不绕过任何门禁。
 const WM_APP_CLIPSIM: u32 = WM_APP + 43;
+/// 鼠标**按在卡片外面**了 → 收起卡片。由低级鼠标钩子发（它才知道点击落在哪），
+/// 为什么不能只靠 `WM_ACTIVATE`：常驻模式下轮盘是 `WS_EX_NOACTIVATE` + 置顶，
+/// 点它、点桌面、点任务栏都不会让卡片失活。
+const WM_APP_CLIPDISMISS: u32 = WM_APP + 44;
+/// 呼出/收起**便签卡片**（w=1 显示 / 0 隐藏）。和 `WM_APP_CLIPSHOW` 同一条理由：
+/// 可能来自钩子线程 / 托盘回调，直接操作窗口不安全。
+const WM_APP_NOTESHOW: u32 = WM_APP + 45;
+/// 仅测试：回报便签状态。w=0 页数 / 1 当前页（0 基）/ 2 当前页字数
+/// / 3 可见 / 4 当前页全文的 FNV 摘要（校验打字落对了）。
+const WM_APP_NOTEINFO: u32 = WM_APP + 46;
 
 /// `loading.1` 用这个哨兵值表示「loading 挂在内环**应用本体**上」（图标位置），
 /// 而不是某个外环胶囊 —— 与 `commit_chip == usize::MAX`（内环提交）同一套约定。
@@ -379,6 +394,11 @@ static ICON_SCRATCH: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new(
 ///    绝不可以在回调里 OpenProcess/查进程名（那会拖慢整条输入链，正是我们以前
 ///    「鼠标卡 5~6 秒」的同类错误）。
 static EXEMPT: AtomicBool = AtomicBool::new(false);
+
+/// 剪贴板卡片**当前开着**（`open_clip` 置真、`close_clip` 置假）。
+/// 为什么必须是跨线程原子量而不是 `st.cl_shown`：唯一的读者是低级鼠标钩子
+/// （`mouse_proc` 的 `WM_MOUSEWHEEL` 分支），那是在钩子线程，碰不到 `State`。
+static CLIP_LIVE: AtomicBool = AtomicBool::new(false);
 
 fn cache_get(url: &str) -> Option<String> {
     SWITCH_CACHE
@@ -634,8 +654,6 @@ fn unpack_pt(v: i64) -> (i32, i32) {
     ((v >> 32) as i32, v as i32)
 }
 const HOTKEY_TOGGLE: i32 = 1;
-/// 剪贴板历史卡片的呼出键（Ctrl+Alt+V）
-const HOTKEY_CLIP: i32 = 2;
 const TIMER_FRAME: usize = 1;
 /// 「单击胶囊 → 延迟 `DBL_WAIT_MS` 再执行」用的定时器。
 /// 为什么必须延迟：单击与双击在事件层面**无法区分**，只有等第二击来了才知道。
@@ -705,12 +723,15 @@ const MENU_TOGGLE: u16 = 100;
 const MENU_QUIT: u16 = 103;
 const MENU_PERSIST: u16 = 106;
 const MENU_SETTINGS: u16 = 107;
-const MENU_CLIP: u16 = 108;
-/// 托盘：勾掉 = 不再采集（已有历史保留，卡片仍能翻）
-const MENU_CLIPREC: u16 = 109;
 
 /// 剪贴板历史卡片窗口（`RLClip`，GDI 自绘分层窗口）。
 static CLIP_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 便签卡片窗口（`RLNote`）。和剪贴板卡片同一套尺寸 / 材质 / 关闭规则，
+/// 区别只有内容和键位 —— 所以渲染管线共用（见 `card_render`）。
+static NOTE_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 便签卡片**当前开着**。和 `CLIP_LIVE` 一样：唯一的读者是低级鼠标钩子
+/// （滚轮放行 + 「点到卡片外面就收起」），那边碰不到 `State`，只能用原子量。
+static NOTE_LIVE: AtomicBool = AtomicBool::new(false);
 /// 「这一条是我们自己写回的」—— 记 `GetClipboardSequenceNumber()`。
 /// 写回后系统还会广播一次 `WM_CLIPBOARDUPDATE`，不认出来就会把 PiPie 的写回
 /// 再记一遍（套娃：历史里出现自己的历史）。
@@ -1070,8 +1091,8 @@ struct State {
     set_page_a: f32,
     /// 开关的滑动动画值（0 关 / 1 开；中间态用于圆钮滑动过渡）。按序号：
     /// 0 常驻 / 1 监听 / 2 开机自启（交互页）/ 3 全屏放行(游戏模式)（交互页）
-    /// / 4 显示应用名称（交互页）/ 5 录屏模式（外观页）
-    sw_a: [f32; 6],
+    /// / 4 显示应用名称（交互页）/ 5 录屏模式（外观页）/ 6 剪贴板总开关（应用页）
+    sw_a: [f32; 7],
     /// 悬停中的「?」tooltip id（0 = 不显示）；见 `tip_lines`
     tip: u8,
     /// 开机自启（ini `autostart`；**缺失视为开** → 默认勾选）。
@@ -1183,10 +1204,26 @@ struct State {
     cl_hover_prev: CCtl,
     cl_hov_a: f32,
     cl_tracking: bool,
+    /// 光标所在那一格（`usize::MAX` = 没停在任何一格的元信息行上）。
+    /// 只用来决定「元信息要不要浮出来」：`cl_hover` 变不变由 `cl_hit` 说了算，
+    /// 而块体 → 块底部那一小条，命中的都是同一个 `Tile(idx)`，
+    /// 不给单独一个字段就永远等不到重绘，提示得等到下一次光标闪。
+    cl_tip: usize,
     cl_last: Instant,
+    /// 卡片弹出的时刻（`now_s()`）——失焦看门狗前 `CARD_FG_GRACE` 秒不查
+    cl_fg0: f64,
     /// toast 文案 + 到期时刻（`now_s()`）
     cl_toast: String,
     cl_toast_at: f64,
+    /// 翻页动画：`cl_anim_from` = 旧页码（`usize::MAX` = 没在动），`cl_anim_t` = 0→1 进度。
+    /// 滚轮、页点、PgUp/PgDn、方向键跨页**共用这一条**（时长见 `CL_ANIM_S`）。
+    cl_anim_from: usize,
+    cl_anim_t: f32,
+    /// 刚删掉、还允许撤销的那条：`(删除时它在 cl_items 里的下标, 条目本体)`。
+    cl_undo: Option<(usize, ClipItem)>,
+    /// 撤销窗口到期时刻（`now_s()`）；这期间图片的 `.dib` **先不真删**（见 `cl_undo_img`）。
+    cl_undo_at: f64,
+    cl_undo_img: Option<String>,
     /// 搜索框光标是否处于「亮」的那半拍（500ms 翻一次，见 `TIMER_CLIP_BLINK`）。
     /// ⚠️ 用独立的慢定时器而不是让 16ms 帧循环去算相位：卡片是 480² 的画布，
     ///    一帧要降采样 100 万像素，为了一闪一闪的光标空转它不值。
@@ -1196,6 +1233,37 @@ struct State {
     cf_tile: HFONT,
     cf_small: HFONT,
     cf_bold: HFONT,
+    /// 便签正文（15px，比卡片的块内正文大一档 —— 这是「要用来看/写」的字）
+    cf_note: HFONT,
+    /// 毛玻璃底：卡片**下面**那一块桌面（已模糊 + 纸色染色，`CL_WW²` 的 BGRA，1×）。
+    /// 空 = 纸质模式 / 抓屏失败 → 退回实心 paper。
+    /// ⚠️ 只在呼出那一刻抓一次（那时卡片还没显示，抓不到自己）；拖走卡片后底图就过期，
+    ///    但毛玻璃本来就是"模糊的桌面"，过期只表现为模糊内容不跟手 —— 可以接受。
+    /// ⚠️ 剪贴板卡片和便签卡片**共用**这一块（两张卡同时只开一个）。
+    card_bg: Vec<u8>,
+    // ── 便签卡片（`RLNote`）──
+    /// 便签开着（钩子的「点外面收卡」和滚轮放行看它）
+    nt_shown: bool,
+    /// 每页一段纯文本；空页不落盘（"扔掉一页"= 把字删光）
+    nt_pages: Vec<String>,
+    nt_cur: usize,
+    /// 光标在**当前页正文**里的字节下标（v2：点哪写哪；插入/退格都在这儿发生）
+    nt_caret: usize,
+    /// IME 组字串（还没上屏那段）。空 = 没在组字。
+    nt_comp: String,
+    nt_blink: bool,
+    nt_tracking: bool,
+    /// 卡片弹出的时刻（`now_s()`）——失焦看门狗前 `CARD_FG_GRACE` 秒不查
+    nt_fg0: f64,
+    /// 悬停的页点（`usize::MAX` = 没悬停）
+    nt_dot_hover: usize,
+    /// 光标停在「＋ 新页」上
+    nt_plus_hot: bool,
+    nt_x: i32,
+    nt_y: i32,
+    /// 排版缓存：(文本摘要, 框宽, 行区间)。便签每帧都要排版，
+    /// 而 GDI 量字宽是逐段调用 —— 不复用就会在光标闪烁时每 500ms 白算一遍。
+    nt_lay: Option<(u64, i32, Vec<(usize, usize)>)>,
     /// 超采样画布（同设置页：hi = SS 倍 GDI 画布，lo = 降采样结果直接上屏）
     c_hi_bits: *mut u8,
     c_hi_dc: HDC,
@@ -1206,11 +1274,19 @@ struct State {
     /// 缩略图缓存（见 `ClipThumb`）。
     /// ⚠️ 只存**当前页**用到的：翻页时整批释放（60 张全缓存 = 24MB 常驻，不能那么干）。
     cl_thumbs: Vec<ClipThumb>,
+    /// 块内正文的行排版缓存（见 `ClLay` / `cl_par`），同样只服务当前页。
+    cl_lay: Vec<ClLay>,
     cl_x: i32,
     cl_y: i32,
+    /// 用户有没有**自己拖过**卡片（ini `clip_pos=`）。`false` = 每次呼出居中；
+    /// `true` = 停在 `cl_x`/`cl_y`（ini `clip_x=`/`clip_y=`，落盘前夹回虚拟桌面）。
+    cl_pos_set: bool,
     /// 轮盘上的「剪贴板」内置条目：`< 2` = 该有（老配置首次自动补一个），
     /// `2` = 用户自己把它拖出过环，**永远不再复活**。
     clip_app: u8,
+    /// 「剪贴板」开关关掉时，那条目在 `apps` 里原本排第几（重新打开塞回原位）。
+    /// `usize::MAX` = 没记着（例如配置里压根关着一整个进程启动）→ 塞到末尾。
+    cl_ring_pos: usize,
 }
 
 impl State {
@@ -1353,8 +1429,9 @@ impl State {
             set_hover_prev: Ctl::None,
             set_hov_a: 1.0,
             set_page_a: 1.0,
-            // `sw_a[5]` = 录屏模式 = `!glass_live`，而 glass_live 缺省开 → 初值 0
-            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            // `sw_a[5]` = 录屏模式 = `!glass_live`，而 glass_live 缺省开 → 初值 0；
+            // `sw_a[6]` = 剪贴板总开关，`cl_on` 缺省开 → 初值 1
+            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
             tip: 0,
             // 默认开：ini 里没有 `autostart=` 时就是它（用户主动关才变 false）
             autostart: true,
@@ -1397,7 +1474,7 @@ impl State {
             s_lo_bmp: HBITMAP(ptr::null_mut()),
             set_x: 0,
             set_y: 0,
-            // ⚠️ `cl_on` 缺省 = 开：卡片里没东西就是一张空卡，第一次按 Ctrl+Alt+V 会
+            // ⚠️ `cl_on` 缺省 = 开：卡片里没东西就是一张空卡，第一次点轮盘上那格会
             //    以为功能坏了。真要关是在设置里关（`clip=0`），不是靠默认。
             cl_on: true,
             cl_pwd: true,
@@ -1411,24 +1488,49 @@ impl State {
             cl_hover_prev: CCtl::None,
             cl_hov_a: 0.0,
             cl_tracking: false,
+            cl_tip: usize::MAX,
             cl_last: Instant::now(),
+            cl_fg0: 0.0,
             cl_toast: String::new(),
             cl_toast_at: 0.0,
+            cl_anim_from: usize::MAX,
+            cl_anim_t: 1.0,
+            cl_undo: None,
+            cl_undo_at: 0.0,
+            cl_undo_img: None,
             cl_blink: true,
             cf_body: HFONT(ptr::null_mut()),
             cf_tile: HFONT(ptr::null_mut()),
             cf_small: HFONT(ptr::null_mut()),
             cf_bold: HFONT(ptr::null_mut()),
+            cf_note: HFONT(ptr::null_mut()),
             c_hi_bits: ptr::null_mut(),
             c_hi_dc: HDC(ptr::null_mut()),
             c_hi_bmp: HBITMAP(ptr::null_mut()),
             c_lo_bits: ptr::null_mut(),
             c_lo_dc: HDC(ptr::null_mut()),
             c_lo_bmp: HBITMAP(ptr::null_mut()),
+            card_bg: Vec::new(),
+            nt_shown: false,
+            nt_pages: Vec::new(),
+            nt_cur: 0,
+            nt_caret: 0,
+            nt_comp: String::new(),
+            nt_blink: true,
+            nt_tracking: false,
+            nt_fg0: 0.0,
+            nt_dot_hover: usize::MAX,
+            nt_plus_hot: false,
+            nt_x: 0,
+            nt_y: 0,
+            nt_lay: None,
             cl_thumbs: Vec::new(),
+            cl_lay: Vec::new(),
             cl_x: 0,
             cl_y: 0,
+            cl_pos_set: false,
             clip_app: 0,
+            cl_ring_pos: usize::MAX,
         }
     }
 }
@@ -3528,6 +3630,32 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                     pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, icon_a,
                 );
             }
+        } else if st.apps[i].target == "@act:note" {
+            // 便签：一支斜放的**铅笔**。
+            // 为什么不用纸/本子：折角纸和剪贴板那颗「板 + 两行字」在 28px 上几乎一样
+            // （用户 2026-11-01：「跟粘贴板区分不开」）。铅笔一眼就是「写东西」。
+            let k = 0.7071f32;
+            let ax = icon_side * 0.30; // 笔杆半长
+            let hw = icon_side * 0.072; // 半宽
+            let tip = icon_side * 0.15; // 笔尖长度
+            let c = (cx, cy);
+            let d = (k, -k);
+            let n = (k, k);
+            let pt = |a: f32, b: f32| (c.0 + d.0 * a + n.0 * b, c.1 + d.1 * a + n.1 * b);
+            let (a0, a1) = (pt(ax, hw), pt(ax, -hw));
+            let (b0, b1) = (pt(-ax, -hw), pt(-ax, hw));
+            // 笔杆（四边形拆两块三角）
+            flat_tri(buf, a0, a1, b1, pal.ink, icon_a);
+            flat_tri(buf, a0, b1, b0, pal.ink, icon_a);
+            // 笔尖
+            let e = pt(-ax - tip, 0.0);
+            flat_tri(buf, b0, b1, e, pal.ink, icon_a);
+            // 笔尖与笔杆之间那道缝：用**纸色**在墨色笔杆上切一刀 ——
+            // 没有它整颗就是个斜杠，看不出是铅笔（离屏 dump 对比过）
+            let (s0, s1) = (pt(-ax, hw * 1.05), pt(-ax, -hw * 1.05));
+            let (s2, s3) = (pt(-ax - tip * 0.22, -hw * 0.75), pt(-ax - tip * 0.22, hw * 0.75));
+            flat_tri(buf, s0, s1, s2, pal.paper, icon_a.max(0.85));
+            flat_tri(buf, s0, s2, s3, pal.paper, icon_a.max(0.85));
         } else if let Some(tex) = st.apps[i].icon.as_ref() {
             draw_bgra_icon(buf, cx, cy, icon_side, tex, icon_a);
         } else if let Some(ch) = st.apps[i].name.chars().next() {
@@ -5113,6 +5241,7 @@ fn default_apps() -> Vec<(String, String)> {
         ("文件夹".to_string(), "shell:UsersFilesFolder".to_string()),
         ("浏览器".to_string(), "https://www.bing.com".to_string()),
         ("剪贴板".to_string(), "@act:clip".to_string()),
+        ("便签".to_string(), "@act:note".to_string()),
         ("开始菜单".to_string(), "@act:start".to_string()),
     ]
 }
@@ -7396,10 +7525,22 @@ fn commit(st: &mut State) {
             }
             return;
         }
+        if t == "@act:note" {
+            // 便签：和剪贴板一样先收轮盘（同一条理由 —— 要抓它下面的桌面做毛玻璃底）
+            unsafe {
+                close_menu_now(st);
+                open_note(st);
+            }
+            return;
+        }
         if t == "@act:clip" {
-            // 剪贴板卡片：不走淡出 —— `open_clip` 要在卡片出现前抓这一块桌面做玻璃底，
-            // 轮盘还留在屏幕上就会被拍进玻璃里（`snap_glass` 那条老规矩）。
-            unsafe { open_clip(st) };
+            // 剪贴板卡片：**先立刻收起轮盘**（用户 2026-11-01：「打开粘贴板后就收起轮盘就行了」）。
+            // 不用淡出 —— ① 卡片要抓这一块桌面做毛玻璃底，轮盘还在屏幕上就会被拍进去；
+            // ② 卡片自己就是焦点，轮盘留着只会挡视线。
+            unsafe {
+                close_menu_now(st);
+                open_clip(st);
+            }
             return;
         }
     }
@@ -8001,7 +8142,7 @@ unsafe fn dump_all(dir: &str) {
         save_bmp(&format!("{}\\dump_bub_name.bmp", dir), &buf, CANVAS, CANVAS);
         // 2d) 气泡：状态消息（主行 + 副行，最长的一档 → 看会不会顶到上限 150）
         st.hover_now = None;
-        say(&mut st, "已添加：Visual Studio Code", "拖进来就能用，右键可改", 99.0);
+        say(&mut st, "已摘下：Visual Studio Code", "点「取消」可以放回", 99.0);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_add.bmp", dir), &buf, CANVAS, CANVAS);
         // 2d-2) 气泡：发现新版本（用户 2026-10-27 要头像提醒）—— 文案必须和 `update_say` 一致
@@ -8015,7 +8156,7 @@ unsafe fn dump_all(dir: &str) {
         // 2f) 深色主题下的气泡 —— 用户用的是深色，必须确认对比度没反
         //     （块色/字色在深浅下是同一套 token，搞反了就是白底白字）
         st.glass_liquid = true;
-        say(&mut st, "已添加：Chrome", "拖进来就能用，右键可改", 99.0);
+        say(&mut st, "已摘下：Chrome", "点「取消」可以放回", 99.0);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_dark.bmp", dir), &buf, CANVAS, CANVAS);
         st.glass_liquid = false;
@@ -8818,6 +8959,13 @@ unsafe fn read_persistent(st: &mut State) {
             } else if let Some(v) = get("clip_app=") {
                 // 轮盘上的「剪贴板」条目：缺省 0 = 该有；2 = 用户自己删过，别再塞回去
                 st.clip_app = v.parse::<u8>().unwrap_or(0).min(2);
+            } else if let Some(v) = get("clip_pos=") {
+                // 用户拖过卡片 = 记住位置；没拖过就每次呼出居中（缺省）
+                st.cl_pos_set = v != "0";
+            } else if let Some(v) = get("clip_x=") {
+                st.cl_x = v.parse::<i32>().unwrap_or(0);
+            } else if let Some(v) = get("clip_y=") {
+                st.cl_y = v.parse::<i32>().unwrap_or(0);
             } else if let Some(v) = get("update_auto=") {
                 st.update_auto = v != "0";
             } else if let Some(v) = get("update_last_check=") {
@@ -8922,7 +9070,18 @@ unsafe fn load_ini(st: &mut State) {
                     }
                     continue;
                 }
-                if mode == 0 || line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                    continue;
+                }
+                if mode == 0 {
+                    // ⚠️ 这里只多认一个 `clip=`：环上那条「剪贴板」该补还是该摘，必须在
+                    // **本函数**就能判定 —— `read_persistent` 跑在 `load_ini` 之后，
+                    // 靠它的缺省值会先按「开」补错一次（2026-11-01 的坑：`clip=0` 重启后图标又回来了）。
+                    if let Some((k, v)) = line.split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("clip") {
+                            st.cl_on = v.trim() != "0";
+                        }
+                    }
                     continue;
                 }
                 if let Some((k, v)) = line.split_once('=') {
@@ -9020,24 +9179,29 @@ unsafe fn load_ini(st: &mut State) {
     // 每次重载都重算「用户是否自己配过环」：他可能刚拖进来一个新应用，
     // 也可能刚删掉了默认项 —— 两个方向都该立刻停止"拖进来添加"的引导。
     st.onb_customized = apps_customized(st);
-    // ── 轮盘上的「剪贴板」：老配置首次自动补一个 ──
+    // ── 轮盘上的「剪贴板」：按开关补齐 / 摘掉 ──
     // 出厂默认里已经带着它（`default_apps`），但存过配置的人不会再走那条路。
     // `clip_app`：0/缺省 = 该有；2 = 他自己把它拖出过环 → **永远不再塞回去**。
     // 重复注入由「apps 里已有这个 target」挡住，所以不必先落一个标记才能防重。
-    if st.clip_app < 2
-        && st.apps.len() < MAX_APPS
-        && !st.apps.iter().any(|a| a.target == "@act:clip")
-    {
-        st.apps.push(AppEntry {
-            name: "剪贴板".to_string(),
-            target: "@act:clip".to_string(),
-            // 图标：这个 target 不是文件，`decode_icon` 取不到东西 ——
-            // 轮盘对 `@act:` 一律自绘（见画内环图标那一支）。
-            icon: None,
-            items: Vec::new(),
-            grad: grad_for("剪贴板"),
-        });
-        ini_insert_app(&st.ini_path, "剪贴板", "@act:clip");
+    // ── 轮盘上的「便签」：和剪贴板不同，它没有开关，缺了就直接补上 ──
+    // 出厂默认里也带着（`default_apps`），但存过配置的人不会再走那条路。
+    if st.apps.len() < MAX_APPS && !st.apps.iter().any(|a| a.target == "@act:note") {
+        ini_insert_app(&st.ini_path, "便签", "@act:note");
+        load_ini(st);
+        return;
+    }
+    if st.cl_on {
+        if st.clip_app < 2
+            && st.apps.len() < MAX_APPS
+            && !st.apps.iter().any(|a| a.target == "@act:clip")
+        {
+            st.apps.push(clip_ring_entry());
+            ini_insert_app(&st.ini_path, "剪贴板", "@act:clip");
+        }
+    } else {
+        // 关着 = 「不展示」：配置里存着那条（老配置 / 手动写的）也要摘掉，
+        // 否则环上会留一个按不出来的图标。
+        hide_clip_ring(st);
     }
     load_icons(st);
     // 窗口条目（kind==1）的 live_hwnd 不持久化，重启后这里按「exe + 标题」重新
@@ -11316,6 +11480,31 @@ struct MsLlHook {
     dw_extra_info: usize,
 }
 
+/// 钩子事件自带的光标坐标此刻**是不是落在剪贴板卡片的窗口矩形里**。
+/// ⚠️ 钩子线程只做纯读（一次 `GetWindowRect`）：不碰 `State`、更不注入输入（铁律）。
+///    用的是**窗口**矩形（含投影留白）—— 卡片是分层窗口，留白那块透明但仍在矩形内，
+///    多让出一圈不会误判到别的窗口：那样只会让滚轮照常投给系统，最坏是滚了下面。
+unsafe fn cursor_on_clip(l: LPARAM) -> bool {
+    cursor_in_window(CLIP_HWND.load(Ordering::Relaxed), l)
+}
+
+unsafe fn cursor_on_note(l: LPARAM) -> bool {
+    cursor_in_window(NOTE_HWND.load(Ordering::Relaxed), l)
+}
+
+/// 光标在不在这个窗口（含投影留白那一圈）里。钩子里用它判「点在卡片上还是外面」。
+unsafe fn cursor_in_window(h: isize, l: LPARAM) -> bool {
+    if h == 0 {
+        return false;
+    }
+    let pt = (*(l.0 as *const MsLlHook)).pt;
+    let mut r = RECT::default();
+    if GetWindowRect(HWND(h as *mut c_void), &mut r).is_err() {
+        return false;
+    }
+    r.left <= pt.x && pt.x < r.right && r.top <= pt.y && pt.y < r.bottom
+}
+
 unsafe extern "system" fn mouse_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     // 计时包装：本回调变慢 = 用户鼠标全系统卡顿的直接证据。
     // 只多两次 GetTickCount（纳秒级），事件本身照常处理。
@@ -11428,7 +11617,25 @@ unsafe extern "system" fn mouse_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LR
         return CallNextHookEx(None, code, w, l);
     }
 
-    // ── 录制态：抓下一次输入。所有鼠标键均不收录（中/侧键已有独立开关、右键=长按右键专属、
+    // 卡片是「呼出型」窗口：**点到卡片外面就收起**。
+    // ⚠️ 光靠 `WM_ACTIVATE` 不够 —— 常驻模式下轮盘（`WS_EX_NOACTIVATE` + 置顶）一直浮着，
+    //    点到轮盘、桌面、任务栏都不会让卡片失活，用户看到的就是「失焦了也不关」
+    //    （2026-11-01 报）。所以按「点击位置在不在卡片上」判，和激活状态无关。
+    //    铁律照旧：钩子线程只读原子量 + PostMessage，绝不碰 State。
+    if matches!(w.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+        if CLIP_LIVE.load(Ordering::Relaxed) && !cursor_on_clip(l) {
+            post(WM_APP_CLIPDISMISS, 0, 0);
+        }
+        if NOTE_LIVE.load(Ordering::Relaxed) && !cursor_on_note(l) {
+            // 便签的收起消息由它自己的窗口过程处理（`WM_APP_NOTESHOW` w=0）
+            let nh = NOTE_HWND.load(Ordering::Relaxed);
+            if nh != 0 {
+                let _ = PostMessageW(HWND(nh as *mut c_void), WM_APP_NOTESHOW, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    // 录制态：抓下一次输入。所有鼠标键均不收录（中/侧键已有独立开关、右键=长按右键专属、
     //    左键=全局点击会破坏正常操作）；仅键盘组合键可录为自定义触发。
     if CAPTURE_TRIGGER.load(Ordering::Relaxed) {
         let btn = match w.0 as u32 {
@@ -11542,6 +11749,20 @@ unsafe extern "system" fn mouse_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LR
             // 菜单不抢焦点，收不到真正的 `WM_MOUSEWHEEL` → 只能在这里截。
             // 开着菜单时**吞掉**消息，否则滚轮会同时滚动下面的窗口。
             if MENU_OPEN.load(Ordering::Relaxed) && !EXEMPT.load(Ordering::Relaxed) {
+                // ⚠️ 卡片开着 + 光标就在卡片上 → 这条滚轮是给**卡片**翻页的：
+                //    既不能转环，也**不能吞**。吞掉就是用户 2026-11-01 报的
+                //    「滚轮不生效」——`commit()` 里 `@act:clip` 分支不 `hide_menu`
+                //    （`MENU_OPEN` 一直真），常驻模式（`persistent=1`）下更是永远真，
+                //    于是卡片和轮盘同时在场时滚轮整条被吃掉。
+                //    放行 = 交给系统按光标位置投递（Win10/11 的「悬停滚动」会送给
+                //    光标下的窗口，实测卡片拿得到，见 `tools/_clipwheel.py`）。
+                let on_card = unsafe {
+                    (CLIP_LIVE.load(Ordering::Relaxed) && cursor_on_clip(l))
+                        || (NOTE_LIVE.load(Ordering::Relaxed) && cursor_on_note(l))
+                };
+                if on_card {
+                    return CallNextHookEx(None, code, w, l);
+                }
                 // ⚠️⚠️ 滚轮增量在 **`MSLLHOOKSTRUCT.mouseData` 的高 16 位**，
                 // 不在 `wParam` 里 —— 低级钩子的 wParam 只带消息 ID（实测恒为 0x20A，
                 // 高 16 位永远是 0）。第一版照窗口消息的写法取 `w.0 >> 16`，
@@ -12733,6 +12954,12 @@ unsafe fn frame(st: &mut State, alpha: u8) {
 // ───────────────────── 菜单生命周期 ─────────────────────
 
 unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
+    // 轮盘一出来就把卡片收掉：卡片是「呼出型」的，两张卡一起在场只会互相挡。
+    // ⚠️ 轮盘是 `WS_EX_NOACTIVATE`，它不会让卡片失活 —— 所以必须显式收。
+    unsafe {
+        close_clip(st);
+        close_note(st);
+    }
     let rh = RING_HWND.load(Ordering::Relaxed);
     if rh == 0 {
         return;
@@ -12953,12 +13180,6 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let on = !st.running;
                 let st2 = state_of(hwnd);
                 set_running(st2, on);
-            } else if w.0 as i32 == HOTKEY_CLIP {
-                // Ctrl+Alt+V：卡片自己 toggle（`open_clip` 已显示时就是收起）
-                let h = CLIP_HWND.load(Ordering::SeqCst);
-                if h != 0 {
-                    let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLIPSHOW, WPARAM(1), LPARAM(0));
-                }
             }
             LRESULT(0)
         }
@@ -12970,6 +13191,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             CLIP_TRY.store(0, Ordering::Relaxed);
             let retry = clip_capture(st);
             clip_retry_arm(hwnd, retry);
+            LRESULT(0)
+        }
+        WM_APP_CLIPDISMISS => {
+            // 鼠标按在卡片外面（由钩子线程判定并投递）→ 收起。
+            // 和 `WM_ACTIVATE` 那条互为兜底：那条管「焦点真被抢走」，这条管「点到了不抢焦点的东西」。
+            close_clip(state_of(hwnd));
             LRESULT(0)
         }
         WM_APP_CLIPINFO => {
@@ -12985,6 +13212,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 6 => vis.len(),
                 // 最新一条的类型（+1，0 = 历史为空）—— 采集链断言用
                 7 => st.cl_items.first().map(|i| i.kind as usize + 1).unwrap_or(0),
+                // 删除之后还在撤销窗口里 / 正在翻页动画 —— 回归断言用
+                8 => st.cl_undo.is_some() as usize,
+                9 => (st.cl_anim_from != usize::MAX) as usize,
                 _ => usize::MAX,
             };
             LRESULT(v as isize)
@@ -13224,7 +13454,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         // 「忙碌」：低头消化刚进环的新成员（到点自动回落）
                         set_mood(st, 5);
                         st.mood_hold = now_s() + 1.5;
-                        say(st, &format!("已添加：{}", drop_name(&items)), "拖进来就能用，右键可改", 1.8);
+                        say(st, &format!("已添加：{}", drop_name(&items)), "", 1.8);
                     } else {
                         // ⚠️ 这里以前只有一行 `println!` —— 用户拖重复 / 落点没命中时
                         //    界面上零反馈，表现就是「拖进去了但不知道成没成」。
@@ -13239,7 +13469,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         if dup {
                             say(st, &format!("已经在环上了：{}", nm), "", 1.7);
                         } else {
-                            say(st, &format!("没接住：{}", nm), "再拖一次试试", 1.7);
+                            say(st, &format!("没接住：{}", nm), "稍后重试", 1.7);
                         }
                     }
                     // 常驻模式：保持打开，让用户亲眼看到新成员出现；
@@ -13900,11 +14130,6 @@ WM_APP_DISMISS_FG => {
                 let t2: Vec<u16> = wide("常驻模式（松开后保持）");
                 let _ = AppendMenuW(menu, mif(st.persistent), MENU_PERSIST as usize, PCWSTR(t2.as_ptr()));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                let t8: Vec<u16> = wide("剪贴板历史（Ctrl+Alt+V）");
-                let _ = AppendMenuW(menu, mif(false), MENU_CLIP as usize, PCWSTR(t8.as_ptr()));
-                let t9: Vec<u16> = wide("记录剪贴板");
-                let _ = AppendMenuW(menu, mif(st.cl_on), MENU_CLIPREC as usize, PCWSTR(t9.as_ptr()));
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let t7: Vec<u16> = wide("退出");
                 let _ = AppendMenuW(menu, mif(false), MENU_QUIT as usize, PCWSTR(t7.as_ptr()));
 
@@ -13936,17 +14161,6 @@ WM_APP_DISMISS_FG => {
                         save_settings(st);
                         println!("[*] 常驻模式：{}", if st.persistent { "开" } else { "关" });
                     }
-                    MENU_CLIP => {
-                        let h = CLIP_HWND.load(Ordering::SeqCst);
-                        if h != 0 {
-                            let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLIPSHOW, WPARAM(1), LPARAM(0));
-                        }
-                    }
-                    MENU_CLIPREC => {
-                        st.cl_on = !st.cl_on;
-                        save_settings(st);
-                        println!("[*] 剪贴板记录：{}", if st.cl_on { "开" } else { "关" });
-                    }
                     MENU_QUIT => unsafe { quit_app() },
                     _ => {}
                 }
@@ -13957,7 +14171,6 @@ WM_APP_DISMISS_FG => {
             remove_tray_icon(hwnd);
             let _ = RemoveClipboardFormatListener(hwnd);
             let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
-            let _ = UnregisterHotKey(hwnd, HOTKEY_CLIP);
             unsafe { quit_app() };
         }
         _ => DefWindowProcW(hwnd, msg, w, l),
@@ -13986,7 +14199,27 @@ const S_X1: i32 = S_W - 26;          // 内容区右边界
 //    否则切页时标题会上下跳几像素。`S_LIST_TOP` 一旦改，`test_settings.py` 里的
 //    镜像常量必须同步（那边有硬编码）。
 const S_LIST_TOP: i32 = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP;
-const S_LIST_BOT: i32 = S_H - 78;
+/// ⚠️ 列表底**不是**贴着页脚 —— 底下还要留一条独立的「剪贴板」开关卡（`clip_card_rect`）。
+/// 列表本身可滚，少给 72px 只是早一点开始滚。
+const S_LIST_BOT: i32 = S_H - 150;
+/// 应用页底部那张独立的「剪贴板」卡：和上面的应用行**故意长得不一样**
+/// （圆角卡 + 右侧开关），因为它管的不是某个应用，而是这个功能开不开。
+const CLIP_CARD_TOP: i32 = S_H - 134;
+const CLIP_CARD_H: i32 = 56;
+
+fn clip_card_rect() -> RECT {
+    RECT { left: S_X0, top: CLIP_CARD_TOP, right: S_X1, bottom: CLIP_CARD_TOP + CLIP_CARD_H }
+}
+
+/// 卡里那颗开关（右侧，离卡片边 14）
+fn clip_sw_rect() -> RECT {
+    RECT { left: S_X1 - 60, top: CLIP_CARD_TOP + (CLIP_CARD_H - 26) / 2, right: S_X1 - 14, bottom: CLIP_CARD_TOP + (CLIP_CARD_H + 26) / 2 }
+}
+
+/// 卡里「剪贴板」标题右边那颗「?」
+fn clip_tip_rect() -> RECT {
+    RECT { left: S_X0 + 66, top: CLIP_CARD_TOP + 18, right: S_X0 + 84, bottom: CLIP_CARD_TOP + 36 }
+}
 
 // ── 渲染管线：整页先在 SS 倍大的 DIB 上用 GDI 画，再 SS×SS 盒式降采样 ──
 //
@@ -14103,6 +14336,8 @@ enum Ctl {
     Tip(u8),              // 1 常驻 2 监听 3 全屏放行 4 黑名单 5 白名单
     /// 关于页「检查更新」按钮
     UpdateCheck,
+    /// 应用页底部那张独立卡：「剪贴板」总开关（状态 = `st.cl_on`，见 `cl_set_on`）
+    ClipOn,
 }
 
 // ══ 交互页几何（绘制与命中共用，别写第二份）══
@@ -14291,29 +14526,36 @@ fn tip_lines(id: u8) -> &'static [&'static str] {
         4 => &["选「黑名单」模式时：列表里的程序呼出键不生效。", "拖 exe 进来添加；点卡片标题切换当前生效的是哪张。"],
         5 => &["选「白名单」模式时：只有列表里的程序呼出键才生效。", "拖 exe 进来添加；点卡片标题切换当前生效的是哪张。"],
         6 => &["鼠标悬停内环图标时，用头像旁的气泡显示它的应用名。", "关掉就只看图标（操作结果提示不受影响）。"],
+        7 => &["关掉后不再记录，轮盘上的「剪贴板」图标一起消失。", "密码管理器里的复制始终不记录。"],
         _ => &[],
     }
 }
 
-fn tip_anchor(id: u8) -> (i32, i32) {
+/// 「?」tooltip 的落点：`(左上角 x, 左上角 y, 是否向上翻)`。
+/// 应用页底部那张卡的下方已经没有空间（会压住「+ 添加应用…」），所以往上翻。
+fn tip_anchor(id: u8) -> (i32, i32, bool) {
     match id {
         1..=3 => {
             let r = act_tip_rect(id as usize - 1);
-            (r.left, r.bottom + 6)
+            (r.left, r.bottom + 6, false)
         }
         4 => {
             let r = exc_tip_rect(0);
-            (r.left, r.bottom + 6)
+            (r.left, r.bottom + 6, false)
         }
         5 => {
             let r = exc_tip_rect(1);
-            (r.left, r.bottom + 6)
+            (r.left, r.bottom + 6, false)
         }
         6 => {
             let r = act_tip_rect(4);
-            (r.left, r.bottom + 6)
+            (r.left, r.bottom + 6, false)
         }
-        _ => (0, 0),
+        7 => {
+            let r = clip_tip_rect();
+            (r.left, r.top - 6, true)
+        }
+        _ => (0, 0, false),
     }
 }
 
@@ -14324,6 +14566,17 @@ struct SRow {
     ii: usize,
     y: i32,
     h: i32,
+}
+
+/// 应用行右边那一列显示什么：普通应用显示路径/网址，内置动作显示人话。
+/// 把 `@act:clip` 这种内部字符串摊到设置页上，等于让用户以为它是个坏掉的路径。
+fn row_target_text(t: &str) -> &str {
+    match t {
+        "@act:clip" => "内置 · 剪贴板历史",
+        "@act:note" => "内置 · 便签",
+        "@act:start" => "内置 · 开始菜单",
+        _ => t,
+    }
 }
 
 fn s_rows(st: &State) -> (Vec<SRow>, i32) {
@@ -14337,8 +14590,11 @@ fn s_rows(st: &State) -> (Vec<SRow>, i32) {
                 v.push(SRow { kind: 1, ai, ii, y, h: 32 });
                 y += 32;
             }
-            v.push(SRow { kind: 2, ai, ii: 0, y, h: 32 });
-            y += 32;
+            // 内置动作（`@act:`）没有「往这个应用里加一条」的概念 —— 不给那两颗胶囊
+            if !a.target.starts_with("@act:") {
+                v.push(SRow { kind: 2, ai, ii: 0, y, h: 32 });
+                y += 32;
+            }
         }
         y += 6;
     }
@@ -14527,9 +14783,58 @@ unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
+/// 圆角**半透明**填充：把 DC 裁成圆角矩形，再把 1×1 的纯色 `AlphaBlend` 铺进去。
+/// 毛玻璃卡片里的「纸面」都走这条 —— 用不透明的 `g_rrect` 就一点也透不出下面的模糊桌面。
+/// ⚠️ 圆角是 GDI 区域裁的（本身有锯齿），但这里是 2 倍画布 + 盒式降采样，
+///    而且填的是半透明色、边缘本来就软，落地看不出台阶。
+unsafe fn g_rrect_alpha(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8) {
+    if r.right <= r.left || r.bottom <= r.top || a == 0 {
+        return;
+    }
+    if a >= 255 {
+        g_rrect(dc, r, rad, c, None, 0);
+        return;
+    }
+    let (bits, mdc, bmp) = make_dib(1, 1);
+    if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
+        return;
+    }
+    *bits = c.2; // B
+    *bits.add(1) = c.1; // G
+    *bits.add(2) = c.0; // R
+    *bits.add(3) = 255;
+    let rgn = CreateRoundRectRgn(
+        sxv(r.left),
+        sxv(r.top),
+        sxv(r.right) + 1,
+        sxv(r.bottom) + 1,
+        rad * 2 * SS,
+        rad * 2 * SS,
+    );
+    let saved = SaveDC(dc);
+    let _ = SelectClipRgn(dc, rgn);
+    let bf = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: a, AlphaFormat: 0 };
+    let _ = AlphaBlend(
+        dc,
+        sxv(r.left),
+        sxv(r.top),
+        (r.right - r.left) * SS,
+        (r.bottom - r.top) * SS,
+        mdc,
+        0,
+        0,
+        1,
+        1,
+        bf,
+    );
+    let _ = RestoreDC(dc, saved);
+    let _ = DeleteObject(HGDIOBJ(rgn.0));
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mdc);
+}
+
 /// 只描边不填充（卡片外框：画在内容之上，不能盖住内容）
-unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32) {
-    let pen = CreatePen(PS_SOLID, ew * SS, rgb(edge));
+unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32) {    let pen = CreatePen(PS_SOLID, ew * SS, rgb(edge));
     let nb = GetStockObject(NULL_BRUSH);
     let op = SelectObject(dc, HGDIOBJ(pen.0));
     let ob = SelectObject(dc, nb);
@@ -15115,7 +15420,7 @@ unsafe fn settings_draw(st: &mut State, dc: HDC) {
     if st.tip != 0 {
         let lines = tip_lines(st.tip);
         if !lines.is_empty() {
-            let (ax, ay) = tip_anchor(st.tip);
+            let (ax, ay, up) = tip_anchor(st.tip);
             // ⚠️ 宽度**按文案量出来**，别写死 —— 写死 384 会拖出一条超宽的条
             //    （用户 2026-10-11：「明显展示的 tooltip 过宽了」）。
             //    这是 12px 字体（`sf_small`）：中文≈12px、西文≈6.5px，左右各留 12 padding。
@@ -15127,7 +15432,7 @@ unsafe fn settings_draw(st: &mut State, dc: HDC) {
             let w = (tw + 24).clamp(120, S_W - S_M * 2 - 24);
             let h = 16 + lines.len() as i32 * 20;
             let x = (ax - 14).min(S_W - 10 - w).max(8);
-            let mut y = ay;
+            let mut y = if up { (ay - h).max(8) } else { ay };
             if y + h > S_H - 10 {
                 y = (ay - h - 34).max(8); // 下面放不下就翻到上面
             }
@@ -15537,7 +15842,7 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
                 if head { pal.ink } else { mixc(pal.paper, pal.ink, 0.75) },
                 if head { st.sf_body } else { st.sf_small }, false);
         }
-        g_text(dc, &target, tg_r, mixc(pal.paper, pal.ink, 0.45), st.sf_small, false);
+        g_text(dc, row_target_text(&target), tg_r, mixc(pal.paper, pal.ink, 0.45), st.sf_small, false);
 
         let dhv = hov(st, del_ctl);
         if dhv > 0.01 {
@@ -15546,6 +15851,32 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
         g_text(dc, "×", del, mixc(mixc(pal.paper, pal.ink, 0.5), pal.paper, dhv), st.sf_small, true);
     }
     let _ = RestoreDC(dc, saved);
+
+    // ── 底部独立卡：「剪贴板」总开关 ──
+    // 故意不跟着上面的应用行走同一套样式：它管的不是某个应用开不开，
+    // 是整个功能存不存在（关掉连轮盘上那条图标都没有），混进列表会被当成一条可删的条目。
+    {
+        let cr = clip_card_rect();
+        let hv = hov(st, Ctl::ClipOn);
+        g_rrect(
+            dc,
+            cr,
+            12,
+            mixc(pal.paper, pal.ink, 0.03 + 0.04 * hv),
+            Some(mixc(pal.paper, pal.ink, 0.12 + 0.10 * hv)),
+            2,
+        );
+        g_text(
+            dc,
+            "剪贴板",
+            RECT { left: cr.left + 14, top: cr.top + 16, right: cr.left + 62, bottom: cr.top + 40 },
+            pal.ink,
+            st.sf_body,
+            false,
+        );
+        draw_tip_icon(st, dc, pal, clip_tip_rect(), 7);
+        g_switch(dc, pal, clip_sw_rect(), st.sw_a[6]);
+    }
 
     // 底部：添加入口 + 备份提示（hover 在「描边态」和「实心态」之间渐变）
     let ba = RECT { left: S_X0, top: S_H - 64, right: S_X0 + 190, bottom: S_H - 28 };
@@ -15886,6 +16217,14 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             }
         }
         2 => {
+            // 底部那张独立的「剪贴板」卡先判：它在 `S_LIST_BOT` 之下，
+            // 走到下面那句「超出列表区 → None」就被吃掉了。
+            if in_rect(clip_tip_rect(), x, y) {
+                return Ctl::Tip(7);
+            }
+            if in_rect(clip_card_rect(), x, y) {
+                return Ctl::ClipOn;
+            }
             let ba = RECT { left: S_X0, top: S_H - 64, right: S_X0 + 190, bottom: S_H - 28 };
             if in_rect(ba, x, y) {
                 return Ctl::AddApp;
@@ -16393,6 +16732,11 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             _ => start_update_check(st, true),
         },
         Ctl::Tip(_) => {} // 「?」只用于悬停出 tooltip，点了不做事
+        Ctl::ClipOn => {
+            // 总开关：关 = 不记录 + 轮盘上摘掉那条图标（全在 `cl_set_on` 里）
+            unsafe { cl_set_on(st, !st.cl_on) };
+            setup_kick(st, hwnd);
+        }
         Ctl::AppHead(ai) => {
             st.set_expanded = if st.set_expanded == ai { usize::MAX } else { ai };
             st.set_scroll = st.set_scroll.min(s_scroll_max(st));
@@ -16600,6 +16944,8 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         // 录屏模式（外观页）：不按页门禁 → 第一次画之前就已经收敛到真值，不会「先亮后滑」
         // ⚠️ 取 `look_live_val`：这条开关是 `glass_live` 的**反面**
         look_live_val(st),
+        // 剪贴板总开关（应用页）：同理不按页门禁，第一次画就对得上 `cl_on`
+        if st.cl_on { 1.0 } else { 0.0 },
     ];
     // 开机自启开关现画在**交互页**（第 1 页），高级页的旧位置也留着这条动画
     if st.set_page == 1 || st.set_page == 3 {
@@ -16609,7 +16955,7 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         targets[3] = if st.exc_fs { 1.0 } else { 0.0 };
         targets[4] = if st.hover_name { 1.0 } else { 0.0 };
     }
-    for i in 0..6 {
+    for i in 0..7 {
         let d = targets[i] - st.sw_a[i];
         if d.abs() > 0.003 {
             st.sw_a[i] += d * k;
@@ -16651,6 +16997,12 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
     let ly = || (((l.0 >> 16) & 0xFFFF) as i16 as i32) - S_M;
     match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            // 类光标是空的（`WNDCLASSW::default()`），系统不会替我们改回箭头 ——
+            // 上一个程序留下的「忙碌」指针会一直转圈（轮盘 `ring_proc` 同一个坑）
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(ptr::null_mut())));
+            LRESULT(1)
+        }
         WM_NCHITTEST => {
             // ⚠️⚠️ `WM_NCHITTEST` 的 lParam 是**屏幕坐标**（不是客户区坐标！）。
             // 原来直接拿 S_M/S_W 去比 → 只有窗口恰好贴在屏幕左上角时才成立，
@@ -16908,6 +17260,9 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("clip={}\r\n", b(st.cl_on)));
     out.push_str(&format!("clip_pwd={}\r\n", b(st.cl_pwd)));
     out.push_str(&format!("clip_app={}\r\n", st.clip_app));
+    out.push_str(&format!("clip_pos={}\r\n", b(st.cl_pos_set)));
+    out.push_str(&format!("clip_x={}\r\n", st.cl_x));
+    out.push_str(&format!("clip_y={}\r\n", st.cl_y));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
@@ -17437,6 +17792,8 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
     for (page, tip, guide) in (0..S_PAGES.len())
         .map(|p| (p, 0u8, -1i32))
         .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1)])
+        // 应用页底部「剪贴板」卡那个「?」
+        .chain([(2usize, 7u8, -1)])
         // 交互页的 4 个引导步骤也出图（离屏没法点按钮，直接置位核对）
         .chain([(1usize, 0u8, 0i32), (1, 0, 1), (1, 0, 2), (1, 0, 3)])
     {
@@ -17480,6 +17837,29 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         let p = format!("{}\\{}.bmp", dir, name);
         let ok = save_bmp(&p, &px, S_WW, S_HH);
         println!("[setup] {} page={} tip={} guide={} {}", name, page, tip, guide, if ok { "OK" } else { "FAIL" });
+    }
+
+    // 应用页底部那张「剪贴板」卡的关态：开关滑到左，**且列表里那条「剪贴板」已经没了**
+    // （真实路径是 `cl_set_on` 摘条目 + 落盘；这里只把条目从内存里摘掉，不碰夹具 ini）
+    {
+        st.set_page = 2;
+        st.set_page_a = 1.0;
+        st.guide_step = -1;
+        st.tip = 0;
+        st.set_scroll = 0;
+        st.set_expanded = usize::MAX;
+        st.set_hover = Ctl::None;
+        st.cl_on = false;
+        st.sw_a[6] = 0.0;
+        hide_clip_ring(st);
+        setup_render(st);
+        s_dump_save(st, dir, "setup_clip_off");
+        if st.clip_app < 2 && !st.apps.iter().any(|a| a.target == "@act:clip") {
+            let at = st.cl_ring_pos.min(st.apps.len());
+            st.apps.insert(at, clip_ring_entry());
+        }
+        st.cl_on = true;
+        st.sw_a[6] = 1.0;
     }
 
     // 首启场景：**故意先停在外观页**，再走 `guide_start`（首启与「查看引导」共用这条路径），
@@ -17940,10 +18320,11 @@ const CL_GAP: i32 = 12;
 const CL_HEAD_H: i32 = 34;
 /// chip / 搜索框的高（设计稿 26）
 const CL_CTRL_H: i32 = 26;
-const CL_FOOT_H: i32 = 14;
+/// 底部那一行：页点 + 「第 x/y 页 · 共 N 条」。16（原来 14 太挤）。
+const CL_FOOT_H: i32 = 16;
 const CL_COLS: i32 = 3;
-const CL_ROWS: i32 = 2;
-/// 一页 6 块（用户验收：「6 块可以」）
+const CL_ROWS: i32 = 3;
+/// 一页 9 块（3×3；用户 2026-11-01：「换成 9 格吧」）
 const CL_PER: usize = (CL_COLS * CL_ROWS) as usize;
 /// 块圆角 / 内边距 / 元信息行高（设计稿 12 / 9 / 11px 字）
 const CL_RAD: i32 = 12;
@@ -17955,10 +18336,13 @@ const CL_TW: i32 = (CL_W - CL_PAD * 2 - (CL_COLS - 1) * CL_GAP) / CL_COLS;
 const CL_TH: i32 = (CL_GRID_BOT - CL_GRID_TOP - (CL_ROWS - 1) * CL_GAP) / CL_ROWS;
 /// 类型 chip：4 颗靠右排，宽度 = (卡片宽 - 内边距×2 - 搜索框 - 间隙) 里分给它们的份
 const CL_TAB_N: u8 = 4;
-const CL_TAB_W: i32 = 40;
+/// 40 → 54：设计稿要求每颗 chip 右侧带**条数**（「全部 12」），40 装不下。
+const CL_TAB_W: i32 = 54;
 const CL_TAB_G: i32 = 4;
 const CL_TAB_X0: i32 = CL_W - CL_PAD - (CL_TAB_N as i32 * CL_TAB_W + (CL_TAB_N as i32 - 1) * CL_TAB_G);
 const CL_TABS: [&str; 4] = ["全部", "文字", "图片", "文件"];
+/// 搜索框里放大镜占的左内边距（放大镜画在 `CL_PAD+8` 那一格）
+const CL_SEARCH_GLYPH: i32 = 24;
 
 /// 内存里最多留多少条（图片像素在磁盘，见 `ClipItem` 注释；60 条 = 一屏滚动都翻不完）。
 const CL_CAP: usize = 60;
@@ -17969,11 +18353,34 @@ const CL_MAX_CHARS: usize = 20_000;
 const CL_MAX_FILES: usize = 20;
 /// CF_DIB 字节上限（一张 4K 截图 ≈ 33MB；再大的多半是位图套壳的怪东西）
 const CL_MAX_DIB: usize = 64 * 1024 * 1024;
-/// 缩略图长边上限。块内图片区是 123×147 **逻辑**px，SS=2 的画布上要 246×294 像素，
-/// 320 留了余量又不会让 60 张图吃满内存（何况只缓存当前页那 6 张）。
+/// 缩略图长边上限。块内图片区是 123×82 **逻辑**px，SS=2 的画布上要 246×164 像素，
+/// 320 留了余量又不会让 60 张图吃满内存（何况只缓存当前页那 9 张）。
 const CL_THUMB: i32 = 320;
+/// 翻页动画时长（秒）。设计稿 160ms —— 再长就开始觉得「等一下」，再短看不出翻页方向。
+const CL_ANIM_S: f32 = 0.16;
+/// toast 胶囊：**定宽**，这样 `cl_hit` 不用拿 `dc` 量文字也能点到「撤销」。
+/// 文案压到最短（最长那条 11 字）后收窄到 280；超了走省略号而不是把胶囊撑破。
+const CL_TOAST_W: i32 = 280;
+const CL_TOAST_H: i32 = 26;
+/// 毛玻璃的雾面浓度（0 = 纯模糊桌面，1 = 全纸色）。
+/// 0.72：字清楚、又看得出底下那层被糊掉的东西。再低字就压在桌面上了
+/// —— 用户 2026-10-31 否掉液态玻璃就是这个原因（「看不见字」）。
+const CL_FROST_TINT: f32 = 0.72;
+/// 撤销窗口（秒）。设计稿 2s：够点一下，又不至于让「已删」的状态挂很久。
+const CL_UNDO_S: f64 = 2.0;
 
 const TIMER_CLIP_BLINK: usize = 6;
+const TIMER_NOTE_BLINK: usize = 7;
+const TIMER_NOTE_SAVE: usize = 8;
+/// 卡片「失焦就收」的看门狗（250ms 一次）。为什么不能只靠 `WM_ACTIVATE`：
+/// 常驻轮盘是 `WS_EX_NOACTIVATE`，点它 / 点桌面 / 点任务栏都不会让卡片失活。
+const TIMER_CARD_FG: usize = 9;
+/// 卡片刚弹出这段时间内不查前台（`focus_window` 拿到焦点要几帧）
+const CARD_FG_GRACE: f64 = 0.45;
+
+/// 便签：最多多少页 / 单页最长多少字（超过就截断 —— 便签不是笔记本，防跑飞）
+const NT_CAP_PAGES: usize = 200;
+const NT_MAX_CHARS: usize = 50_000;
 
 /// 卡片控件标识 —— 和设置页 `Ctl` 同一条铁律：**绘制与命中共用同一个枚举**，
 /// 杜绝「画在这、点在那」。
@@ -17986,6 +18393,23 @@ enum CCtl {
     Del(usize),
     Tab(u8),
     Dot(usize),
+    /// 搜索框右侧那颗 ×（只有框里有字才画、才给命中）
+    Clr,
+    /// toast 里的「撤销」（只有 `cl_undo` 有值时才画，见 `cl_undo_rect`）
+    Undo,
+}
+
+/// 块内正文的行排版缓存（见 `cl_par`）。卡片在 hover / 翻页动画期间每帧都重画，
+/// 而自绘换行一趟要量几百次字宽 —— 不缓存就等于把排版成本乘上帧数。
+struct ClLay {
+    /// 文本 / 查询词的 FNV 摘要
+    th: u64,
+    qh: u64,
+    /// 排版时的框宽与行数（尺寸变了必须重排）
+    w: i32,
+    n: usize,
+    lines: Vec<(usize, usize)>,
+    more: bool,
 }
 
 /// 块内图片那一格的缩略图：从 `.dib` 解出来的 32bpp DIB 段。
@@ -18308,7 +18732,7 @@ unsafe fn clip_del(st: &mut State, idx: usize) {
     if !it.img.is_empty() {
         let _ = std::fs::remove_file(&it.img);
     }
-    st.cl_thumbs.retain(|t| t.path != it.img);
+    clip_thumb_drop(st, &it.img);
     if st.cl_sel == idx {
         st.cl_sel = usize::MAX;
     } else if st.cl_sel != usize::MAX && st.cl_sel > idx {
@@ -18319,6 +18743,130 @@ unsafe fn clip_del(st: &mut State, idx: usize) {
     clip_log(&format!("del idx={idx} kind={}", it.kind));
 }
 
+/// 丢掉某张缩略图并**归还 GDI 句柄**。
+/// 直接 `Vec::retain` 只丢结构体，`dc` + `bmp` 两个句柄会一直挂在进程上。
+unsafe fn clip_thumb_drop(st: &mut State, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i < st.cl_thumbs.len() {
+        if st.cl_thumbs[i].path == path {
+            let t = st.cl_thumbs.remove(i);
+            let _ = DeleteDC(t.dc);
+            let _ = DeleteObject(HGDIOBJ(t.bmp.0));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// 只留这几页要用的缩略图，其余当场释放。
+/// 翻页动画那一瞬屏上同时有**两页**，不清的话一次翻页就多养 9 张位图；
+/// 动画收尾 `clip_tick` 会再调一次，把范围收窄回当前页。
+unsafe fn clip_thumbs_keep_pages(st: &mut State, pages: [usize; 2]) {
+    let vis = cl_visible(st);
+    let mut keep: Vec<String> = Vec::new();
+    for p in pages {
+        let s = (p * CL_PER).min(vis.len());
+        for idx in vis[s..(s + CL_PER).min(vis.len())].iter() {
+            let img = st.cl_items[*idx].img.clone();
+            if !img.is_empty() && !keep.iter().any(|k| *k == img) {
+                keep.push(img);
+            }
+        }
+    }
+    let mut i = 0;
+    while i < st.cl_thumbs.len() {
+        if !keep.iter().any(|k| *k == st.cl_thumbs[i].path) {
+            let t = st.cl_thumbs.remove(i);
+            let _ = DeleteDC(t.dc);
+            let _ = DeleteObject(HGDIOBJ(t.bmp.0));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// 撤销窗口到头（过期 / 卡片收起 / 又删了别的一条）：这时才真删那张 `.dib`。
+unsafe fn cl_undo_finish(st: &mut State) {
+    st.cl_undo = None;
+    st.cl_undo_at = 0.0;
+    if let Some(p) = st.cl_undo_img.take() {
+        let _ = std::fs::remove_file(&p);
+        clip_thumb_drop(st, &p);
+    }
+}
+
+/// 删除，但在 toast 上留一颗「撤销」，2 秒内可以原样放回。
+/// 条目先离手、图片文件**压着不删**（放回时不用重新采集）；过期才走 `cl_undo_finish`。
+/// 设计稿：卡片里删除是高频动作，不弹设置页那种确认卡。
+unsafe fn cl_delete_undoable(st: &mut State, idx: usize) {
+    if idx >= st.cl_items.len() {
+        return;
+    }
+    cl_undo_finish(st); // 上一条还没过期就被新删除盖掉 → 先把上一条结算掉
+    let it = st.cl_items.remove(idx);
+    st.cl_undo_img = if it.img.is_empty() { None } else { Some(it.img.clone()) };
+    st.cl_undo = Some((idx, it));
+    st.cl_undo_at = now_s() + CL_UNDO_S;
+    if st.cl_sel == idx {
+        st.cl_sel = usize::MAX;
+    } else if st.cl_sel != usize::MAX && st.cl_sel > idx {
+        st.cl_sel -= 1;
+    }
+    st.cl_tip = usize::MAX; // 后面的条目整体前移了一位，旧下标已经不是同一条了
+    cl_clamp(st);
+    clip_save(st);
+    clip_toast(st, "已删除");
+    // toast 跟着撤销窗口一起到期，不然钮还在、点下去没反应
+    st.cl_toast_at = st.cl_undo_at;
+    clip_log(&format!("del idx={idx} kind={} (可撤销)", st.cl_undo.as_ref().map(|x| x.1.kind).unwrap_or(0)));
+}
+
+/// 点「撤销」/ 按 U：放回原来的位置（期间的新增把位置往后挤，就 append 到末尾）。
+unsafe fn cl_undo_apply(st: &mut State) {
+    let Some((pos, it)) = st.cl_undo.take() else { return };
+    st.cl_undo_img = None;
+    st.cl_undo_at = 0.0;
+    let at = pos.min(st.cl_items.len());
+    st.cl_items.insert(at, it);
+    st.cl_sel = at;
+    cl_clamp(st);
+    clip_save(st);
+    clip_toast(st, "已放回");
+}
+
+/// 记住位置之后，卡片停在鼠标点开的地方 → 坐标先夹回虚拟桌面再看（见 `cl_pos_clamp`）。
+fn cl_pos_clamp(st: &mut State) {
+    unsafe {
+        let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        if vw <= 0 || vh <= 0 {
+            return;
+        }
+        // 至少留 80px 在屏内（含投影留白，80 - 2*S_M 也还有得点）：
+        // 拔掉副屏 / 换了分辨率之后，卡片不能停在鼠标永远够不到的地方。
+        let keep = 80i32;
+        st.cl_x = st.cl_x.clamp(vx + keep - CL_WW, vx + vw - keep);
+        st.cl_y = st.cl_y.clamp(vy + keep - CL_HH, vy + vh - keep);
+    }
+}
+
+/// 双击标题条 = 撤销「记住位置」，回到屏幕居中（并落盘）
+unsafe fn cl_recenter(st: &mut State) {
+    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    st.cl_x = (sw - CL_WW) / 2;
+    st.cl_y = (sh - CL_HH) / 2;
+    st.cl_pos_set = false;
+    let h = CLIP_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        let _ = SetWindowPos(HWND(h as *mut c_void), None, st.cl_x, st.cl_y, CL_WW, CL_HH, SWP_NOZORDER);
+    }
+    save_settings(st);
+    clip_toast(st, "已回到居中");
+}
+
 /// 超出上限就从**末尾**淘汰非置顶条目（末尾 = 最旧；置顶的永远不掉）。
 unsafe fn clip_evict(st: &mut State) {
     while st.cl_items.len() > CL_CAP {
@@ -18327,6 +18875,68 @@ unsafe fn clip_evict(st: &mut State) {
             None => break, // 全置顶了：宁可超一点也不删用户钉住的东西
         }
     }
+}
+
+/// 轮盘上那条「剪贴板」内置条目（`@act:clip`）的构造 —— 两处共用：
+/// 启动时补一条（`load_ini`）和设置页把开关打开时塞回。
+fn clip_ring_entry() -> AppEntry {
+    AppEntry {
+        name: "剪贴板".to_string(),
+        target: "@act:clip".to_string(),
+        // 图标：这个 target 不是文件，`decode_icon` 取不到东西 ——
+        // 轮盘对 `@act:` 一律自绘（见画内环图标那一支）。
+        icon: None,
+        items: Vec::new(),
+        grad: grad_for("剪贴板"),
+    }
+}
+
+/// 把轮盘上那条「剪贴板」摘下来：记住原槽位（`cl_ring_pos`）+ 收掉一切按 `apps`
+/// 下标定身的状态（和设置页删应用同一套）。**不落盘** —— 调用方自己决定何时写。
+fn hide_clip_ring(st: &mut State) {
+    if let Some(i) = st.apps.iter().position(|a| a.target == "@act:clip") {
+        st.cl_ring_pos = i;
+        st.apps.remove(i);
+        st.set_edit_ai = usize::MAX;
+        st.set_edit_buf.clear();
+        if st.set_expanded == i {
+            st.set_expanded = usize::MAX;
+        } else if st.set_expanded != usize::MAX && st.set_expanded > i {
+            st.set_expanded -= 1;
+        }
+        st.active_app = None;
+    }
+}
+
+/// 设置页那条「剪贴板」开关**唯一**的落点：
+/// 关 = 不再采集，且轮盘上不出现这个图标（卡片也就没有入口）；
+/// 开 = 恢复采集，并把条目塞回它原来那个槽位。已有历史一律不动，重新打开接着能用。
+///
+/// ⚠️ 是「从 `apps` 里摘掉/加回」，不是画的时候跳过 —— 环的几何（`ring_radii`、
+/// 槽位命中、滚轮偏移）全按 `apps.len()` 算，留一条隐形条目会把图标挤歪。
+/// 他自己把它拖出过环（`clip_app == 2`）就不再塞回，和 `load_ini` 同一套规矩。
+unsafe fn cl_set_on(st: &mut State, on: bool) {
+    if st.cl_on == on {
+        return;
+    }
+    st.cl_on = on;
+    if on {
+        if st.clip_app < 2
+            && st.apps.len() < MAX_APPS
+            && !st.apps.iter().any(|a| a.target == "@act:clip")
+        {
+            let at = st.cl_ring_pos.min(st.apps.len());
+            st.apps.insert(at, clip_ring_entry());
+        }
+    } else {
+        if st.cl_shown {
+            close_clip(st); // 关的这一刻它没有入口了，别留一张能看见却回不去的卡
+        }
+        hide_clip_ring(st);
+    }
+    save_settings(st);
+    load_icons(st);
+    println!("[*] 剪贴板：{}", if on { "开" } else { "关（不记录 · 不展示）" });
 }
 
 /// 采集一条剪贴板变更。**每条门禁都写一行 reason=**，顺序即判定顺序。
@@ -18756,7 +19366,7 @@ unsafe fn clip_fire(st: &mut State, idx: usize) {
     st.cl_sel = idx;
     let ok = clip_paste(st, idx);
     if !ok {
-        clip_toast(st, "写回失败：剪贴板被别的程序占着");
+        clip_toast(st, "写回失败 · 剪贴板被占用");
         clip_present(st);
         clip_kick(st);
         return;
@@ -18803,6 +19413,40 @@ fn cl_pages(n: usize) -> usize {
     (n + CL_PER - 1) / CL_PER
 }
 
+/// 四颗类型 chip 右侧的条数（下标 = tab：全部 / 文字 / 图片 / 文件）。
+/// ⚠️ 只按**类型**数，不带搜索词：搜一下「全部」就掉到 3，读起来像「历史只剩 3 条」。
+fn cl_counts(st: &State) -> [usize; CL_TAB_N as usize] {
+    let mut c = [0usize; CL_TAB_N as usize];
+    for it in &st.cl_items {
+        // `.min(2)`：clipstore 是**用户能手改的文本**，kind 写出界不能把卡片搞崩
+        c[1 + (it.kind as usize).min(2)] += 1;
+        c[0] += 1;
+    }
+    c
+}
+
+/// 空态的主句。⚠️ 分成「一条都没采到」和「有历史但这一屏没匹配上」：
+/// 后者需要一个能点的出口（`cl_filter_chip`），前者只留一句话 —— 用户要的是简洁，不是教学。
+/// 「监听关着」那一支早就到不了：开关一关，轮盘上没图标、卡片根本没有入口（见 `cl_set_on`）。
+fn cl_empty_text(st: &State) -> &'static str {
+    if st.cl_items.is_empty() {
+        "还没有历史"
+    } else {
+        "没有匹配的条目"
+    }
+}
+
+/// 空态里那颗出口胶囊（「清除搜索」或「看全部」）；不该出现时 `None`。
+/// 尺寸写死而不是量文字 —— 绘制和 `cl_hit` 都要用它，量文字得把 `dc` 传进命中判定。
+fn cl_filter_chip(st: &State) -> Option<RECT> {
+    if st.cl_items.is_empty() || (st.cl_q.is_empty() && st.cl_tab == 0) {
+        return None;
+    }
+    let cy = (CL_GRID_TOP + CL_GRID_BOT) / 2;
+    let (w, h) = (96i32, 24i32);
+    Some(RECT { left: (CL_W - w) / 2, top: cy + 30, right: (CL_W + w) / 2, bottom: cy + 30 + h })
+}
+
 /// 增删条目 / 切类型 / 改搜索之后都要调用：页码不能悬在有效页之外。
 fn cl_clamp(st: &mut State) {
     let np = cl_pages(cl_visible(st).len());
@@ -18829,6 +19473,8 @@ fn cl_ago(ts: i64) -> String {
 
 /// 块底部那行元信息：`86 字 · PiPie · 刚刚`
 fn cl_meta(it: &ClipItem) -> String {
+    // 文字条**不报字数**（用户 2026-11-01：「不需要展示多少个字」）——
+    // 块里本来就看得见有多少内容，那个数只占地方。
     let head = match it.kind {
         1 => format!("{}×{}", it.w, it.h),
         2 => {
@@ -18841,16 +19487,30 @@ fn cl_meta(it: &ClipItem) -> String {
                 "文件".into()
             }
         }
-        _ => format!("{} 字", it.text.chars().count()),
+        _ => String::new(),
     };
     let src = if it.src.is_empty() {
         String::new()
     } else {
         // 进程名带 .exe 后缀，显示时去掉（元信息那一行很窄，一个字都要省）
-        let s = it.src.strip_suffix(".exe").unwrap_or(&it.src);
-        format!(" · {s}")
+        it.src.strip_suffix(".exe").unwrap_or(&it.src).to_string()
     };
-    format!("{head}{src} · {}", cl_ago(it.ts))
+    // 三段里谁空谁不出场，别留下「· · 」这种空分隔
+    let mut out = String::new();
+    for part in [head, src] {
+        if part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(" · ");
+        }
+        out.push_str(&part);
+    }
+    if !out.is_empty() {
+        out.push_str(" · ");
+    }
+    out.push_str(&cl_ago(it.ts));
+    out
 }
 
 // ── 版面（绘制与命中**共用**，别写第二份）──
@@ -18863,14 +19523,18 @@ fn cl_tile_rect(k: usize) -> RECT {
     let y = CL_GRID_TOP + rw * (CL_TH + CL_GAP);
     RECT { left: x, top: y, right: x + CL_TW, bottom: y + CL_TH }
 }
-/// 块内正文区（文字 / 图片）
+/// 块内正文区（文字 / 图片）。
 fn cl_body_rect(r: RECT) -> RECT {
-    RECT { left: r.left + CL_TP, top: r.top + CL_TP, right: r.right - CL_TP, bottom: r.bottom - CL_TP - CL_META - 2 }
+    RECT {
+        left: r.left + CL_TP,
+        top: r.top + CL_TP,
+        right: r.right - CL_TP,
+        bottom: r.bottom - CL_TP - CL_META - 2,
+    }
 }
-/// 元信息行。**右边固定让出 22px**：右下角那个数字键（1~6）和它同一行，
-/// 不让就会叠成「…260 · Snipaste · …1」这种读不通的东西（离屏 dump 抓到的）。
+/// 元信息行。右下角那 22px 已经还给文字（原先留给「1~6」数字键位；键位说明整条删掉了）。
 fn cl_meta_rect(r: RECT) -> RECT {
-    RECT { left: r.left + CL_TP, top: r.bottom - CL_TP - CL_META, right: r.right - CL_TP - 22, bottom: r.bottom - CL_TP }
+    RECT { left: r.left + CL_TP, top: r.bottom - CL_TP - CL_META, right: r.right - CL_TP, bottom: r.bottom - CL_TP }
 }
 /// 悬停才露的两颗小操作（22×22，块内右上角横排）
 fn cl_act_rect(r: RECT, which: u8) -> RECT {
@@ -18883,6 +19547,12 @@ fn cl_act_rect(r: RECT, which: u8) -> RECT {
 fn cl_search_rect() -> RECT {
     RECT { left: CL_PAD, top: CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2, right: CL_TAB_X0 - 8, bottom: CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2 + CL_CTRL_H }
 }
+/// 搜索框里的 ×（框右侧 18×18，**有词才画**，见 `clip_draw`）
+fn cl_clear_rect() -> RECT {
+    let sr = cl_search_rect();
+    let s = 18i32;
+    RECT { left: sr.right - s - 4, top: (sr.top + sr.bottom) / 2 - s / 2, right: sr.right - 4, bottom: (sr.top + sr.bottom) / 2 + s / 2 }
+}
 fn cl_tab_rect(i: u8) -> RECT {
     let x = CL_TAB_X0 + i as i32 * (CL_TAB_W + CL_TAB_G);
     let y = CL_PAD + (CL_HEAD_H - CL_CTRL_H) / 2;
@@ -18893,12 +19563,30 @@ fn cl_dot_rect(i: usize) -> RECT {
     let x = CL_PAD + i as i32 * 11;
     RECT { left: x, top: y + (CL_FOOT_H - 6) / 2, right: x + 6, bottom: y + (CL_FOOT_H - 6) / 2 + 6 }
 }
+/// toast 胶囊（定宽 + 水平居中，贴在网格下沿、footer 之上）
+fn cl_toast_rect() -> RECT {
+    let y = CL_GRID_BOT - CL_TOAST_H - 6;
+    RECT { left: (CL_W - CL_TOAST_W) / 2, top: y, right: (CL_W + CL_TOAST_W) / 2, bottom: y + CL_TOAST_H }
+}
+/// toast 右端那颗「撤销」—— 只有 `cl_undo` 有值才画、才给命中。
+/// ⚠️ 坐标是纯几何：`cl_hit` 拿不到 `dc`，不能在这里量文字宽度。
+fn cl_undo_rect() -> RECT {
+    let t = cl_toast_rect();
+    RECT { left: t.right - 52, top: t.top + 3, right: t.right - 4, bottom: t.bottom - 3 }
+}
 /// 标题条可拖区（头部整条，但搜索框和四颗 chip 除外 —— 否则点了没反应，
-/// 窗口跟着鼠标跑，正是设置页 2026-10-11 那个「拖不动/点不动」的坑）
-fn cl_drag_band(x: i32, y: i32) -> bool {
-    let p = (x, y);
-    let in_head = p.1 >= 0 && p.1 < CL_GRID_TOP;
-    in_head && !in_rect(cl_search_rect(), p.0, p.1) && !(0..CL_TAB_N).any(|i| in_rect(cl_tab_rect(i), p.0, p.1))
+/// 窗口跟着鼠标跑，正是设置页 2026-10-11 那个「拖不动/点不动」的坑）。
+/// `q_empty`：搜索框**空着**时里面没有可点的东西（那颗 × 也不画），整条还给拖拽，
+/// 不然头部凭空多出一块 18×18 的死区。
+fn cl_drag_band(x: i32, y: i32, q_empty: bool) -> bool {
+    if !(y >= 0 && y < CL_GRID_TOP) {
+        return false;
+    }
+    if (0..CL_TAB_N).any(|i| in_rect(cl_tab_rect(i), x, y)) {
+        return false;
+    }
+    // 有词时框里那颗 × 要点得动；空框时里面没东西，整条还给拖拽
+    q_empty || !in_rect(cl_search_rect(), x, y)
 }
 
 /// 控件当前的 hover 强度 0..1（新 hover 淡入、旧 hover 淡出）—— 和设置页同一套手感。
@@ -18928,24 +19616,24 @@ fn cl_tile_hov(st: &State, idx: usize) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// 光标停在哪一格的**元信息行**上（`usize::MAX` = 没停）。
+/// 只认那一条 14px 高的带子 —— 整块都算的话，鼠标一进块就蹦提示，太吵。
+fn cl_meta_tip_idx(st: &State, x: i32, y: i32) -> usize {
+    let idx = match st.cl_hover {
+        CCtl::Tile(i) | CCtl::Pin(i) | CCtl::Del(i) => i,
+        _ => return usize::MAX,
+    };
+    match cl_slot_of(st, idx) {
+        Some(k) if in_rect(cl_meta_rect(cl_tile_rect(k)), x, y) => idx,
+        _ => usize::MAX,
+    }
+}
+
 // ── 画布小工具（卡片专用；圆角矩形/文字沿用 `g_*`）──
 
 /// 单行文字，align: 0 左 1 中 2 右（左右都带省略号）
 unsafe fn c_text(dc: HDC, text: &str, r: RECT, color: (u8, u8, u8), font: HFONT, align: u8) {
     c_text_xy(dc, text, r, color, font, align, 0, 0);
-}
-
-/// 多行文字（自动换行、超出矩形即裁掉 —— 对应设计稿的 line-clamp）
-unsafe fn c_mtext(dc: HDC, text: &str, r: RECT, color: (u8, u8, u8), font: HFONT) {
-    if text.is_empty() {
-        return;
-    }
-    let _ = SelectObject(dc, HGDIOBJ(font.0));
-    let _ = SetBkMode(dc, TRANSPARENT);
-    let _ = SetTextColor(dc, rgb(color));
-    let mut t: Vec<u16> = text.encode_utf16().collect();
-    let mut rr = RECT { left: sxv(r.left), top: sxv(r.top), right: sxv(r.right), bottom: sxv(r.bottom) };
-    let _ = DrawTextW(dc, &mut t, &mut rr, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
 }
 
 /// 单行文字（hi 画布上可再挪 `ox/oy` 个**物理**像素 —— 挪 1 px 是阴影，不是位移）
@@ -18985,6 +19673,284 @@ unsafe fn c_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, w: i32, c: (u8, u8
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
+/// 逻辑坐标（f32，卡片左上为 0,0）→ hi 画布设备像素，**四舍五入**。
+/// `sxv` 只吃整数，而小图标是转 45° 画出来的，坐标全是小数；截断会让一根线两头各偏一格。
+#[inline]
+fn cdev(v: f32) -> i32 {
+    ((v + S_M as f32) * SS as f32 + 0.5) as i32
+}
+
+/// 圆头线段（`wpx` 直接给**设备**像素笔宽，所以能画 1.5 逻辑 px 这种档）。
+/// GDI 的笔是平头，22px 的按钮上像被刀切过；苹果那套符号的笔画都是圆端点 ——
+/// 这里在两端各补一个半径 = 笔宽一半的实心圆，`LineTo` 不画的末点也顺便补上了。
+unsafe fn c_stroke(dc: HDC, x1: f32, y1: f32, x2: f32, y2: f32, wpx: i32, c: (u8, u8, u8)) {
+    let (ax, ay, bx, by) = (cdev(x1), cdev(y1), cdev(x2), cdev(y2));
+    let pen = CreatePen(PS_SOLID, wpx.max(1), rgb(c));
+    let op = SelectObject(dc, HGDIOBJ(pen.0));
+    let _ = MoveToEx(dc, ax, ay, None);
+    let _ = LineTo(dc, bx, by);
+    let _ = SelectObject(dc, op);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+    let r = wpx / 2;
+    if r < 1 {
+        return;
+    }
+    let br = CreateSolidBrush(rgb(c));
+    let pn = CreatePen(PS_NULL, 0, rgb(c));
+    let ob = SelectObject(dc, HGDIOBJ(br.0));
+    let oq = SelectObject(dc, HGDIOBJ(pn.0));
+    for (x, y) in [(ax, ay), (bx, by)] {
+        let _ = Ellipse(dc, x - r, y - r, x + r, y + r);
+    }
+    let _ = SelectObject(dc, ob);
+    let _ = SelectObject(dc, oq);
+    let _ = DeleteObject(HGDIOBJ(br.0));
+    let _ = DeleteObject(HGDIOBJ(pn.0));
+}
+
+/// 块内小图标：置顶 = 向上的箭头撞到一条横线（SF Symbols 的 `arrow.up.to.line`）。
+/// 为什么不是图钉：16px 里怎么画都像个「T」（正放、斜放各试过一版），而这个形状一眼
+/// 就读得出「顶到最上面」；且全正交 + 一个实心三角，2 倍超采样下不踩台阶。
+unsafe fn c_pin(dc: HDC, cx: f32, cy: f32, c: (u8, u8, u8)) {
+    c_stroke(dc, cx - 4.6, cy - 5.6, cx + 4.6, cy - 5.6, SS, c); // 顶线
+    c_stroke(dc, cx, cy - 0.2, cx, cy + 5.2, SS, c); // 杆
+    let pts = [
+        POINT { x: cdev(cx - 3.3), y: cdev(cy + 0.4) },
+        POINT { x: cdev(cx + 3.3), y: cdev(cy + 0.4) },
+        POINT { x: cdev(cx), y: cdev(cy - 3.8) },
+    ];
+    let br = CreateSolidBrush(rgb(c));
+    let pn = CreatePen(PS_NULL, 0, rgb(c));
+    let ob = SelectObject(dc, HGDIOBJ(br.0));
+    let oq = SelectObject(dc, HGDIOBJ(pn.0));
+    let _ = Polygon(dc, &pts);
+    let _ = SelectObject(dc, ob);
+    let _ = SelectObject(dc, oq);
+    let _ = DeleteObject(HGDIOBJ(br.0));
+    let _ = DeleteObject(HGDIOBJ(pn.0));
+}
+
+/// 块内小图标：删除（✕）。两笔对称、圆头，张开 6 逻辑 px。
+unsafe fn c_x(dc: HDC, cx: f32, cy: f32, c: (u8, u8, u8)) {
+    let a = 3.0f32;
+    c_stroke(dc, cx - a, cy - a, cx + a, cy + a, SS + SS / 2, c);
+    c_stroke(dc, cx + a, cy - a, cx - a, cy + a, SS + SS / 2, c);
+}
+
+// ── 块内文字排版 + 命中词反白 ──
+
+/// 中日韩 / 全角：这类字符**逐字可断**（和 `DrawTextW` 的 `DT_WORDBREAK` 一致）。
+fn cl_is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF | 0x2E80..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6)
+}
+
+/// 字体在**逻辑**px 下的一行高度（含外部行距）。⚠️ 卡片字体是 `×SS` 建的，量完得除回去。
+unsafe fn c_font_h(dc: HDC, font: HFONT) -> i32 {
+    use windows::Win32::Graphics::Gdi::{GetTextMetricsW, TEXTMETRICW};
+    let op = SelectObject(dc, HGDIOBJ(font.0));
+    let mut tm = TEXTMETRICW::default();
+    let h = if GetTextMetricsW(dc, &mut tm).as_bool() {
+        tm.tmHeight + tm.tmExternalLeading
+    } else {
+        16 * SS
+    };
+    let _ = SelectObject(dc, op);
+    (h as f32 / SS as f32).ceil() as i32
+}
+
+/// FNV-1a：排版缓存的键（文本 / 查询词各压一个 u64，不引新依赖）。
+fn cl_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// 一行里命中词的位置（字节区间）。大小写不敏感。
+/// 按 **char** 逐个比再折算字节：`str::to_lowercase` 会让长度变化（`İ`→2 字符），
+/// 直接在字节串上比会错位。
+fn cl_hits(text: &str, q: &str) -> Vec<(usize, usize)> {
+    let ql: Vec<char> = q.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    if ql.is_empty() {
+        return Vec::new();
+    }
+    let cs: Vec<(usize, char)> = text.char_indices().collect();
+    let low: Vec<char> = cs.iter().map(|(_, c)| c.to_lowercase().next().unwrap_or(*c)).collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + ql.len() <= low.len() {
+        if low[i..i + ql.len()] == ql[..] {
+            let a = cs[i].0;
+            let (be, bc) = cs[i + ql.len() - 1];
+            out.push((a, be + bc.len_utf8()));
+            i += ql.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 单行（已排好版的）文字，命中段带反白底色；`q` 空时等价于 `c_text`。
+unsafe fn c_runs(dc: HDC, text: &str, r: RECT, ink: (u8, u8, u8), font: HFONT, q: &str, bg: (u8, u8, u8)) {
+    if text.is_empty() {
+        return;
+    }
+    let hits = cl_hits(text, q);
+    if hits.is_empty() {
+        c_text(dc, text, r, ink, font, 0);
+        return;
+    }
+    let mut p = 0usize;
+    let mut x = 0i32;
+    for (a, b) in hits {
+        if a > p {
+            let plain = &text[p..a];
+            c_text_xy(dc, plain, r, ink, font, 0, x * SS, 0);
+            x += s_text_w(dc, plain, font);
+        }
+        let hit = &text[a..b];
+        let hw = s_text_w(dc, hit, font);
+        g_fill(dc, RECT { left: r.left + x, top: r.top + 1, right: r.left + x + hw, bottom: r.bottom - 1 }, bg);
+        c_text_xy(dc, hit, r, ink, font, 0, x * SS, 0);
+        x += hw;
+        p = b;
+    }
+    if p < text.len() {
+        let tail = &text[p..];
+        c_text_xy(dc, tail, r, ink, font, 0, x * SS, 0);
+    }
+}
+
+/// 自绘逐行排版，返回 (每行的字节区间, 后面还有没画下的内容)。
+///
+/// 为什么不用 `DrawTextW(DT_WORDBREAK)`（`c_mtext` 那条老路）：一整段只能给一个颜色，
+/// 做不了「命中词反白」。⚠️ 搜索和不搜索**都走这一条** —— 只在有词时才换算法，
+/// 用户敲下第一个字符就看到整段重新排版（跳行）。
+/// 只排到 `maxlines` 就收工：字符预算按行数封顶，不做整段测量（一帧最多几百次量宽）。
+unsafe fn cl_layout(dc: HDC, s: &str, font: HFONT, maxw: i32, maxlines: usize) -> (Vec<(usize, usize)>, bool) {
+    let budget = maxlines * 40 + 40;
+    let cs: Vec<(usize, char)> = s.char_indices().take(budget).collect();
+    // 预算截断后 `s` 可能还有更长的内容：单元只能覆盖到 cs 的最后一个字符。
+    let tail_end = cs.last().map(|(b, c)| b + c.len_utf8()).unwrap_or(0);
+    // ① 切可断单元：CJK 一字一单元；拉丁按词，词尾空格并进同一单元（挂在行尾，不构成断点）
+    let mut units: Vec<(usize, usize, bool)> = Vec::with_capacity(cs.len()); // (起, 止, 是换行符)
+    let mut i = 0usize;
+    while i < cs.len() {
+        let (a, c) = cs[i];
+        if c == '\n' {
+            units.push((a, a + 1, true));
+            i += 1;
+            continue;
+        }
+        if c.is_whitespace() {
+            // 行首孤立空格：丢掉（DrawText 也不会为它单独起一行）
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if !cl_is_cjk(c) {
+            while j < cs.len() && !cl_is_cjk(cs[j].1) && !cs[j].1.is_whitespace() && cs[j].1 != '\n' {
+                j += 1;
+            }
+        }
+        let mut k = j;
+        while k < cs.len() && cs[k].1 == ' ' {
+            k += 1;
+        }
+        units.push((a, if k < cs.len() { cs[k].0 } else { tail_end }, false));
+        i = k;
+    }
+    // ② 贪心填行
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut cur_w, mut open) = (0usize, 0i32, false);
+    let mut u = 0usize;
+    while u < units.len() {
+        if lines.len() >= maxlines {
+            return (lines, true);
+        }
+        let (a, b, nl) = units[u];
+        if nl {
+            if open {
+                lines.push((start, a));
+                open = false;
+                cur_w = 0;
+            } else {
+                lines.push((a, a)); // 空行（连续两个换行）
+            }
+            u += 1;
+            continue;
+        }
+        let seg = &s[a..b];
+        let sw = s_text_w(dc, seg.trim_end(), font);
+        if sw == 0 {
+            u += 1;
+            continue;
+        }
+        if !open {
+            start = a;
+            open = true;
+            cur_w = sw;
+            u += 1;
+            continue;
+        }
+        if cur_w + sw > maxw {
+            lines.push((start, a));
+            open = false;
+            cur_w = 0;
+            continue; // 这个单元重新处理（落到新行）
+        }
+        cur_w += sw;
+        u += 1;
+    }
+    if open && lines.len() < maxlines {
+        lines.push((start, tail_end));
+    }
+    // 预算之外的部分（超长文本 / 行数已满）= 还有没画下的
+    (lines, tail_end < s.len())
+}
+
+/// 一块里的一段正文：排版 + 逐行绘制 + 命中反白。
+/// 排版结果进 `st.cl_lay`：卡片在 hover/翻页动画期间每帧都重画，不该每帧都重新量几百次字宽。
+/// 上限放到 16（> 一页的 6）：翻页动画那一瞬两页同屏，卡在 6 会让它每帧都重排一遍。
+unsafe fn cl_par(st: &mut State, dc: HDC, text: &str, r: RECT, font: HFONT, ink: (u8, u8, u8), q: &str, bg: (u8, u8, u8)) {
+    let maxw = r.right - r.left;
+    if maxw <= 0 || text.is_empty() {
+        return;
+    }
+    let lh = c_font_h(dc, font);
+    let maxlines = (((r.bottom - r.top) / lh.max(1)).max(1)) as usize;
+    let (th, qh) = (cl_hash(text), cl_hash(q));
+    let (lines, more) = match st.cl_lay.iter().find(|e| e.th == th && e.qh == qh && e.w == maxw && e.n == maxlines) {
+        Some(e) => (e.lines.clone(), e.more),
+        None => {
+            let v = cl_layout(dc, text, font, maxw, maxlines);
+            if st.cl_lay.len() > 8 {
+                st.cl_lay.clear();
+            }
+            st.cl_lay.push(ClLay { th, qh, w: maxw, n: maxlines, lines: v.0.clone(), more: v.1 });
+            v
+        }
+    };
+    for (i, (a, b)) in lines.iter().enumerate() {
+        let last = i + 1 == lines.len();
+        let mut seg = &text[*a..*b];
+        if last {
+            seg = seg.trim_end();
+            if more {
+                let t = format!("{seg}…");
+                c_runs(dc, &t, RECT { left: r.left, top: r.top + i as i32 * lh, right: r.right, bottom: r.top + i as i32 * lh + lh }, ink, font, q, bg);
+                continue;
+            }
+        }
+        c_runs(dc, seg, RECT { left: r.left, top: r.top + i as i32 * lh, right: r.right, bottom: r.top + i as i32 * lh + lh }, ink, font, q, bg);
+    }
+}
+
 // ── 资源 ──
 
 /// 卡片字体：字号 ×SS（同设置页，关窗即删）。
@@ -18997,6 +19963,7 @@ unsafe fn ensure_clip_fonts(st: &mut State) {
     st.cf_tile = CreateFontW(-12 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.cf_small = CreateFontW(-11 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.cf_bold = CreateFontW(-12 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_note = CreateFontW(-15 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
 }
 
 unsafe fn ensure_clip_surfaces(st: &mut State) {
@@ -19019,7 +19986,7 @@ unsafe fn ensure_clip_surfaces(st: &mut State) {
 /// hi 那张是 SS² 倍大，常驻纯浪费）。
 unsafe fn clip_free(st: &mut State) {
     clip_thumbs_clear(st);
-    for f in [&mut st.cf_body, &mut st.cf_tile, &mut st.cf_small, &mut st.cf_bold] {
+    for f in [&mut st.cf_body, &mut st.cf_tile, &mut st.cf_small, &mut st.cf_bold, &mut st.cf_note] {
         if !f.0.is_null() {
             let _ = DeleteObject(HGDIOBJ((*f).0));
             *f = HFONT(ptr::null_mut());
@@ -19043,63 +20010,41 @@ unsafe fn clip_free(st: &mut State) {
 
 // ── 绘制 ──
 
-unsafe fn clip_draw(st: &mut State, dc: HDC) {
-    let pal = pal_of(st.glass_liquid);
-    // 卡片底：材质跟轮盘共用 `glass=`。能透就是液体玻璃（`clip_render` 已把卡身铺好），
-    // 透不出（纸质 / 抓屏失败）就是和设置页一样的 paper。
+/// 第 `p` 页在可见序列里的格子（越界的页码给空，不 panic）。
+fn cl_page_seg(vis: &[usize], p: usize) -> &[usize] {
+    let s = (p * CL_PER).min(vis.len());
+    &vis[s..(s + CL_PER).min(vis.len())]
+}
 
-    // ── 头部：搜索框 + 四颗类型 chip ──
-    let sr = cl_search_rect();
-    let sf = mixc(pal.paper, pal.ink, 0.05);
-    g_rrect(dc, sr, 10, sf, Some(mixc(pal.edge, pal.ink, 0.25)), 1);
-    let q: String = st.cl_q.chars().take(48).collect();
-    if q.is_empty() {
-        c_text(dc, "搜内容 / 来源（打字即搜 · 1~6 直接选）", RECT { left: sr.left + 9, top: sr.top, right: sr.right - 8, bottom: sr.bottom }, pal.edge, st.cf_body, 0);
-    } else {
-        c_text(dc, &q, RECT { left: sr.left + 9, top: sr.top, right: sr.right - 8, bottom: sr.bottom }, pal.ink, st.cf_body, 0);
-    }
-    // 光标：搜索框**永远是焦点**（呼出即输），所以不用等用户点它才闪
-    if st.cl_blink {
-        let txw = s_text_w(dc, if q.is_empty() { "" } else { &q }, st.cf_body);
-        let cx = (sr.left + 9 + txw).min(sr.right - 10);
-        c_line(dc, cx, sr.top + 5, cx, sr.bottom - 5, 1, pal.ink);
-    }
-    for i in 0..CL_TAB_N {
-        let r = cl_tab_rect(i);
-        let on = st.cl_tab == i;
-        let hv = c_hov(st, CCtl::Tab(i));
-        if on {
-            g_rrect(dc, r, 9, pal.block, Some(pal.block), 1);
-            c_text(dc, CL_TABS[i as usize], r, pal.paper, st.cf_small, 1);
-        } else {
-            g_rrect(dc, r, 9, mixc(pal.paper, pal.ink, 0.06 * hv), Some(mixc(pal.edge, pal.ink, 0.4 * hv)), 1);
-            c_text(dc, CL_TABS[i as usize], r, pal.ink, st.cf_small, 1);
-        }
-    }
-
-    // ── 6 块 ──
-    let vis = cl_visible(st);
-    let start = (st.cl_page * CL_PER).min(vis.len());
-    let slice: Vec<usize> = vis[start..(start + CL_PER).min(vis.len())].to_vec();
-    if slice.is_empty() {
-        let r = RECT { left: CL_PAD, top: CL_GRID_TOP, right: CL_W - CL_PAD, bottom: CL_GRID_BOT };
-        g_rrect_stroke(dc, r, CL_RAD, mixc(pal.edge, pal.ink, 0.1), 1);
-        c_text(dc, "没有匹配的条目（清空搜索或换个类型）", r, pal.edge, st.cf_body, 1);
-    }
-    for (k, idx) in slice.iter().enumerate() {
+/// 画**一页**的 6 块。`dx` = 翻页动画期间这块的水平位移（平时 0）；
+/// `live` = 是不是当前页 —— 滑出去那一页不带 hover、选中框和操作钮，
+/// 不然旧页的高亮会跟着一起滑出去，看着像两块同时亮。
+///
+/// 从 `clip_draw` 里抽出来只有一个原因：动画那一瞬屏上要同时摆两页。
+unsafe fn cl_tiles(st: &mut State, dc: HDC, pal: &Pal, page: &[usize], dx: i32, q: &str, hitbg: (u8, u8, u8), live: bool) {
+    let frost = !st.card_bg.is_empty();
+    for (k, idx) in page.iter().enumerate() {
         // 克隆一份：下面 `clip_thumb_get` 要往里写缩略图缓存（`&mut`），
         // 借着一个 `&st.cl_items[i]` 不放会让借用检查器直接判死。
         let it = st.cl_items[*idx].clone();
-        let r = cl_tile_rect(k);
-        let hv = cl_tile_hov(st, *idx);
-        let sel = st.cl_sel == *idx;
+        let r0 = cl_tile_rect(k);
+        let r = RECT { left: r0.left + dx, top: r0.top, right: r0.right + dx, bottom: r0.bottom };
+        let hv = if live { cl_tile_hov(st, *idx) } else { 0.0 };
+        let sel = live && st.cl_sel == *idx;
         let fill = mixc(pal.paper, pal.ink, 0.055 + 0.05 * hv);
         let edge = if sel {
             pal.block
         } else {
             mixc(pal.edge, pal.ink, 0.4 * hv)
         };
-        g_rrect(dc, r, CL_RAD, fill, Some(edge), if sel { 2 } else { 1 });
+        // 毛玻璃：块底换成**半透明纸**，让下面那层模糊的桌面透出来；
+        // 不做的话整张卡就只有四周 12px 的缝里能看出玻璃，等于白做。
+        if frost && !sel {
+            g_rrect_alpha(dc, r, CL_RAD, pal.paper, (108.0 + 92.0 * hv) as u8);
+            g_rrect_stroke(dc, r, CL_RAD, edge, 1);
+        } else {
+            g_rrect(dc, r, CL_RAD, fill, Some(edge), if sel { 2 } else { 1 });
+        }
         if it.pinned {
             // 置顶标记：左边一根 3px 通高条（设计稿同款）
             g_fill(dc, RECT { left: r.left + 1, top: r.top + 4, right: r.left + 4, bottom: r.bottom - 4 }, pal.block);
@@ -19109,7 +20054,7 @@ unsafe fn clip_draw(st: &mut State, dc: HDC) {
             1 => {
                 // 图片格：先铺一个略深的「井」，再把缩略图**等比放进**（不裁切：
                 // 截图看的就是整体内容，裁掉边角比留白更糟）
-                g_rrect(dc, br, 8, mixc(pal.paper, pal.wall, 0.6), None, 0);
+                g_rrect_alpha(dc, br, 8, mixc(pal.paper, pal.wall, 0.6), if frost { 190 } else { 255 });
                 let p = it.img.clone();
                 if let Some(ti) = clip_thumb_get(st, &p) {
                     let t = &st.cl_thumbs[ti];
@@ -19158,65 +20103,314 @@ unsafe fn clip_draw(st: &mut State, dc: HDC) {
                 } else {
                     first.rsplit(['\\', '/']).next().unwrap_or(first).to_string()
                 };
-                c_mtext(dc, &sub, RECT { left: br.left, top: br.top + 20, right: br.right, bottom: br.bottom }, pal.edge, st.cf_small);
+                cl_par(
+                    st,
+                    dc,
+                    &sub,
+                    RECT { left: br.left, top: br.top + 20, right: br.right, bottom: br.bottom },
+                    st.cf_small,
+                    pal.edge,
+                    q,
+                    hitbg,
+                );
             }
             _ => {
-                c_mtext(dc, &cl_body(&it.text), br, pal.ink, st.cf_tile);
+                // 正文走自绘换行（`cl_par`）：命中词要能反白，`DrawTextW` 一整段只给一个颜色
+                let body = cl_body(&it.text);
+                cl_par(st, dc, &body, br, st.cf_tile, pal.ink, q, hitbg);
             }
         }
         c_text(dc, &cl_meta(&it), cl_meta_rect(r), pal.edge, st.cf_small, 0);
-        // 右下角数字（操作按钮没露出来时才画，两者会叠在同一角上）
-        if k < 9 && !cl_acts_on(st, *idx) {
-            let mr = cl_meta_rect(r);
-            c_text(dc, &format!("{}", k + 1), RECT { left: r.right - 26, top: mr.top, right: r.right - 6, bottom: mr.bottom }, pal.edge, st.cf_small, 2);
-        }
-        if cl_acts_on(st, *idx) {
+        if live && cl_acts_on(st, *idx) {
             for which in 0..2u8 {
                 let ar = cl_act_rect(r, which);
                 // 每颗钮自己的强度：光标点在哪颗，哪颗往墨色压深一档（跟 chip/tab 同一套手感）
                 let bhv = c_hov(st, if which == 0 { CCtl::Pin(*idx) } else { CCtl::Del(*idx) });
-                let base = mixc(pal.paper, pal.wall, 0.55);
-                let bedge = mixc(pal.edge, pal.ink, 0.35);
-                g_rrect(dc, ar, 7, mixc(base, pal.ink, 0.14 * bhv), Some(mixc(bedge, pal.ink, 0.5 * bhv)), 1);
                 let cx = (ar.left + ar.right) / 2;
                 let cy = (ar.top + ar.bottom) / 2;
+                // 苹果列表行的悬停钮：**只有一层随 hover 加深的圆底，不描边**。
+                // 旧版是 22×22 圆角方 + 1px 边框，两颗并排读起来像两个复选框。
+                // 底色从**块自己的填色**往墨色里压一档 —— 拿 paper 当底会反着来
+                //（悬停的块本来就比 paper 深一格，圆底就成了一块「发白」的补丁）。
+                g_dot(dc, cx, cy, 9, mixc(fill, pal.ink, 0.05 + 0.11 * bhv));
+                let ink = mixc(pal.edge, pal.ink, 0.40 + 0.50 * bhv);
                 if which == 0 {
-                    // 置顶：向上的一根针 + 两笔短翅
-                    c_line(dc, cx, cy + 6, cx, cy - 6, 1, pal.ink);
-                    c_line(dc, cx - 4, cy - 2, cx, cy - 6, 1, pal.ink);
-                    c_line(dc, cx + 4, cy - 2, cx, cy - 6, 1, pal.ink);
-                    c_line(dc, cx - 4, cy + 2, cx + 4, cy + 2, 1, pal.ink);
+                    c_pin(dc, cx as f32, cy as f32, ink);
                 } else {
-                    c_line(dc, cx - 4, cy - 4, cx + 4, cy + 4, 1, pal.ink);
-                    c_line(dc, cx + 4, cy - 4, cx - 4, cy + 4, 1, pal.ink);
+                    c_x(dc, cx as f32, cy as f32, ink);
                 }
             }
         }
     }
+}
 
-    // ── 底部：页点 + 计数/按键提示 ──
+/// 块底部那行元信息装不下时，悬停把整行浮出来 —— 来源名经常在中间就被省略号切掉，
+/// 只剩「Windows 资源…」看不出是哪个程序。
+unsafe fn cl_meta_tip(st: &State, dc: HDC, pal: &Pal) {
+    if st.cl_tip == usize::MAX || (st.cl_anim_from != usize::MAX && st.cl_anim_t < 1.0) {
+        return;
+    }
+    let Some(it) = st.cl_items.get(st.cl_tip) else { return };
+    let Some(k) = cl_slot_of(st, st.cl_tip) else { return };
+    let mr = cl_meta_rect(cl_tile_rect(k));
+    let full = cl_meta(it);
+    let tw = s_text_w(dc, &full, st.cf_small);
+    // 装得下就不弹：不该为了一条本来就看全的字多出一块方片
+    if tw <= mr.right - mr.left {
+        return;
+    }
+    // 只浮**来源名**：整行太长会压到隔壁的块，而且被切掉的通常就是来源的后半截
+    let src = it.src.strip_suffix(".exe").unwrap_or(&it.src);
+    let tip = if src.is_empty() { full.as_str() } else { src };
+    let w = s_text_w(dc, tip, st.cf_small) + 20;
+    let left = mr.left.min(CL_W - CL_PAD - w).max(CL_PAD);
+    let r = RECT { left, top: mr.top - 22, right: left + w, bottom: mr.top - 2 };
+    g_rrect(dc, r, 10, pal.block, None, 0);
+    c_text(dc, tip, RECT { left: r.left + 10, top: r.top, right: r.right - 10, bottom: r.bottom }, pal.paper, st.cf_small, 0);
+}
+
+unsafe fn clip_draw(st: &mut State, dc: HDC) {
+    let pal = pal_of(st.glass_liquid);
+    // 卡片底：材质跟轮盘共用 `glass=`。能透就是液体玻璃（`clip_render` 已把卡身铺好），
+    // 透不出（纸质 / 抓屏失败）就是和设置页一样的 paper。
+
+    // ── 头部：搜索框（放大镜 + 清除 ×）+ 四颗类型 chip（带计数）──
+    let sr = cl_search_rect();
+    let sf = mixc(pal.paper, pal.ink, 0.05);
+    g_rrect(dc, sr, 10, sf, Some(mixc(pal.edge, pal.ink, 0.25)), 1);
+    // 放大镜：一圈 + 一根柄（描边宁细勿粗 —— 这颗东西只有 11px）
+    {
+        let gx = sr.left + 13;
+        let gy = (sr.top + sr.bottom) / 2;
+        g_rrect_stroke(dc, RECT { left: gx - 5, top: gy - 6, right: gx + 4, bottom: gy + 3 }, 4, pal.edge, 1);
+        c_line(dc, gx + 3, gy + 2, gx + 7, gy + 6, 1, pal.edge);
+    }
+    let q: String = st.cl_q.chars().take(48).collect();
+    // 有词时文字右边要给 × 让位，没词时placeholder 也统一从放大镜后起笔
+    let tx = sr.left + CL_SEARCH_GLYPH;
+    let tr = RECT {
+        left: tx,
+        top: sr.top,
+        right: if q.is_empty() { sr.right - 8 } else { cl_clear_rect().left - 6 },
+        bottom: sr.bottom,
+    };
+    if q.is_empty() {
+        c_text(dc, "搜索内容 / 来源", tr, pal.edge, st.cf_body, 0);
+    } else {
+        c_text(dc, &q, tr, pal.ink, st.cf_body, 0);
+        // × 只随「有词」出现，出现才有 hover 底色 —— 空框时它不存在，命中也不给（见 cl_hit）
+        let cr = cl_clear_rect();
+        let hv = c_hov(st, CCtl::Clr);
+        if hv > 0.01 {
+            g_rrect(dc, cr, 6, mixc(pal.paper, pal.ink, 0.10 * hv), None, 0);
+        }
+        let (ccx, ccy) = ((cr.left + cr.right) / 2, (cr.top + cr.bottom) / 2);
+        c_line(dc, ccx - 4, ccy - 4, ccx + 4, ccy + 4, 1, pal.ink);
+        c_line(dc, ccx + 4, ccy - 4, ccx - 4, ccy + 4, 1, pal.ink);
+    }
+    // 光标：搜索框**永远是焦点**（呼出即输），所以不用等用户点它才闪
+    if st.cl_blink {
+        let txw = s_text_w(dc, &q, st.cf_body);
+        let cx = (tx + txw).min(tr.right - 10);
+        c_line(dc, cx, sr.top + 5, cx, sr.bottom - 5, 1, pal.ink);
+    }
+    // 每颗 chip 的条数（⚠️ 「全部」的计数是**不带搜索**的全量，否则搜一下就变成
+    // "全部 3"，用户会以为历史只剩 3 条 —— 计数要说的是「这堆里有什么类型」）
+    let counts = cl_counts(st);
+    for i in 0..CL_TAB_N {
+        let r = cl_tab_rect(i);
+        let on = st.cl_tab == i;
+        let hv = c_hov(st, CCtl::Tab(i));
+        if on {
+            g_rrect(dc, r, 9, pal.block, Some(pal.block), 1);
+        } else {
+            g_rrect(dc, r, 9, mixc(pal.paper, pal.ink, 0.06 * hv), Some(mixc(pal.edge, pal.ink, 0.4 * hv)), 1);
+        }
+        let fg = if on { pal.paper } else { pal.ink };
+        let label = CL_TABS[i as usize];
+        c_text(dc, label, RECT { left: r.left + 7, top: r.top, right: r.right - 20, bottom: r.bottom }, fg, st.cf_small, 0);
+        let n = counts[i as usize];
+        c_text(dc, &n.to_string(), RECT { left: r.right - 24, top: r.top, right: r.right - 7, bottom: r.bottom }, mixc(fg, if on { pal.paper } else { pal.ink }, 0.25), st.cf_small, 2);
+    }
+
+    // ── 6 块 ──
+    let vis = cl_visible(st);
+    if cl_page_seg(&vis, st.cl_page).is_empty() {
+        let r = RECT { left: CL_PAD, top: CL_GRID_TOP, right: CL_W - CL_PAD, bottom: CL_GRID_BOT };
+        g_rrect_stroke(dc, r, CL_RAD, mixc(pal.edge, pal.ink, 0.1), 1);
+        let msg = cl_empty_text(st);
+        let cy = (r.top + r.bottom) / 2;
+        c_text(dc, msg, RECT { left: r.left, top: cy - 20, right: r.right, bottom: cy + 2 }, pal.ink, st.cf_body, 1);
+        // 那颗出口胶囊（坐标只有一份：`cl_filter_chip`，绘制与命中共用）
+        if let Some(cr) = cl_filter_chip(st) {
+            let hv = c_hov(st, if st.cl_q.is_empty() { CCtl::Tab(0) } else { CCtl::Clr });
+            g_rrect(dc, cr, 12, mixc(pal.paper, pal.ink, 0.07 + 0.06 * hv), Some(mixc(pal.edge, pal.ink, 0.4 + 0.3 * hv)), 1);
+            c_text(dc, if st.cl_q.is_empty() { "看全部" } else { "清除搜索" }, cr, pal.ink, st.cf_small, 1);
+        }
+    }
+    // 查询词先克隆出来：`cl_par` 要 `&mut st`（排版缓存），循环里不能再借 `st.cl_q`
+    let q = st.cl_q.clone();
+    let hitbg = mixc(pal.paper, pal.block, 0.34);
+    let from = if st.cl_anim_from != usize::MAX && st.cl_anim_t < 1.0 { st.cl_anim_from } else { usize::MAX };
+    if from != usize::MAX && !cl_page_seg(&vis, from).is_empty() {
+        // smoothstep：两头都不突兀（线性滑看着像被拽走）
+        let t = {
+            let x = st.cl_anim_t.clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let w = (CL_W - CL_PAD * 2) as f32;
+        // 往后翻 = 旧页往左走、新页从右边进来；往前翻整个反向
+        let dir = if from < st.cl_page { 1.0f32 } else { -1.0 };
+        let saved = SaveDC(dc);
+        // 裁在网格带里：不然滑块会盖到头部的搜索框和脚下的页脚
+        let _ = IntersectClipRect(dc, sxv(CL_PAD), sxv(CL_GRID_TOP), sxv(CL_W - CL_PAD), sxv(CL_GRID_BOT));
+        cl_tiles(st, dc, &pal, cl_page_seg(&vis, from), (-dir * t * w) as i32, &q, hitbg, false);
+        cl_tiles(st, dc, &pal, cl_page_seg(&vis, st.cl_page), (dir * (1.0 - t) * w) as i32, &q, hitbg, true);
+        let _ = RestoreDC(dc, saved);
+    } else {
+        cl_tiles(st, dc, &pal, cl_page_seg(&vis, st.cl_page), 0, &q, hitbg, true);
+    }
+    // 元信息提示：盖在块上面，所以在块之后、页脚之前画
+    cl_meta_tip(st, dc, &pal);
+
+    // ── 底部：页点 + 「第 x/y 页 · 共 N 条」──
+    //（原来是一整行小灰字挤在一起，翻页时页点根本点不到）
     let np = cl_pages(vis.len());
+    let fy0 = CL_H - CL_PAD - CL_FOOT_H;
+    let fy1 = CL_H - CL_PAD;
     for i in 0..np {
         let d = cl_dot_rect(i);
         let on = i == st.cl_page;
         g_rrect(dc, d, 3, if on { pal.block } else { mixc(pal.edge, pal.paper, 0.4) }, None, 0);
     }
-    let fr = RECT { left: CL_PAD + 130, top: CL_H - CL_PAD - CL_FOOT_H, right: CL_W - CL_PAD, bottom: CL_H - CL_PAD };
-    c_text(dc, &format!("共 {} 条 · 滚轮翻页 · Enter 写回 · Del 删 · P 置顶", vis.len()), fr, pal.edge, st.cf_small, 2);
+    let dots_r = CL_PAD + (np as i32).max(1) * 11 - 5;
+    let info = if np > 1 {
+        format!("第 {} / {} 页 · 共 {} 条", st.cl_page + 1, np, vis.len())
+    } else {
+        format!("共 {} 条", vis.len())
+    };
+    c_text(
+        dc,
+        &info,
+        RECT { left: dots_r + 8, top: fy0, right: CL_W - CL_PAD, bottom: fy1 },
+        pal.edge,
+        st.cf_small,
+        0,
+    );
+    // 键帽行整条删掉（用户 2026-11-01：「不需要右下角的快捷键说明，也不需要快捷键」）。
 
     // ── toast（删除/置顶/失败反馈；写回是立刻收起卡片的，没有 toast）──
+    // 定宽胶囊（`CL_TOAST_W`）：绘制和 `cl_hit` 用的是同一个几何量，
+    // 命中判定拿不到 dc，不能在这儿靠量字宽定位那颗「撤销」。
     if !st.cl_toast.is_empty() {
         let txt = st.cl_toast.clone();
-        let tw = (s_text_w(dc, &txt, st.cf_body) + 28).min(CL_W - CL_PAD * 2);
-        let r = RECT { left: (CL_W - tw) / 2, top: CL_GRID_BOT - 32, right: (CL_W + tw) / 2, bottom: CL_GRID_BOT - 6 };
+        let r = cl_toast_rect();
         g_rrect(dc, r, 13, pal.block, None, 0);
-        c_text(dc, &txt, r, pal.paper, st.cf_body, 1);
+        let can_undo = st.cl_undo.is_some();
+        c_text(
+            dc,
+            &txt,
+            RECT { left: r.left + 14, top: r.top, right: r.right - if can_undo { 58 } else { 14 }, bottom: r.bottom },
+            pal.paper,
+            st.cf_body,
+            0,
+        );
+        if can_undo {
+            let ur = cl_undo_rect();
+            let hv = c_hov(st, CCtl::Undo);
+            g_rrect(dc, ur, 9, mixc(pal.block, pal.paper, 0.20 + 0.30 * hv), None, 0);
+            c_text(dc, "撤销", ur, pal.paper, st.cf_small, 1);
+        }
     }
 }
 
 // ── 渲染管线（与设置页同一条：hi 上 SS× 画 → 盒式降采样 → SDF 补 alpha → 投影）──
 
-unsafe fn clip_render(st: &mut State) {
+/// 毛玻璃底：抓卡片下面那一块桌面 → 缩 1/2 三次盒式模糊 → 用纸色染一道，存进 `card_bg`。
+/// ⚠️ 必须在卡片 `SW_SHOW` **之前**调：卡片自己是分层窗口，抓进来的就是一块自己的残影。
+/// 失败（受保护窗口 / 全黑 / 抓屏失败）→ `card_bg` 留空，`clip_render` 自动退回实心 paper。
+unsafe fn clip_snap_bg(st: &mut State, x: i32, y: i32) {
+    st.card_bg.clear();
+    if !st.glass {
+        return;
+    }
+    let (bits, mdc, bmp) = make_dib(CL_WW, CL_HH);
+    if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
+        return;
+    }
+    let n = (CL_WW * CL_HH * 4) as usize;
+    let mut raw = Vec::new();
+    let sdc = GetDC(None);
+    if !sdc.is_invalid() {
+        // CAPTUREBLT：带上分层窗口（否则某些叠层 / 播放器会抓成空洞）
+        if BitBlt(mdc, 0, 0, CL_WW, CL_HH, sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
+            raw.extend_from_slice(std::slice::from_raw_parts(bits, n));
+        }
+        let _ = ReleaseDC(None, sdc);
+    }
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mdc);
+    if raw.len() != n || mostly_black(&raw) {
+        return;
+    }
+    let mut bg = blur_glass_sq(&raw, CL_WW as usize);
+    clip_frost_tint(st, &mut bg);
+    st.card_bg = bg;
+}
+
+/// 毛玻璃的**染色**这一步单独拆出来：真机走「抓屏 → 模糊 → 这里」，
+/// 离屏 dump 走「合成壁纸 → 模糊 → 这里」，两边必须是同一个浓度，出图才对得上真机。
+fn clip_frost_tint(st: &State, bg: &mut [u8]) {
+    let pal = pal_of(st.glass_liquid);
+    let paper = [pal.paper.2, pal.paper.1, pal.paper.0]; // BGRA
+    let k = CL_FROST_TINT;
+    for px in bg.chunks_exact_mut(4) {
+        for c in 0..3 {
+            px[c] = (px[c] as f32 * (1.0 - k) + paper[c] as f32 * k).round().clamp(0.0, 255.0) as u8;
+        }
+        px[3] = 255;
+    }
+}
+
+/// 把 1× 的毛玻璃底拉满整块 hi 画布（`CL_WW² → (CL_WW*SS)²`）。
+/// 用 `StretchDIBits` 而不是逐像素：卡片一帧要把 100 万像素降采样，
+/// 再手写一遍 440 万次缩放，光这一层就能吃掉好几毫秒。
+unsafe fn blit_frost(dc: HDC, bg: &[u8]) {
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = CL_WW;
+    bmi.bmiHeader.biHeight = -CL_HH; // 顶朝下，和 `make_dib` 一致
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    let _ = SetStretchBltMode(dc, HALFTONE);
+    let _ = StretchDIBits(
+        dc,
+        0,
+        0,
+        CL_WW * SS,
+        CL_HH * SS,
+        0,
+        0,
+        CL_WW,
+        CL_HH,
+        Some(bg.as_ptr() as *const c_void),
+        &bmi as *const BITMAPINFO,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+}
+
+/// 两张卡片（剪贴板 / 便签）共用的渲染管线：同尺寸、同材质、同一套降采样 + SDF 补 alpha + 投影。
+/// 差异只有「画什么」，所以用 `card` 选一个 draw 函数，别的**一个字节都不要分叉**。
+/// （同时只有一张卡开着，画布/字体也就共用一份。）
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Card {
+    Clip,
+    Note,
+}
+
+unsafe fn card_render(st: &mut State, card: Card) {
     ensure_clip_surfaces(st);
     if st.c_hi_dc.0.is_null() || st.c_lo_dc.0.is_null() || st.c_hi_bits.is_null() {
         return;
@@ -19227,7 +20421,14 @@ unsafe fn clip_render(st: &mut State) {
     let lo_h = CL_HH as usize;
 
     g_fill(st.c_hi_dc, RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M }, pal.paper);
-    clip_draw(st, st.c_hi_dc);
+    // 毛玻璃：底图先铺满（含投影留白那一圈，反正最后按卡片形状裁 alpha）
+    if st.card_bg.len() == (CL_WW * CL_HH * 4) as usize {
+        blit_frost(st.c_hi_dc, &st.card_bg);
+    }
+    match card {
+        Card::Clip => clip_draw(st, st.c_hi_dc),
+        Card::Note => note_draw(st, st.c_hi_dc),
+    }
 
     let hi = std::slice::from_raw_parts(st.c_hi_bits, hi_w * (CL_HH * SS) as usize * 4);
     let lo = std::slice::from_raw_parts_mut(st.c_lo_bits, lo_w * lo_h * 4);
@@ -19288,18 +20489,25 @@ unsafe fn clip_render(st: &mut State) {
         }
     }
     if std::env::var("RL_SETDBG").is_ok() {
-        eprintln!("[clipdbg] clip_render");
+        eprintln!("[clipdbg] card_render {:?}", card);
     }
+}
+
+unsafe fn clip_render(st: &mut State) {
+    card_render(st, Card::Clip);
 }
 
 /// 渲染 + 上屏。⚠️ `pptDst` 传 `None` 的理由和设置页完全一样：传坐标会把窗口
 /// 每帧拽回居中位置，用户一拖就弹回去。
-unsafe fn clip_present(st: &mut State) {
-    let h = CLIP_HWND.load(Ordering::SeqCst);
-    if h == 0 || !st.cl_shown {
+unsafe fn card_present(st: &mut State, card: Card) {
+    let (h, shown) = match card {
+        Card::Clip => (CLIP_HWND.load(Ordering::SeqCst), st.cl_shown),
+        Card::Note => (NOTE_HWND.load(Ordering::SeqCst), st.nt_shown),
+    };
+    if h == 0 || !shown {
         return;
     }
-    clip_render(st);
+    card_render(st, card);
     if st.c_lo_bits.is_null() {
         return;
     }
@@ -19321,6 +20529,14 @@ unsafe fn clip_present(st: &mut State) {
         Some(&blend),
         ULW_ALPHA,
     );
+}
+
+unsafe fn clip_present(st: &mut State) {
+    card_present(st, Card::Clip);
+}
+
+unsafe fn note_present(st: &mut State) {
+    card_present(st, Card::Note);
 }
 
 unsafe fn clip_kick(st: &mut State) {
@@ -19353,6 +20569,21 @@ unsafe fn clip_tick(st: &mut State, hwnd: HWND) {
             busy = true;
         }
     }
+    // 撤销窗口过期 → 这时才真删那张 .dib（顺带把 toast 收掉）
+    if st.cl_undo.is_some() && now_s() > st.cl_undo_at {
+        cl_undo_finish(st);
+        busy = true;
+    }
+    if st.cl_anim_from != usize::MAX {
+        st.cl_anim_t += dt / CL_ANIM_S;
+        if st.cl_anim_t >= 1.0 {
+            st.cl_anim_from = usize::MAX;
+            st.cl_anim_t = 1.0;
+            clip_thumbs_keep_pages(st, [st.cl_page, st.cl_page]);
+        } else {
+            busy = true;
+        }
+    }
     if !busy {
         st.cl_hover_prev = CCtl::None;
         let _ = KillTimer(hwnd, TIMER_CLIP_FRAME);
@@ -19363,6 +20594,25 @@ unsafe fn clip_tick(st: &mut State, hwnd: HWND) {
 // ── 命中 / 动作 ──
 
 fn cl_hit(st: &State, x: i32, y: i32) -> CCtl {
+    // toast 浮在网格下沿上面：整条都吃掉点击（不然「刚删一条」时点它会穿透成写回），
+    // 右端那颗「撤销」只有还有得撤销时才存在。
+    if !st.cl_toast.is_empty() {
+        if st.cl_undo.is_some() && in_rect(cl_undo_rect(), x, y) {
+            return CCtl::Undo;
+        }
+        if in_rect(cl_toast_rect(), x, y) {
+            return CCtl::None;
+        }
+    }
+    if !st.cl_q.is_empty() && in_rect(cl_clear_rect(), x, y) {
+        return CCtl::Clr;
+    }
+    // 空态那颗出口：和「×」「切回全部」走同两个 handler，不另立动作
+    if let Some(cr) = cl_filter_chip(st) {
+        if in_rect(cr, x, y) {
+            return if st.cl_q.is_empty() { CCtl::Tab(0) } else { CCtl::Clr };
+        }
+    }
     for i in 0..CL_TAB_N {
         if in_rect(cl_tab_rect(i), x, y) {
             return CCtl::Tab(i);
@@ -19419,8 +20669,33 @@ fn cl_slot_of(st: &State, idx: usize) -> Option<usize> {
 /// 翻页 / 换类型 / 改搜索 = 页内条目全换了，选中项和缩略图缓存都得跟着清
 unsafe fn cl_repage(st: &mut State) {
     st.cl_sel = usize::MAX;
+    st.cl_tip = usize::MAX; // 下标会变，提示先收掉（下一次移动会重新算）
+    st.cl_anim_from = usize::MAX; // 筛选条件都变了，旧页没有滑出去的意义
+    st.cl_anim_t = 1.0;
     clip_thumbs_clear(st);
+    st.cl_lay.clear();
     cl_clamp(st);
+}
+
+/// 翻页 = 一次动画。滚轮、页点、PgUp/PgDn、方向键跨页都走这一条，
+/// 免得键盘翻过去是硬切、鼠标翻过去有过渡（两套手感）。
+unsafe fn cl_turn(st: &mut State, to: usize) {
+    let np = cl_pages(cl_visible(st).len());
+    let to = to.min(np.saturating_sub(1));
+    if np == 0 || to == st.cl_page {
+        return;
+    }
+    let from = st.cl_page;
+    st.cl_anim_from = from;
+    st.cl_anim_t = 0.0;
+    st.cl_page = to;
+    st.cl_sel = usize::MAX;
+    // 旧页的 hover 到新页上就是另一块了：不清会把高亮留在一个没指着的位置
+    st.cl_hover = CCtl::None;
+    st.cl_hover_prev = CCtl::None;
+    st.cl_hov_a = 0.0;
+    st.cl_lay.clear();
+    clip_thumbs_keep_pages(st, [from, to]);
 }
 
 /// 翻转置顶并返回新状态；下标越界（含 `usize::MAX` = 没选中）给 `None`。
@@ -19439,20 +20714,24 @@ unsafe fn cl_click(st: &mut State, x: i32, y: i32) {
             cl_repage(st);
         }
         CCtl::Dot(p) => {
-            if p != st.cl_page {
-                st.cl_page = p;
-                cl_repage(st);
-            }
+            cl_turn(st, p as usize);
         }
         CCtl::Pin(i) => {
             if let Some(on) = cl_toggle_pin(st, i) {
-                clip_toast(st, if on { "已置顶 · 关掉程序也不掉" } else { "已取消置顶" });
+                clip_toast(st, if on { "已置顶" } else { "已取消置顶" });
             }
             clip_save(st);
         }
         CCtl::Del(i) => {
-            clip_del(st, i);
-            clip_toast(st, "已从历史删除");
+            cl_delete_undoable(st, i);
+        }
+        CCtl::Undo => {
+            cl_undo_apply(st);
+        }
+        CCtl::Clr => {
+            st.cl_q.clear();
+            st.cl_page = 0;
+            cl_repage(st);
         }
         CCtl::Tile(i) => {
             clip_fire(st, i);
@@ -19488,15 +20767,31 @@ unsafe fn open_clip(st: &mut State) {
     st.cl_hov_a = 1.0;
     st.cl_toast.clear();
     st.cl_toast_at = 0.0;
+    st.cl_anim_from = usize::MAX;
+    st.cl_anim_t = 1.0;
     st.cl_blink = true;
     st.cl_tracking = false;
-    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-    st.cl_x = (sw - CL_WW) / 2;
-    st.cl_y = (sh - CL_HH) / 2;
+    // 摆过位置就停在那儿（拖到副屏也是白摆 → 现在不回了）；没摆过 = 主屏居中。
+    // 读进来的坐标每次呼出都夹一遍，拔了副屏也不会把卡片丢在屏外。
+    if st.cl_pos_set {
+        cl_pos_clamp(st);
+    } else {
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        st.cl_x = (sw - CL_WW) / 2;
+        st.cl_y = (sh - CL_HH) / 2;
+    }
     let _ = SetWindowPos(hwnd, None, st.cl_x, st.cl_y, CL_WW, CL_HH, SWP_NOZORDER);
+    // 毛玻璃底：必须在 `SW_SHOW` **之前**抓（否则抓到自己那张卡）
+    clip_snap_bg(st, st.cl_x, st.cl_y);
     let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = SetForegroundWindow(hwnd);
+    // ⚠️ 必须走 `focus_window`（挂前台线程输入队列），**不能**直接 `SetForegroundWindow`：
+    //    我们是后台进程，前台锁多半不让 —— 实测同一个探针两次跑，一次拿到前台一次没拿到。
+    //    拿不到焦点的代价是键盘整条废（搜索框收不到 `WM_CHAR`、Esc/1~6/Enter 全无反应）。
+    focus_window(hwnd);
+    CLIP_LIVE.store(true, Ordering::SeqCst);
+    st.cl_fg0 = now_s();
     let _ = SetTimer(hwnd, TIMER_CLIP_BLINK, 500, None);
+    let _ = SetTimer(hwnd, TIMER_CARD_FG, 250, None);
     clip_present(st);
     clip_kick(st);
 }
@@ -19506,13 +20801,19 @@ unsafe fn close_clip(st: &mut State) {
         return; // 幂等：Esc、点空白、失去焦点、写回都会走到这里
     }
     st.cl_shown = false;
+    CLIP_LIVE.store(false, Ordering::SeqCst);
+    // 毛玻璃底（约 1MB）只服务这一次呼出，收起就还回去
+    st.card_bg.clear();
     let h = CLIP_HWND.load(Ordering::SeqCst);
     if h != 0 {
         let hwnd = HWND(h as *mut c_void);
         let _ = KillTimer(hwnd, TIMER_CLIP_FRAME);
         let _ = KillTimer(hwnd, TIMER_CLIP_BLINK);
+        let _ = KillTimer(hwnd, TIMER_CARD_FG);
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
+    // 卡片都收了，撤销窗口不留到下次呼出：当场结算（真删那张 .dib）
+    cl_undo_finish(st);
     clip_free(st);
 }
 
@@ -19542,6 +20843,22 @@ fn demo_dib(w: usize, h: usize) -> Vec<u8> {
     v
 }
 
+/// 把当前 `c_lo` 画布合成到灰底上存 BMP（离屏 dump 共用：剪贴板卡片 / 便签都走这条）
+unsafe fn dump_card_bmp(name: &str, dir: &str, st: &State) {
+    let bg = (205u8, 205u8, 208u8);
+    let mut px = std::slice::from_raw_parts(st.c_lo_bits, (CL_WW * CL_HH * 4) as usize).to_vec();
+    for p in px.chunks_mut(4) {
+        let a = p[3] as f32 / 255.0;
+        let ia = 1.0 - a;
+        p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[3] = 255;
+    }
+    let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, CL_WW, CL_HH);
+    println!("[card] {name} {}", if ok { "OK" } else { "FAIL" });
+}
+
 /// 离屏出图（`--clip-dump`）：深浅 × 图片页 × 选中/提示 × 空态各一张。
 /// ⚠️ 条目是**造的**，只为核对版面；真实采集见 `clip_capture`。
 unsafe fn clip_dump(dir: &str, st: &mut State) {
@@ -19561,30 +20878,27 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
     let _ = std::fs::write(&d1, demo_dib(420, 260));
     let _ = std::fs::write(&d2, demo_dib(300, 300));
     st.cl_items = vec![
-        it(0, "帮我核对一下：剪贴板卡片 480×480，一页 6 块，3×2。\n选中只写回，不自动粘贴。", "", "Google Chrome", 30, true, 0, 0),
+        it(0, "fn main() {\n    println!(\"hello\");\n}", "", "Code", 30, true, 0, 0),
         it(1, "", &d1, "Snipaste", 90, false, 420, 260),
-        it(2, "D:\\工作\\IDEA\\pigo\\src\\main.rs\nD:\\工作\\IDEA\\pigo\\Cargo.toml\nD:\\工作\\IDEA\\pigo\\README.md", "", "explorer.exe", 200, false, 0, 0),
+        it(2, "D:\\工作\\IDEA\\pigo\\src\\main.rs\nD:\\工作\\IDEA\\pigo\\Cargo.toml\nD:\\工作\\IDEA\\pigo\\README.md", "", "Windows 资源管理器", 200, false, 0, 0),
         it(0, "https://github.com/lifeFxxker/pipie/issues/1", "", "Google Chrome", 400, false, 0, 0),
-        it(1, "", &d2, "WeChat", 3600 * 5, false, 300, 300),
-        it(0, &"很长的文字".repeat(60), "", "notepad.exe", 3600 * 30, false, 0, 0),
-        it(2, "E:\\下载\\PiPie-1.0.8-win-x64.zip", "", "explorer.exe", 3600 * 26, false, 0, 0),
-        it(0, "已解决：液体玻璃在 WDA 设不上的机器退回真桌面快照。", "", "Code", 86400 * 2, false, 0, 0),
+        it(1, "", &d2, "微信", 3600 * 5, false, 300, 300),
+        it(0, &"今天的会议纪要：先把剪贴板的历史改成 9 格一页，再看来源那行被省略号切掉的问题。".repeat(3), "", "记事本", 3600 * 30, false, 0, 0),
+        it(2, "E:\\下载\\PiPie-1.0.8-win-x64.zip", "", "Windows 资源管理器", 3600 * 26, false, 0, 0),
+        it(0, "把主题里的 paper / ink 两个 token 换掉，深浅两套就都跟着变了。", "", "Visual Studio Code", 86400 * 2, false, 0, 0),
+        it(0, "https://www.rust-lang.org/learn", "", "Microsoft Edge", 86400 * 3, false, 0, 0),
+        it(0, &"这一条只在第二页，用来核对翻页后的版面。".repeat(4), "", "Notepad", 86400 * 4, false, 0, 0),
+        it(2, "D:\\工作\\Blender\\角色", "", "Windows 资源管理器", 86400 * 5, false, 0, 0),
+        it(0, "轮盘上的「剪贴板」那一格，悬停展开后直接点就打开卡片。", "", "WPS Office", 86400 * 6, false, 0, 0),
     ];
     ensure_clip_fonts(st);
     let snap = |name: &str, st: &mut State| {
         clip_render(st);
-        let bg = (205u8, 205u8, 208u8);
-        let mut px = std::slice::from_raw_parts(st.c_lo_bits, (CL_WW * CL_HH * 4) as usize).to_vec();
-        for p in px.chunks_mut(4) {
-            let a = p[3] as f32 / 255.0;
-            let ia = 1.0 - a;
-            p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
-            p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
-            p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
-            p[3] = 255;
-        }
-        let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, CL_WW, CL_HH);
-        println!("[clip] {name} {}", if ok { "OK" } else { "FAIL" });
+        dump_card_bmp(name, dir, st);
+    };
+    let snap_note = |name: &str, st: &mut State| {
+        card_render(st, Card::Note);
+        dump_card_bmp(name, dir, st);
     };
     for (name, dark) in [("clip_dark", true), ("clip_light", false)] {
         st.glass_liquid = dark;
@@ -19599,19 +20913,75 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
         cl_clamp(st);
         snap(name, st);
     }
+    // 块内两颗操作钮的 hover 态（「置顶图标」返工过三版，留一张能反复核对的图）
+    st.glass_liquid = true;
+    st.cl_tab = 0;
+    st.cl_page = 0;
+    st.cl_hover = CCtl::Pin(1);
+    st.cl_hov_a = 1.0;
+    st.cl_hover_prev = CCtl::None;
+    st.cl_sel = usize::MAX;
+    st.cl_toast.clear();
+    cl_clamp(st);
+    snap("clip_act", st);
+    // 元信息提示：来源名被省略号切掉时，悬停浮出整行（第 3 块是「Windows 资源管理器」）
+    st.glass_liquid = true;
+    st.cl_tab = 0;
+    st.cl_page = 0;
+    st.cl_hover = CCtl::Tile(2);
+    st.cl_hov_a = 1.0;
+    st.cl_hover_prev = CCtl::None;
+    st.cl_tip = 2;
+    st.cl_sel = usize::MAX;
+    st.cl_toast.clear();
+    cl_clamp(st);
+    snap("clip_meta_tip", st);
+    // 毛玻璃（`glass=1`）：离屏没有真桌面 → 合成一张彩色壁纸切一块当底，
+    // 走的是和真机**同一条**「缩放模糊 → 纸色染色」。
+    for (name, dark) in [("clip_frost_dark", true), ("clip_frost_light", false)] {
+        st.glass = true;
+        st.cl_tab = 0;
+        st.cl_page = 0;
+        st.cl_hover = CCtl::Tile(1);
+        st.cl_hov_a = 1.0;
+        st.cl_hover_prev = CCtl::None;
+        st.cl_tip = usize::MAX;
+        st.cl_sel = usize::MAX;
+        st.cl_toast.clear();
+        st.glass_liquid = dark;
+        let mut raw = vec![0u8; (CL_WW * CL_HH * 4) as usize];
+        for y in 0..CL_HH as usize {
+            for x in 0..CL_WW as usize {
+                let (u, t) = (x as f32 / CL_WW as f32, y as f32 / CL_HH as f32);
+                let o = (y * CL_WW as usize + x) * 4;
+                raw[o] = (38.0 + 150.0 * u) as u8;
+                raw[o + 1] = (70.0 + 120.0 * (1.0 - t)) as u8;
+                raw[o + 2] = (150.0 + 95.0 * t) as u8;
+                raw[o + 3] = 255;
+            }
+        }
+        let mut bg = blur_glass_sq(&raw, CL_WW as usize);
+        clip_frost_tint(st, &mut bg);
+        st.card_bg = bg;
+        cl_clamp(st);
+        snap(name, st);
+        st.glass = false;
+        st.card_bg.clear();
+    }
     // 图片 tab（整页都是缩略图，看「井」和等比放法）
     st.glass_liquid = true;
     st.cl_tab = 2;
     st.cl_page = 0;
     st.cl_hover = CCtl::None;
     st.cl_hov_a = 0.0;
+    st.cl_tip = usize::MAX;
     cl_clamp(st);
     snap("clip_image", st);
     // 选中 + 提示（Enter 写回那一瞬的观感）
     st.cl_tab = 0;
     cl_clamp(st);
     st.cl_sel = cl_visible(st)[1];
-    clip_toast(st, "已写回剪贴板 · Ctrl+V 粘贴");
+    clip_toast(st, "已写回剪贴板");
     snap("clip_sel", st);
     // 空态（搜索无结果）
     st.cl_sel = usize::MAX;
@@ -19619,7 +20989,114 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
     st.cl_q = "zzzzz".into();
     cl_clamp(st);
     snap("clip_empty", st);
+    // 命中词反白（第一块正文里有「核对」）
+    st.cl_q = "核对".into();
+    st.cl_tab = 0;
+    cl_clamp(st);
+    snap("clip_hit", st);
+    // 只剩类型过滤（没有搜索词）→ 出口胶囊该写「看全部」
+    let keep = std::mem::take(&mut st.cl_items);
+    st.cl_items = vec![it(0, "这里只有一条文字历史", "", "Code", 10, false, 0, 0)];
+    st.cl_q.clear();
+    st.cl_tab = 3;
+    snap("clip_tab_empty", st);
+    // 空态：一条都没采到（「监听关着」那一支已经到不了了 —— 关着根本没入口）
+    st.cl_items.clear();
+    st.cl_tab = 0;
+    st.cl_on = true;
+    snap("clip_no_hist", st);
+    st.cl_items = keep;
+    st.cl_on = true;
+    // 删除后那颗「撤销」（toast 改成定宽，深浅两套都要核对右端钮的对比度）
+    for (name, dark) in [("clip_undo_dark", true), ("clip_undo_light", false)] {
+        st.glass_liquid = dark;
+        st.cl_tab = 0;
+        st.cl_page = 0;
+        st.cl_q.clear();
+        st.cl_hover = CCtl::Undo;
+        st.cl_hov_a = 1.0;
+        st.cl_hover_prev = CCtl::None;
+        st.cl_sel = usize::MAX;
+        cl_clamp(st);
+        clip_toast(st, "已删除");
+        st.cl_undo = Some((6, st.cl_items[6].clone()));
+        st.cl_undo_at = now_s() + CL_UNDO_S;
+        st.cl_toast_at = st.cl_undo_at;
+        snap(name, st);
+    }
+    st.cl_undo = None;
+    st.cl_toast.clear();
+    st.cl_hover = CCtl::None;
+    // 翻页动画的中间帧（第 0 页 → 第 1 页滑到一半）
+    st.glass_liquid = true;
+    st.cl_anim_from = 0;
+    st.cl_anim_t = 0.5;
+    st.cl_page = 1;
+    snap("clip_turn", st);
+    st.cl_anim_from = usize::MAX;
+    st.cl_anim_t = 1.0;
+    st.cl_page = 0;
     clip_thumbs_clear(st);
+
+    // ── 便签卡片：一页正文 + 一页短的（看页点和「第 x / y 页」） ──
+    st.nt_pages = vec![
+        "周三之前要交的：
+· 把剪贴板卡片的 9 格改完
+· 便签能不能直接打字（中文）
+· 毛玻璃在浅色桌面上够不够看
+
+记完记得顺手 Ctrl+C 带到聊天窗口。".to_string(),
+        "买：牛奶、鸡蛋、咖啡豆".to_string(),
+        String::new(),
+    ];
+    st.nt_blink = true;
+    for (name, dark, page) in [
+        ("note_dark", true, 0usize),
+        ("note_light", false, 0),
+        ("note_long", false, 0),
+    ] {
+        st.glass_liquid = dark;
+        st.nt_cur = page;
+        st.nt_lay = None;
+        st.nt_dot_hover = 1;
+        st.card_bg.clear();
+        snap_note(name, st);
+    }
+    // 毛玻璃版（同一张合成壁纸走 blur + 染色）
+    {
+        let mut raw = vec![0u8; (CL_WW * CL_HH * 4) as usize];
+        for y in 0..CL_HH as usize {
+            for x in 0..CL_WW as usize {
+                let (u, t) = (x as f32 / CL_WW as f32, y as f32 / CL_HH as f32);
+                let o = (y * CL_WW as usize + x) * 4;
+                raw[o] = (38.0 + 150.0 * u) as u8;
+                raw[o + 1] = (70.0 + 120.0 * (1.0 - t)) as u8;
+                raw[o + 2] = (150.0 + 95.0 * t) as u8;
+                raw[o + 3] = 255;
+            }
+        }
+        let mut bg = blur_glass_sq(&raw, CL_WW as usize);
+        st.glass_liquid = true;
+        clip_frost_tint(st, &mut bg);
+        st.card_bg = bg;
+        st.nt_cur = 0;
+        st.nt_lay = None;
+        st.nt_dot_hover = usize::MAX;
+        snap_note("note_frost_dark", st);
+        st.card_bg.clear();
+    }
+    // 光标落点：正文以换行结尾时，光标必须在**新的一行**开头（不是上一行行尾）
+    st.nt_pages = vec!["第一行文字\n第二行里有光标\n第三行".to_string()];
+    st.nt_cur = 0;
+    // 光标放在第二行中间（字节下标 = 第一行 + 换行 + 「第二行里」）
+    st.nt_caret = "第一行文字
+第二行里".len();
+    st.nt_blink = true;
+    st.nt_lay = None;
+    st.nt_dot_hover = usize::MAX;
+    st.glass_liquid = false;
+    snap_note("note_caret", st);
+    st.glass_liquid = false;
 }
 
 // ── 窗口过程 ──
@@ -19637,13 +21114,19 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     let ly = || (((l.0 >> 16) & 0xFFFF) as i16 as i32) - S_M;
     match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            // 类光标是空的（`WNDCLASSW::default()`），系统不会替我们改回箭头 ——
+            // 上一个程序留下的「忙碌」指针会一直转圈（轮盘 `ring_proc` 同一个坑）
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(ptr::null_mut())));
+            LRESULT(1)
+        }
         WM_NCHITTEST => {
             // ⚠️ lParam 是**屏幕**坐标（和设置页同一个坑）
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let x = ((l.0 & 0xFFFF) as i16 as i32) - wr.left - S_M;
             let y = (((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top - S_M;
-            if cl_drag_band(x, y) {
+            if cl_drag_band(x, y, state_of(hwnd).cl_q.is_empty()) {
                 return LRESULT(HTCAPTION as isize);
             }
             DefWindowProcW(hwnd, msg, w, l)
@@ -19670,11 +21153,19 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 st.cl_hov_a = 0.0;
                 clip_kick(st);
             }
+            // 元信息的提示位单独回一笔：块体 → 块底部那一小条，命中都是同一个 Tile，
+            // 不比出一个变化就不会重绘，提示得等到下一次光标闪（500ms）才冒出来。
+            let tip = cl_meta_tip_idx(st, lx(), ly());
+            if tip != st.cl_tip {
+                st.cl_tip = tip;
+                clip_kick(st);
+            }
             LRESULT(0)
         }
         WM_MOUSELEAVE_MSG => {
             let st = state_of(hwnd);
             st.cl_tracking = false;
+            st.cl_tip = usize::MAX;
             if st.cl_hover != CCtl::None {
                 st.cl_hover_prev = st.cl_hover;
                 st.cl_hover = CCtl::None;
@@ -19696,12 +21187,42 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             // （和内环 `ring_scroll(st, -(d/120))` 同符号；别照搬浏览器的 `deltaY`，那个是反的）
             let p = (st.cl_page as i32 - d).clamp(0, np as i32 - 1) as usize;
             if p != st.cl_page {
-                st.cl_page = p;
-                cl_repage(st);
+                cl_turn(st, p);
                 clip_present(st);
                 clip_kick(st);
             }
             LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            // 拖到哪，下次呼出还在哪（落 ini `clip_x=`/`clip_y=`）。
+            // 取的是**窗口**矩形 = 卡片 + 投影留白，和 `SetWindowPos` 写进去的同一套坐标。
+            let st = state_of(hwnd);
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            // 单击标题条也会走一遍「移动循环」（ENTER/EXITSIZEMOVE 成对发），位置没变就别
+            // 落盘 —— 否则一次误点就把卡片钉死在当前坐标，还把 ini 写一遍。
+            if st.cl_x != wr.left || st.cl_y != wr.top {
+                st.cl_x = wr.left;
+                st.cl_y = wr.top;
+                st.cl_pos_set = true;
+                cl_pos_clamp(st);
+                if st.cl_x != wr.left || st.cl_y != wr.top {
+                    let _ = SetWindowPos(hwnd, None, st.cl_x, st.cl_y, CL_WW, CL_HH, SWP_NOZORDER);
+                }
+                save_settings(st);
+            }
+            LRESULT(0)
+        }
+        WM_NCLBUTTONDBLCLK => {
+            // 双击标题条 = 回居中。⚠️ 必须自己接住：交给 DefWindowProc 会当成「双击最大化」
+            if w.0 as u32 == HTCAPTION as u32 {
+                let st = state_of(hwnd);
+                cl_recenter(st);
+                clip_present(st);
+                clip_kick(st);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
         }
         WM_TIMER => {
             let st = state_of(hwnd);
@@ -19711,6 +21232,15 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     if st.cl_shown {
                         st.cl_blink = !st.cl_blink;
                         clip_present(st);
+                    }
+                }
+                TIMER_CARD_FG => {
+                    // 失焦看门狗（和便签同一条）：前台不是自己 → 收起
+                    if st.cl_shown && now_s() - st.cl_fg0 > CARD_FG_GRACE {
+                        let fg = GetForegroundWindow();
+                        if !fg.is_invalid() && fg != hwnd {
+                            close_clip(st);
+                        }
                     }
                 }
                 _ => {}
@@ -19738,9 +21268,9 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
                 return LRESULT(0);
             }
-            // 空搜索时：数字 1~6 = 直接选第几块，P = 置顶选中项（和鼠标 hover 一致）
+            // 空搜索时：数字 1~9 = 直接选第几块，P = 置顶选中项（和鼠标 hover 一致）
             if st.cl_q.is_empty() {
-                if (0x31..=0x36).contains(&c) {
+                if (0x31..=0x39).contains(&c) {
                     if let Some(idx) = cl_slot(st, (c - 0x31) as usize) {
                         clip_fire(st, idx);
                     }
@@ -19748,8 +21278,17 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
                 if c == 0x50 || c == 0x70 {
                     if let Some(on) = cl_toggle_pin(st, st.cl_sel) {
-                        clip_toast(st, if on { "已置顶 · 关掉程序也不掉" } else { "已取消置顶" });
+                        clip_toast(st, if on { "已置顶" } else { "已取消置顶" });
                         clip_save(st);
+                        clip_present(st);
+                        clip_kick(st);
+                    }
+                    return LRESULT(0);
+                }
+                if c == 0x55 || c == 0x75 {
+                    // U = 撤销刚才那笔删除（和 toast 上那颗钮同一个 handler）
+                    if st.cl_undo.is_some() {
+                        cl_undo_apply(st);
                         clip_present(st);
                         clip_kick(st);
                     }
@@ -19779,32 +21318,54 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                 }
                 0x25 | 0x26 | 0x27 | 0x28 => {
-                    // 方向键按**页内格子**走（←→ 横、↑↓ 竖），到边界回卷，和 3×2 版面一致
+                    // 方向键按**页内格子**走（←→ 横、↑↓ 竖），到页边界就翻页 ——
+                    // 只在页内回卷的话，「↓↓Enter」这类键盘流翻过一屏就断了，得回头点鼠标。
                     let vis = cl_visible(st);
+                    let np = cl_pages(vis.len());
                     let n = (vis.len() - (st.cl_page * CL_PER).min(vis.len())).min(CL_PER);
+                    let step = match w.0 as u32 {
+                        0x27 => 1,
+                        0x25 => -1,
+                        0x28 => CL_COLS,
+                        _ => -CL_COLS,
+                    };
+                    let cur = if st.cl_sel == usize::MAX { None } else { cl_slot_of(st, st.cl_sel) };
+                    let mut k = 0usize;
                     if n > 0 {
-                        let cur = if st.cl_sel == usize::MAX { None } else { cl_slot_of(st, st.cl_sel) };
-                        let step = match w.0 as u32 {
-                            0x27 => 1,
-                            0x25 => -1,
-                            0x28 => CL_COLS,
-                            _ => -CL_COLS,
-                        };
-                        let k = match cur {
-                            None => 0,
-                            Some(c) => ((c as i32 + step).rem_euclid(n as i32) as usize).min(n - 1),
-                        };
+                        if let Some(c) = cur {
+                            let t = c as i32 + step;
+                            if t >= n as i32 && st.cl_page + 1 < np {
+                                // 往后翻：下一页一定满 9 格，落点就是同一列（→ 越界则 = 0）
+                                cl_turn(st, st.cl_page + 1);
+                                k = (t - CL_PER as i32).max(0) as usize;
+                            } else if t < 0 && st.cl_page > 0 {
+                                // 往前翻：上一页可能不满（它自己是最后一页）→ 夹进它的格数里
+                                let pn = (vis.len() - (st.cl_page - 1) * CL_PER).min(CL_PER) as i32;
+                                cl_turn(st, st.cl_page - 1);
+                                k = (t + pn).clamp(0, pn - 1) as usize;
+                            } else {
+                                k = t.clamp(0, n as i32 - 1) as usize;
+                            }
+                        }
                         if let Some(idx) = cl_slot(st, k) {
                             st.cl_sel = idx;
-                            clip_present(st);
                         }
+                        clip_present(st);
+                        clip_kick(st);
                     }
+                }
+                0x21 | 0x22 => {
+                    // PgUp / PgDn：和滚轮同一条（含动画）
+                    let d = if w.0 as u32 == 0x22 { 1i32 } else { -1 };
+                    let p = (st.cl_page as i32 + d).max(0) as usize;
+                    cl_turn(st, p);
+                    clip_present(st);
+                    clip_kick(st);
                 }
                 0x2E => {
                     // Delete（不是 Backspace，那个归搜索框）
                     if st.cl_sel != usize::MAX {
-                        clip_del(st, st.cl_sel);
-                        clip_toast(st, "已从历史删除");
+                        cl_delete_undoable(st, st.cl_sel);
                         clip_present(st);
                         clip_kick(st);
                     }
@@ -19833,6 +21394,868 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 open_clip(st);
             }
             LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+// ───────────────────── 便签卡片（RLNote）─────────────────────
+//
+// 和剪贴板卡片是同一张卡：480²、同一套材质（纸 / 毛玻璃）、同一条渲染管线
+// （见 `card_render`）、同样「点到外面 / 失焦 / Esc 就收」、打开时轮盘一起收。
+// v1 只做**尾部追加**：没有选区、不能点哪写哪 —— 换来的是中文输入法能直接打字
+// （组字串自己画在光标处，见 `WM_IME_COMPOSITION`）。
+
+/// 便签的底栏比剪贴板高一档：右边要放一颗「＋」新页按钮（22px）
+const NT_FOOT_H: i32 = 26;
+/// 便签纸：卡片里那张「纸」，四周留出投影留白和一条拖拽带
+fn nt_sheet() -> RECT {
+    RECT { left: CL_PAD, top: CL_PAD + 4, right: CL_W - CL_PAD, bottom: CL_H - CL_PAD - NT_FOOT_H - 8 }
+}
+/// 底栏那颗「＋ 新页」（22×22，右下角）
+fn nt_plus_rect() -> RECT {
+    let b = CL_H - CL_PAD;
+    RECT { left: CL_W - CL_PAD - 22, top: b - 22, right: CL_W - CL_PAD, bottom: b }
+}
+/// 当前页空着 → 「＋」不生效（和 Ctrl+N 一致：空页上再开一页没意义）
+fn nt_can_new_page(st: &State) -> bool {
+    !note_text(st).trim().is_empty() && st.nt_pages.len() < NT_CAP_PAGES
+}
+/// 纸上的正文区（上沿那条 18px 是拖拽带，下面才是字）
+fn nt_text_rect() -> RECT {
+    let s = nt_sheet();
+    RECT { left: s.left + 16, top: s.top + 18, right: s.right - 16, bottom: s.bottom - 14 }
+}
+/// 顶上那条拖拽带（和剪贴板卡片头部一个意思：按住能拖卡片）
+fn nt_drag_band(y: i32) -> bool {
+    y >= 0 && y < nt_text_rect().top
+}
+fn nt_dot_rect(i: usize) -> RECT {
+    let fy0 = CL_H - CL_PAD - NT_FOOT_H;
+    let fy1 = CL_H - CL_PAD;
+    let y = (fy0 + fy1) / 2 - 3;
+    let x = CL_PAD + i as i32 * 11;
+    RECT { left: x, top: y, right: x + 6, bottom: y + 6 }
+}
+
+fn note_path() -> String {
+    format!("{}\\notes.txt", config_dir())
+}
+
+/// 读盘。没有文件 / 全是空页 → 留一页空白（打开就能写）。
+fn note_load(st: &mut State) {
+    st.nt_pages.clear();
+    if let Ok(txt) = std::fs::read_to_string(note_path()) {
+        for ln in txt.lines().skip(1) {
+            let f: Vec<&str> = ln.split('\t').collect();
+            if f.len() < 2 {
+                continue;
+            }
+            st.nt_pages.push(cl_unesc(f[1]));
+            if st.nt_pages.len() >= NT_CAP_PAGES {
+                break;
+            }
+        }
+    }
+    if st.nt_pages.is_empty() {
+        st.nt_pages.push(String::new());
+    }
+    st.nt_cur = 0; // 第 1 页 = 最新那页
+    st.nt_caret = note_text(st).len();
+    st.nt_lay = None;
+}
+
+/// 落盘。**空页不写**：想扔掉一页就把字删光，不用另做一个「删除页」的按钮/撤销。
+fn note_save(st: &mut State) {
+    let mut out = String::from("notefile v1\n");
+    for p in st.nt_pages.iter().filter(|p| !p.trim().is_empty()) {
+        out.push_str(&format!("{}\t{}\n", unix_now(), cl_esc(p)));
+    }
+    if let Err(e) = std::fs::write(note_path(), out) {
+        clip_log(&format!("notes save FAIL {e}"));
+    }
+}
+
+/// 当前页正文（只读）
+fn note_text(st: &State) -> &str {
+    st.nt_pages.get(st.nt_cur).map(|s| s.as_str()).unwrap_or("")
+}
+
+/// 改完正文之后统一走这条：截断超长、清排版缓存、排一次「延迟落盘」、重画。
+/// ⚠️ 落盘走 400ms 定时器而不是每次敲键都写盘 —— 一秒能敲十个字，写十次没必要。
+unsafe fn note_touch(st: &mut State, hwnd: HWND) {
+    if let Some(p) = st.nt_pages.get_mut(st.nt_cur) {
+        if p.chars().count() > NT_MAX_CHARS {
+            let cut: String = p.chars().take(NT_MAX_CHARS).collect();
+            *p = cut;
+        }
+    }
+    st.nt_lay = None;
+    st.nt_blink = true;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+}
+
+/// 光标夹进 [0, 正文长度]，并保证落在**字符边界**上（中文是多字节，切在中间会崩）
+fn note_caret_clamp(st: &mut State) {
+    let len = note_text(st).len();
+    if st.nt_caret > len {
+        st.nt_caret = len;
+    }
+    while st.nt_caret > 0 && !note_text(st).is_char_boundary(st.nt_caret) {
+        st.nt_caret -= 1;
+    }
+}
+
+/// 在**光标处**插入（v2：不再是只能往末尾追加）
+unsafe fn note_insert(st: &mut State, hwnd: HWND, s: &str) {
+    if st.nt_cur >= st.nt_pages.len() {
+        return;
+    }
+    note_caret_clamp(st);
+    let at = st.nt_caret;
+    st.nt_pages[st.nt_cur].insert_str(at, s);
+    st.nt_caret = at + s.len();
+    note_touch(st, hwnd);
+}
+
+/// 退格：删光标**前一个字符**（按字符不按字节，中文才不会删成乱码）
+unsafe fn note_backspace(st: &mut State, hwnd: HWND) {
+    note_caret_clamp(st);
+    let at = st.nt_caret;
+    if at == 0 || st.nt_cur >= st.nt_pages.len() {
+        return;
+    }
+    let prev = note_text(st)[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+    st.nt_pages[st.nt_cur].replace_range(prev..at, "");
+    st.nt_caret = prev;
+    note_touch(st, hwnd);
+}
+
+/// 光标左移一个字符
+fn note_left(st: &mut State) {
+    st.nt_caret = note_text(st)[..st.nt_caret.min(note_text(st).len())]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+}
+
+/// 光标右移一个字符
+fn note_right(st: &mut State) {
+    let t = note_text(st);
+    let i = st.nt_caret.min(t.len());
+    st.nt_caret = t[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(t.len());
+}
+
+/// 当前滚动位置（绘制和命中必须用**同一个**算法，否则点哪写哪会错行）
+unsafe fn note_scroll(st: &State, _dc: HDC, lines: &[(usize, usize)], lh: i32) -> usize {
+    let ta = nt_text_rect();
+    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
+    let cur = note_line_of(lines, st.nt_caret.min(note_text(st).len()));
+    if cur + 1 > visible {
+        (cur + 1 - visible).min(lines.len().saturating_sub(visible))
+    } else {
+        0
+    }
+}
+
+/// ↑/↓：按列上下移动（目标行里找离当前 x 最近的字符边界）
+unsafe fn note_move_line(st: &mut State, dir: i32) {
+    let dc = st.c_lo_dc;
+    if dc.0.is_null() {
+        return;
+    }
+    let ta = nt_text_rect();
+    let text = note_text(st).to_string();
+    let lines = note_lines(st, dc, &text, ta.right - ta.left);
+    if lines.is_empty() {
+        return;
+    }
+    let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
+    let target = if dir < 0 { cur.saturating_sub(1) } else { (cur + 1).min(lines.len() - 1) };
+    if target == cur {
+        return;
+    }
+    let (a0, _) = lines[cur];
+    let x = s_text_w(dc, &text[a0..st.nt_caret.max(a0)], st.cf_note);
+    let (ta0, tb0) = lines[target];
+    let mut best = ta0;
+    let mut bestd = i32::MAX;
+    let mut idx = ta0;
+    loop {
+        let d = (s_text_w(dc, &text[ta0..idx], st.cf_note) - x).abs();
+        if d < bestd {
+            bestd = d;
+            best = idx;
+        }
+        if idx >= tb0 {
+            break;
+        }
+        match text[idx..].chars().next() {
+            Some(c) if idx + c.len_utf8() <= tb0 => idx += c.len_utf8(),
+            _ => break,
+        }
+    }
+    st.nt_caret = best;
+    st.nt_blink = true;
+}
+
+/// 鼠标点在正文里 → 光标落到最近的字符边界（**点哪写哪**）。
+/// 点在最后一行下面 = 跳到末尾（编辑器都这样）。
+unsafe fn note_click(st: &mut State, x: i32, y: i32) {
+    let dc = st.c_lo_dc;
+    if dc.0.is_null() {
+        return;
+    }
+    let ta = nt_text_rect();
+    let text = note_text(st).to_string();
+    let mut lines = note_lines(st, dc, &text, ta.right - ta.left);
+    if lines.is_empty() {
+        st.nt_caret = text.len();
+        st.nt_blink = true;
+        return;
+    }
+    let lh = c_font_h(dc, st.cf_note).max(1);
+    let scroll = note_scroll(st, dc, &lines, lh);
+    let row = ((y - ta.top) / lh).max(0) as usize;
+    if scroll + row >= lines.len() {
+        st.nt_caret = text.len();
+        st.nt_blink = true;
+        return;
+    }
+    let (a, b) = lines[scroll + row];
+    let mut best = a;
+    let mut bestd = i32::MAX;
+    let mut idx = a;
+    loop {
+        let d = (ta.left + s_text_w(dc, &text[a..idx], st.cf_note) - x).abs();
+        if d < bestd {
+            bestd = d;
+            best = idx;
+        }
+        if idx >= b {
+            break;
+        }
+        match text[idx..].chars().next() {
+            Some(c) if idx + c.len_utf8() <= b => idx += c.len_utf8(),
+            _ => break,
+        }
+    }
+    st.nt_caret = best;
+    st.nt_blink = true;
+    let _ = &mut lines;
+}
+
+/// 翻到第 `p` 页（越界不动），返回「有没有真的翻」
+unsafe fn note_go(st: &mut State, p: usize) -> bool {
+    if p >= st.nt_pages.len() || p == st.nt_cur {
+        return false;
+    }
+    st.nt_cur = p;
+    st.nt_caret = note_text(st).len();
+    st.nt_comp.clear();
+    st.nt_lay = None;
+    st.nt_blink = true;
+    true
+}
+
+/// 新开一页：插到**第一页**并跳过去（最新那张永远在最上面）；当前页空着 → 什么都不做。
+unsafe fn note_new_page(st: &mut State, hwnd: HWND) {
+    if note_text(st).trim().is_empty() || st.nt_pages.len() >= NT_CAP_PAGES {
+        return;
+    }
+    // 新页放在**第一页**（用户 2026-11-02：「新开一页应该是第一页而不是第二页吧」）——
+    // 便签是"往上摞的纸"：最新那张在最上面，越往下越旧。
+    st.nt_pages.insert(0, String::new());
+    st.nt_cur = 0;
+    st.nt_caret = 0;
+    st.nt_plus_hot = false;
+    st.nt_comp.clear();
+    st.nt_lay = None;
+    st.nt_blink = true;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+}
+
+/// Ctrl+V：把剪贴板里的**文字**接到光标处（v1 不接图片/文件）
+unsafe fn note_paste(st: &mut State, hwnd: HWND) {
+    let mut txt = String::new();
+    if OpenClipboard(HWND(ptr::null_mut())).is_ok() {
+        if let Ok(h) = GetClipboardData(13) {
+            let hg = HGLOBAL(h.0);
+            let p = GlobalLock(hg);
+            if !p.is_null() {
+                let ws = p as *const u16;
+                let cap = (GlobalSize(hg) / 2).min((NT_MAX_CHARS + 1) as usize);
+                let mut len = 0usize;
+                while len < cap && *ws.add(len) != 0 {
+                    len += 1;
+                }
+                txt = String::from_utf16_lossy(std::slice::from_raw_parts(ws, len));
+                let _ = GlobalUnlock(hg);
+            }
+        }
+        let _ = CloseClipboard();
+    }
+    if txt.is_empty() {
+        return;
+    }
+    let clean: String = txt.chars().filter(|c| *c != '\r').collect();
+    note_insert(st, hwnd, &clean);
+}
+
+/// Ctrl+C：v1 没有选区，复制**整页**（记完的东西顺手带走）
+unsafe fn note_copy(st: &mut State) {
+    let txt = note_text(st).to_string();
+    if txt.is_empty() || OpenClipboard(HWND(ptr::null_mut())).is_err() {
+        return;
+    }
+    let _ = CloseClipboard();
+    let mut bytes: Vec<u8> = Vec::with_capacity((txt.len() + 1) * 2);
+    for c in txt.encode_utf16().chain(std::iter::once(0)) {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    if clip_put(13, &bytes) {
+        // 自己写的那一次别记进历史（和 `clip_paste` 同一条规矩）
+        CLIP_SELF_SEQ.store(GetClipboardSequenceNumber(), Ordering::SeqCst);
+    }
+}
+
+/// 当前页 → 排版行区间（带一条缓存：光标每 500ms 闪一次就重排一遍太浪费）
+unsafe fn note_lines(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<(usize, usize)> {
+    let h = cl_hash(text);
+    if let Some((th, w, lines)) = &st.nt_lay {
+        if *th == h && *w == maxw {
+            return lines.clone();
+        }
+    }
+    let (lines, _more) = cl_layout(dc, text, st.cf_note, maxw, 20000);
+    st.nt_lay = Some((h, maxw, lines.clone()));
+    lines
+}
+
+/// 字节下标落在第几行（`lines` 是 `cl_layout` 输出的 (start,end)，start 单调递增）
+fn note_line_of(lines: &[(usize, usize)], idx: usize) -> usize {
+    lines
+        .iter()
+        .rposition(|(a, _)| *a <= idx)
+        .unwrap_or(0)
+        .min(lines.len().saturating_sub(1))
+}
+
+/// 光标在卡片坐标里的落点（IME 候选窗用它定位）。量不出来就给正文区左上角。
+unsafe fn note_caret_point(st: &State) -> (i32, i32) {
+    let ta = nt_text_rect();
+    if st.c_lo_dc.0.is_null() {
+        return (ta.left, ta.top);
+    }
+    let Some((_, _w, lines)) = &st.nt_lay else {
+        return (ta.left, ta.top);
+    };
+    if lines.is_empty() {
+        return (ta.left, ta.top);
+    }
+    let lh = c_font_h(st.c_lo_dc, st.cf_note).max(1);
+    let full = {
+        let mut s = note_text(st).to_string();
+        s.push_str(&st.nt_comp);
+        s
+    };
+    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
+    let scroll = lines.len().saturating_sub(visible);
+    let (a, b) = lines[lines.len() - 1];
+    let tail = full.get(a..b).unwrap_or("");
+    let x = (ta.left + s_text_w(st.c_lo_dc, tail, st.cf_note)).min(ta.right - 4);
+    let y = ta.top + (lines.len() - 1 - scroll) as i32 * lh;
+    (x, y)
+}
+
+/// IME 组字窗/候选窗贴到光标位置（不设的话会飘到窗口默认角落，中文输入没法用）
+unsafe fn note_ime_place(st: &State, hwnd: HWND) {
+    let himc = ImmGetContext(hwnd);
+    if himc.0.is_null() {
+        return;
+    }
+    let (x, y) = note_caret_point(st);
+    let mut cf = COMPOSITIONFORM {
+        dwStyle: CFS_POINT,
+        ptCurrentPos: POINT { x: x + S_M, y: y + S_M },
+        rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+    };
+    let _ = ImmSetCompositionWindow(himc, &mut cf);
+    let _ = ImmReleaseContext(hwnd, himc);
+}
+
+/// IME 组字串（`flag` = `GCS_COMPSTR` / `GCS_RESULTSTR` 的数值）
+unsafe fn imm_string(h: HIMC, flag: IME_COMPOSITION_STRING) -> String {
+    let n = ImmGetCompositionStringW(h, flag, None, 0);
+    if n <= 0 {
+        return String::new();
+    }
+    let mut buf: Vec<u16> = vec![0; (n as usize + 1) / 2];
+    let got = ImmGetCompositionStringW(h, flag, Some(buf.as_mut_ptr() as *mut c_void), n as u32);
+    if got <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..(got as usize) / 2])
+}
+
+unsafe fn note_draw(st: &mut State, dc: HDC) {
+    let pal = pal_of(st.glass_liquid);
+    let frost = !st.card_bg.is_empty();
+    let s = nt_sheet();
+    if frost {
+        // 毛玻璃：整张卡就是那块玻璃，中间的纸是半透明的 —— 底下的模糊桌面能透出来
+        g_rrect_alpha(dc, s, CL_RAD, pal.paper, 132);
+        g_rrect_stroke(dc, s, CL_RAD, mixc(pal.edge, pal.ink, 0.25), 1);
+    } else {
+        // 纸面：卡身用 **wall**（比纸深一档），中间那张纸才是 paper ——
+        // 像一张纸放在桌面上；两层都用 paper 的话纸边根本看不出来（离屏 dump 抓到的）。
+        g_fill(dc, RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M }, pal.wall);
+        g_shadow(dc, s, CL_RAD, &pal);
+        g_rrect(dc, s, CL_RAD, pal.paper, Some(mixc(pal.edge, pal.ink, 0.18)), 1);
+    }
+    let ta = nt_text_rect();
+    let page = note_text(st).to_string();
+    let comp = st.nt_comp.clone();
+    // v2：正文 + 组字串按**光标位置**拼起来画（组字串就在光标处上屏）
+    let caret = st.nt_caret.min(page.len());
+    let full = if comp.is_empty() {
+        page.clone()
+    } else {
+        format!("{}{}{}", &page[..caret], comp, &page[caret..])
+    };
+    let caret_at = caret + comp.len();
+    let mut lines = note_lines(st, dc, &full, ta.right - ta.left);
+    // 结尾是换行时 `cl_layout` 只给到这一行为止（它是"填满一行"输出，不留空气行），
+    // 光标就会被画回**上一行**行尾 —— 用户 2026-11-01 报「回车后光标位置不对」。
+    if lines.is_empty() || full.ends_with('\n') {
+        lines.push((full.len(), full.len()));
+    }
+    let lh = c_font_h(dc, st.cf_note).max(1);
+    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
+    // 光标在哪一行（取最后一个 `a <= caret` 的行）
+    let lno = note_line_of(&lines, caret_at);
+    // 滚动只跟光标走：v1 是"永远滚到底"，v2 点哪写哪之后必须跟着光标
+    let scroll = if lno + 1 > visible {
+        (lno + 1 - visible).min(lines.len().saturating_sub(visible))
+    } else {
+        0
+    };
+    // 组字区间（在 full 里的字节范围），用来画淡色 + 下划线
+    let comp_a = caret;
+    let comp_b = caret + comp.len();
+    for (i, (a, b)) in lines.iter().enumerate().skip(scroll) {
+        let y = ta.top + (i - scroll) as i32 * lh;
+        if y + lh > ta.bottom {
+            break;
+        }
+        let seg = &full[*a..*b];
+        if !seg.is_empty() {
+            let overlaps_comp = !comp.is_empty() && *b > comp_a && *a < comp_b;
+            let ink = if overlaps_comp { pal.edge } else { pal.ink };
+            c_text(dc, seg, RECT { left: ta.left, top: y, right: ta.right, bottom: y + lh }, ink, st.cf_note, 0);
+        }
+        if !comp.is_empty() && *b > comp_a && *a < comp_b {
+            let x0 = ta.left + s_text_w(dc, &full[*a..comp_a.max(*a)], st.cf_note);
+            let x1 = ta.left + s_text_w(dc, &full[*a..comp_b.min(*b)], st.cf_note);
+            c_line(dc, x0, y + lh - 2, x1.max(x0 + 2), y + lh - 2, 1, pal.edge);
+        }
+    }
+    // 光标：组字期间藏起来（IME 自己有）
+    if comp.is_empty() && st.nt_blink {
+        let y = ta.top + (lno.saturating_sub(scroll)) as i32 * lh;
+        let (a, _) = lines[lno];
+        let x = (ta.left + s_text_w(dc, &full[a..caret_at.max(a)], st.cf_note)).min(ta.right - 3);
+        if y + lh <= ta.bottom {
+            // 1.5 逻辑 px 圆头：1px 的竖线在浅色纸面 + 2 倍降采样下几乎看不见（离屏出图核对过）
+            c_stroke(dc, x as f32, (y + 2) as f32, x as f32, (y + lh - 2) as f32, SS + SS / 2, pal.ink);
+        }
+    }
+
+    // 底栏：页点 + 「第 x / y 页」+ 右侧「＋ 新页」
+    let n = st.nt_pages.len();
+    let fy0 = CL_H - CL_PAD - NT_FOOT_H;
+    let fy1 = CL_H - CL_PAD;
+    for i in 0..n.min(16) {
+        let d = nt_dot_rect(i);
+        let c = if i == st.nt_cur {
+            pal.block
+        } else if i == st.nt_dot_hover {
+            mixc(pal.edge, pal.ink, 0.6)
+        } else {
+            mixc(pal.edge, pal.paper, 0.4)
+        };
+        g_rrect(dc, d, 3, c, None, 0);
+    }
+    if n > 1 {
+        let info = format!("第 {} / {} 页", st.nt_cur + 1, n);
+        let x0 = CL_PAD + n.min(16) as i32 * 11 + 4;
+        c_text(dc, &info, RECT { left: x0, top: fy0, right: x0 + 140, bottom: fy1 }, pal.edge, st.cf_small, 0);
+    }
+    // 「＋ 新页」：空页时置灰（点了也没意义），有字才亮起来
+    {
+        let r = nt_plus_rect();
+        let on = nt_can_new_page(st);
+        let hv = if on && st.nt_plus_hot { 1.0 } else { 0.0 };
+        g_rrect(dc, r, 7, mixc(pal.paper, pal.ink, 0.05 + 0.10 * hv), Some(mixc(pal.edge, pal.ink, 0.30 + 0.2 * hv)), 1);
+        let ink = if on { mixc(pal.ink, pal.edge, 0.35 - 0.35 * hv) } else { mixc(pal.edge, pal.paper, 0.35) };
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        c_stroke(dc, cx as f32, (cy - 5) as f32, cx as f32, (cy + 5) as f32, SS, ink);
+        c_stroke(dc, (cx - 5) as f32, cy as f32, (cx + 5) as f32, cy as f32, SS, ink);
+    }
+}
+
+unsafe fn open_note(st: &mut State) {
+    let h = NOTE_HWND.load(Ordering::SeqCst);
+    if h == 0 || st.nt_shown {
+        return;
+    }
+    close_clip(st); // 两张卡互斥：同一个画布、同一把焦点
+    let hwnd = HWND(h as *mut c_void);
+    st.nt_shown = true;
+    st.nt_blink = true;
+    st.nt_comp.clear();
+    st.nt_dot_hover = usize::MAX;
+    st.nt_lay = None;
+    if st.nt_pages.is_empty() {
+        st.nt_pages.push(String::new());
+    }
+    st.nt_cur = 0;                     // 呼出就落在第 1 页（最新那页）
+    st.nt_caret = note_text(st).len(); // 呼出即"接着往下写"
+    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    st.nt_x = (sw - CL_WW) / 2;
+    st.nt_y = (sh - CL_HH) / 2;
+    let _ = SetWindowPos(hwnd, None, st.nt_x, st.nt_y, CL_WW, CL_HH, SWP_NOZORDER);
+    // 毛玻璃底：必须在 `SW_SHOW` 之前抓（那时卡片还没显示，抓不到自己）
+    clip_snap_bg(st, st.nt_x, st.nt_y);
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    focus_window(hwnd);
+    NOTE_LIVE.store(true, Ordering::SeqCst);
+    st.nt_fg0 = now_s();
+    let _ = SetTimer(hwnd, TIMER_NOTE_BLINK, 500, None);
+    let _ = SetTimer(hwnd, TIMER_CARD_FG, 250, None);
+    note_present(st);
+}
+
+unsafe fn close_note(st: &mut State) {
+    if !st.nt_shown {
+        return;
+    }
+    st.nt_shown = false;
+    NOTE_LIVE.store(false, Ordering::SeqCst);
+    note_save(st);
+    st.card_bg.clear();
+    let h = NOTE_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        let hwnd = HWND(h as *mut c_void);
+        let _ = KillTimer(hwnd, TIMER_NOTE_BLINK);
+        let _ = KillTimer(hwnd, TIMER_NOTE_SAVE);
+        let _ = KillTimer(hwnd, TIMER_CARD_FG);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    clip_free(st);
+}
+
+unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        let mut ps = PAINTSTRUCT::default();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    let lx = || ((l.0 & 0xFFFF) as i16 as i32) - S_M;
+    let ly = || (((l.0 >> 16) & 0xFFFF) as i16 as i32) - S_M;
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(ptr::null_mut())));
+            LRESULT(1)
+        }
+        WM_NCHITTEST => {
+            // lParam 是屏幕坐标（和设置页 / 剪贴板卡片同一个坑）
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let y = (((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top - S_M;
+            if nt_drag_band(y) {
+                return LRESULT(HTCAPTION as isize);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_MOUSEMOVE => {
+            let st = state_of(hwnd);
+            if !st.nt_tracking {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+                st.nt_tracking = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            let (x, y) = (lx(), ly());
+            let mut hit = usize::MAX;
+            for i in 0..st.nt_pages.len().min(16) {
+                if in_rect(nt_dot_rect(i), x, y) {
+                    hit = i;
+                    break;
+                }
+            }
+            let plus = in_rect(nt_plus_rect(), x, y) && nt_can_new_page(st);
+            if hit != st.nt_dot_hover || plus != st.nt_plus_hot {
+                st.nt_dot_hover = hit;
+                st.nt_plus_hot = plus;
+                note_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            let st = state_of(hwnd);
+            st.nt_tracking = false;
+            if st.nt_dot_hover != usize::MAX || st.nt_plus_hot {
+                st.nt_dot_hover = usize::MAX;
+                st.nt_plus_hot = false;
+                note_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let st = state_of(hwnd);
+            let (x, y) = (lx(), ly());
+            let mut on_dot = false;
+            for i in 0..st.nt_pages.len().min(16) {
+                if in_rect(nt_dot_rect(i), x, y) {
+                    on_dot = true;
+                    if note_go(st, i) {
+                        note_present(st);
+                    }
+                    break;
+                }
+            }
+            // 「＋ 新页」：右下角那颗按钮
+            if in_rect(nt_plus_rect(), x, y) {
+                if nt_can_new_page(st) {
+                    note_new_page(st, hwnd);
+                    note_present(st);
+                }
+                return LRESULT(0);
+            }
+            // 点在纸上（不在页点、不在拖拽带）= 把光标挪过去（v2 点哪写哪）
+            if !on_dot && y >= nt_text_rect().top - 6 && in_rect(nt_sheet(), x, y) {
+                note_click(st, x, y);
+                note_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let st = state_of(hwnd);
+            let d = ((w.0 >> 16) & 0xFFFF) as u16 as i16;
+            let moved = if d > 0 {
+                st.nt_cur > 0 && note_go(st, st.nt_cur - 1)
+            } else {
+                note_go(st, st.nt_cur + 1)
+            };
+            if moved {
+                note_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let st = state_of(hwnd);
+            match w.0 as usize {
+                TIMER_NOTE_BLINK => {
+                    if st.nt_shown {
+                        st.nt_blink = !st.nt_blink;
+                        note_present(st);
+                    }
+                }
+                TIMER_NOTE_SAVE => {
+                    let _ = KillTimer(hwnd, TIMER_NOTE_SAVE);
+                    note_save(st);
+                }
+                TIMER_CARD_FG => {
+                    // 失焦看门狗：前台不是自己（而是别的程序）就收。
+                    // ⚠️ 只靠 `WM_ACTIVATE` 不够 —— 常驻轮盘是 NOACTIVATE，
+                    //    点它/桌面/任务栏都不会让卡片失活（用户 2026-11-01 报）。
+                    if st.nt_shown && now_s() - st.nt_fg0 > CARD_FG_GRACE {
+                        let fg = GetForegroundWindow();
+                        if !fg.is_invalid() && fg != hwnd {
+                            close_note(st);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            let st = state_of(hwnd);
+            let c = w.0 as u32;
+            match c {
+                0x08 => note_backspace(st, hwnd),
+                0x0D => note_insert(st, hwnd, "\n"),
+                0x1B => {
+                    close_note(st);
+                    return LRESULT(0);
+                }
+                0x09 => note_insert(st, hwnd, "    "),
+                _ => {
+                    if let Some(ch) = char::from_u32(c) {
+                        if !ch.is_control() {
+                            let mut b = [0u8; 4];
+                            let s = ch.encode_utf8(&mut b).to_string();
+                            note_insert(st, hwnd, &s);
+                        }
+                    }
+                }
+            }
+            note_present(st);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let st = state_of(hwnd);
+            let vk = w.0 as u32;
+            // ⚠️ 用 `GetAsyncKeyState` 而不是 `GetKeyState`：后者取的是**本线程消息队列**里的
+            // 按键状态，自绘的呼出型窗口在自动化 / 非前台场景下经常读到 0（组合键就废了）
+            let ctrl = GetAsyncKeyState(0x11) as u16 & 0x8000 != 0;
+            let mut moved = false;
+            match vk {
+                0x25 if !ctrl => {
+                    note_left(st);
+                    moved = true;
+                }
+                0x27 if !ctrl => {
+                    note_right(st);
+                    moved = true;
+                }
+                0x24 => {
+                    // Home：本行开头
+                    if !st.c_lo_dc.0.is_null() {
+                        let ta = nt_text_rect();
+                        let text = note_text(st).to_string();
+                        let lines = note_lines(st, st.c_lo_dc, &text, ta.right - ta.left);
+                        if !lines.is_empty() {
+                            let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
+                            st.nt_caret = lines[cur].0;
+                            st.nt_blink = true;
+                            moved = true;
+                        }
+                    }
+                }
+                0x23 => {
+                    // End：本行结尾
+                    if !st.c_lo_dc.0.is_null() {
+                        let ta = nt_text_rect();
+                        let text = note_text(st).to_string();
+                        let lines = note_lines(st, st.c_lo_dc, &text, ta.right - ta.left);
+                        if !lines.is_empty() {
+                            let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
+                            st.nt_caret = lines[cur].1;
+                            st.nt_blink = true;
+                            moved = true;
+                        }
+                    }
+                }
+                0x26 if !ctrl => {
+                    note_move_line(st, -1);
+                    moved = true;
+                }
+                0x28 if !ctrl => {
+                    note_move_line(st, 1);
+                    moved = true;
+                }
+                0x25 | 0x27 if ctrl => {
+                    if vk == 0x27 {
+                        moved = note_go(st, st.nt_cur + 1);
+                    } else {
+                        moved = st.nt_cur > 0 && note_go(st, st.nt_cur - 1);
+                    }
+                }
+                0x21 => moved = st.nt_cur > 0 && note_go(st, st.nt_cur - 1),
+                0x22 => moved = note_go(st, st.nt_cur + 1),
+                0x4E if ctrl => {
+                    note_new_page(st, hwnd);
+                    moved = true;
+                }
+                0x56 if ctrl => {
+                    note_paste(st, hwnd);
+                    moved = true;
+                }
+                0x43 if ctrl => note_copy(st),
+                _ => {}
+            }
+            if moved {
+                note_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION => {
+            let st = state_of(hwnd);
+            note_ime_place(st, hwnd);
+            LRESULT(0)
+        }
+        WM_IME_COMPOSITION => {
+            let st = state_of(hwnd);
+            let flags = l.0 as u32;
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                if flags & GCS_RESULTSTR.0 != 0 {
+                    let s = imm_string(himc, GCS_RESULTSTR);
+                    st.nt_comp.clear();
+                    if !s.is_empty() {
+                        note_insert(st, hwnd, &s);
+                    }
+                } else if flags & GCS_COMPSTR.0 != 0 {
+                    st.nt_comp = imm_string(himc, GCS_COMPSTR);
+                    st.nt_lay = None;
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+            note_present(st);
+            LRESULT(0)
+        }
+        WM_IME_ENDCOMPOSITION => {
+            let st = state_of(hwnd);
+            st.nt_comp.clear();
+            st.nt_lay = None;
+            note_present(st);
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            // 呼出型窗口：焦点一走就收起（和剪贴板卡片同一条）
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                close_note(state_of(hwnd));
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            close_note(state_of(hwnd));
+            LRESULT(0)
+        }
+        WM_APP_NOTESHOW => {
+            let st = state_of(hwnd);
+            if w.0 == 0 {
+                close_note(st);
+            } else {
+                open_note(st);
+            }
+            LRESULT(0)
+        }
+        WM_APP_NOTEINFO => {
+            let st = state_of(hwnd);
+            let v = match w.0 as u32 {
+                0 => st.nt_pages.len(),
+                1 => st.nt_cur,
+                2 => note_text(st).chars().count(),
+                3 => st.nt_shown as usize,
+                4 => cl_hash(note_text(st)) as usize,
+                // 5 = 光标字节下标；6 = 首个字符的码点（"点哪写哪"的断言用）
+                5 => st.nt_caret,
+                6 => note_text(st).chars().next().map(|c| c as usize).unwrap_or(0),
+                _ => 0,
+            };
+            LRESULT(v as isize)
         }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
@@ -20859,6 +23282,8 @@ fn main() {
             lpfnWndProc: Some(clip_proc),
             hInstance: hinst,
             lpszClassName: PCWSTR(ccls.as_ptr()),
+            // CS_DBLCLKS：头部那条既是拖拽区也是「双击回居中」（见 WM_NCLBUTTONDBLCLK）
+            style: CS_DBLCLKS,
             ..Default::default()
         });
         let chwnd = CreateWindowExW(
@@ -20882,6 +23307,38 @@ fn main() {
         clip_load(&mut st);
         if args.iter().any(|a| a == "--clip-show") {
             open_clip(&mut st);
+        }
+
+        // 便签卡片：和剪贴板卡片同尺寸 / 同材质 / 同一条渲染管线（见 `card_render`）
+        let ncls: Vec<u16> = wide("RLNote");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(note_proc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(ncls.as_ptr()),
+            style: CS_DBLCLKS,
+            ..Default::default()
+        });
+        let nhwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0),
+            PCWSTR(ncls.as_ptr()),
+            PCWSTR(wide(&format!("PiPieNote{}", suffix)).as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            CL_WW,
+            CL_HH,
+            HWND(ptr::null_mut()),
+            HMENU(ptr::null_mut()),
+            hinst,
+            None,
+        )
+        .unwrap_or(HWND(ptr::null_mut()));
+        SetWindowLongPtrW(nhwnd, GWLP_USERDATA, p as isize);
+        NOTE_HWND.store(nhwnd.0 as isize, Ordering::SeqCst);
+        // 便签从 `%APPDATA%\PiPie\notes.txt` 恢复（空页不落盘，见 `note_save`）
+        note_load(&mut st);
+        if args.iter().any(|a| a == "--note-show") {
+            open_note(&mut st);
         }
 
         // --settings：启动后直接把设置页调出来（便于做快捷方式 / 自动化核对）
@@ -20908,11 +23365,8 @@ fn main() {
         // 剪贴板变化监听挂在**宿主窗口**上：它不可见但一直活着，`WM_CLIPBOARDUPDATE`
         // 才有地方落。开关（`st.cl_on`）判在 `clip_capture` 里 —— 这样托盘勾选即时生效。
         let _ = AddClipboardFormatListener(hwnd);
-        let hk = RegisterHotKey(hwnd, HOTKEY_CLIP, MOD_CONTROL | MOD_ALT, 0x56); // Ctrl+Alt+V
-        if hk.is_err() {
-            // 撞键（别的程序也占了 Ctrl+Alt+V）时托盘那一项仍然能用，只提醒一句
-            println!("[!] 剪贴板热键 Ctrl+Alt+V 注册失败，可用托盘菜单「剪贴板历史」");
-        }
+        // 「Ctrl+Alt+V」整条删掉（用户 2026-11-01：「也不需要快捷键」）：卡片只有两个入口
+        // —— 轮盘上那格「剪贴板」和设置页的开关。少占一个全局热键也少一类撞键。
 
         // 钩子装在专用线程里（见 set_running 注释）
         let listen_on = st.listening;
