@@ -33,10 +33,15 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, SetProcessWorkingSetSize};
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, MapVirtualKeyW, RegisterHotKey, SetFocus, UnregisterHotKey,
+    MAPVK_VSC_TO_VK_EX, MOD_ALT, MOD_CONTROL,
+};
+
 // 输入法：自绘窗口没有原生 EDIT，组字串得自己取（见便签卡片的 WM_IME_COMPOSITION）
 use windows::Win32::UI::Input::Ime::{
-    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, COMPOSITIONFORM,
+    ImmGetCompositionStringW, ImmGetContext, ImmGetVirtualKey, ImmReleaseContext,
+    ImmSetCompositionWindow, COMPOSITIONFORM,
     CFS_POINT, GCS_COMPSTR, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
 };
 use windows::Win32::UI::Shell::{AssocQueryStringW, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, DROPFILES, HDROP, ShellExecuteW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_MESSAGE, NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
@@ -732,6 +737,25 @@ static NOTE_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 便签卡片**当前开着**。和 `CLIP_LIVE` 一样：唯一的读者是低级鼠标钩子
 /// （滚轮放行 + 「点到卡片外面就收起」），那边碰不到 `State`，只能用原子量。
 static NOTE_LIVE: AtomicBool = AtomicBool::new(false);
+/// 便签正在开**系统文件对话框**（图片按钮）。钩子线程看不到 State，只能读原子量：
+/// 对话框上的点击都在卡片外，不挡的话第一下就把便签收掉了（用户 2026-11-02 报）。
+static NOTE_MODAL: AtomicBool = AtomicBool::new(false);
+/// 抓屏太慢（> `CAP_SLOW_MS`）→ 本次运行不再抓，玻璃/毛玻璃一律退回纸面。
+/// 公司电脑上常见：DLP / 录屏审计会钩住 GDI 的 BitBlt，一次抓屏能慢十倍，
+/// 于是「一呼出就卡一下」，轮盘和卡片都中招（用户 2026-11-02 报）。
+static CAP_SLOW: AtomicBool = AtomicBool::new(false);
+/// 判定阈值（毫秒）。正常机器 475²/524² 抓 + 模糊 ≈ 5~15ms
+const CAP_SLOW_MS: u128 = 150;
+/// 抓出来**全黑**的次数（DLP / 受保护会话会稳定返回黑帧）。连续两次 → 本次运行不再抓：
+/// 反正每次都黑，白抓只是每次呼出都多等一拍（用户 2026-11-02 公司电脑）。
+static CAP_BLACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 抓屏到底还能不能用（慢过一次 / 黑过两次 → 不能）
+fn capture_dead() -> bool {
+    CAP_SLOW.load(Ordering::Relaxed) || CAP_BLACK.load(Ordering::Relaxed) >= 2
+}
+/// 慢帧日志只记前 20 条（一次 hover 动画能出十几帧，别把日志刷爆）
+static SLOW_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// 「这一条是我们自己写回的」—— 记 `GetClipboardSequenceNumber()`。
 /// 写回后系统还会广播一次 `WM_CLIPBOARDUPDATE`，不认出来就会把 PiPie 的写回
 /// 再记一遍（套娃：历史里出现自己的历史）。
@@ -1235,15 +1259,31 @@ struct State {
     cf_bold: HFONT,
     /// 便签正文（15px，比卡片的块内正文大一档 —— 这是「要用来看/写」的字）
     cf_note: HFONT,
+    /// 便签的 Markdown 块：三级标题 + 等宽（代码块）
+    cf_h1: HFONT,
+    cf_h2: HFONT,
+    cf_h3: HFONT,
+    cf_mono: HFONT,
+    /// 行内样式：粗体 / 斜体（15px，和正文同字号）
+    cf_b15: HFONT,
+    cf_i15: HFONT,
     /// 毛玻璃底：卡片**下面**那一块桌面（已模糊 + 纸色染色，`CL_WW²` 的 BGRA，1×）。
     /// 空 = 纸质模式 / 抓屏失败 → 退回实心 paper。
     /// ⚠️ 只在呼出那一刻抓一次（那时卡片还没显示，抓不到自己）；拖走卡片后底图就过期，
     ///    但毛玻璃本来就是"模糊的桌面"，过期只表现为模糊内容不跟手 —— 可以接受。
     /// ⚠️ 剪贴板卡片和便签卡片**共用**这一块（两张卡同时只开一个）。
     card_bg: Vec<u8>,
+    /// `card_bg` 预先放大到 hi 画布尺寸的那一份（`CL_WW*SS ²`）。
+    /// 为什么：每帧用 `StretchDIBits(HALFTONE)` 把 524² 拉到 1048² 是整帧里最贵的一步
+    /// （弱一点的机器上一帧能到 10ms+）。放大一次、之后每帧只做一次 `BitBlt`（内存拷贝）。
+    card_bg_hi_bits: *mut u8,
+    card_bg_hi_dc: HDC,
+    card_bg_hi_bmp: HBITMAP,
     // ── 便签卡片（`RLNote`）──
     /// 便签开着（钩子的「点外面收卡」和滚轮放行看它）
     nt_shown: bool,
+    /// 网络/文件对话框开着：这段时间失焦看门狗不许收卡片
+    nt_picking: bool,
     /// 每页一段纯文本；空页不落盘（"扔掉一页"= 把字删光）
     nt_pages: Vec<String>,
     nt_cur: usize,
@@ -1255,15 +1295,48 @@ struct State {
     nt_tracking: bool,
     /// 卡片弹出的时刻（`now_s()`）——失焦看门狗前 `CARD_FG_GRACE` 秒不查
     nt_fg0: f64,
-    /// 悬停的页点（`usize::MAX` = 没悬停）
-    nt_dot_hover: usize,
-    /// 光标停在「＋ 新页」上
-    nt_plus_hot: bool,
+    /// 页码器悬停：-1 = 左箭头，1 = 右箭头，0 = 没悬停
+    nt_pager_hot: i32,
+    /// 底栏工具悬停：0 无 / 1 待办 / 2 删除线 / 3 图片 / 4 新页
+    nt_tool_hot: i32,
+    /// 删除页的 toast（「已删除 · 撤销」）：文案 + 到期时刻
+    nt_toast: String,
+    nt_toast_until: f64,
+    /// toast 的撤销数据：`(原下标, 标题, 正文)`
+    nt_toast_undo: Option<(usize, String, String)>,
+    /// toast 上的「撤销」是否悬停
+    nt_toast_hot: bool,
+    /// 「加粗模式」：点 B 之后直接打粗体（不把 `**` 露给用户）。
+    /// `nt_bold_end` = 当前加粗段的闭合标记起点（`usize::MAX` = 还没打过字）
+    nt_bold_want: bool,
+    nt_bold_end: usize,
     nt_x: i32,
     nt_y: i32,
-    /// 排版缓存：(文本摘要, 框宽, 行区间)。便签每帧都要排版，
+    /// 便签里贴进来的图片（按文件名缓存解码结果）
+    nt_imgs: Vec<NtImg>,
+    /// 每页的标题（和 `nt_pages` 一一对应）。缺省 = 「便签 N」
+    nt_titles: Vec<String>,
+    /// 标题编号的自增序列（新页 = `便签 {seq}`）
+    nt_tseq: usize,
+    /// 选区**锚点**（`usize::MAX` = 没有选区）。选区 = 锚点..光标。
+    nt_sel: usize,
+    /// 鼠标正按着拖选
+    nt_sel_drag: bool,
+    /// 正在编辑**标题**（键盘 / 组字都进标题，不进正文）
+    nt_edit_title: bool,
+    nt_tcaret: usize,
+    /// 撤销 / 重做栈：`(页号, 整页文本, 光标)`。便签每页都很小（≤5 万字），整页快照最简单可靠。
+    nt_undo: Vec<(usize, String, usize)>,
+    nt_redo: Vec<(usize, String, usize)>,
+    /// 排版缓存：(文本摘要, 框宽, 视觉行)。便签每帧都要排版，
     /// 而 GDI 量字宽是逐段调用 —— 不复用就会在光标闪烁时每 500ms 白算一遍。
-    nt_lay: Option<(u64, i32, Vec<(usize, usize)>)>,
+    nt_lay: Option<(u64, i32, Vec<NtLine>)>,
+    /// 正文滚动位置 = **第一条可见视觉行**的下标。超过一屏才有效；
+    /// 键盘移动光标时由 `note_follow_caret` 自动跟随（用户 2026-11-02 要的滚动）。
+    nt_scroll: usize,
+    /// 上次绘制时的（正文摘要, 光标）：只有它们变了才把滚动拉回光标。
+    /// ⚠️ 每帧都跟随的话，用户滚轮刚滚走就被拉回去 —— 滚不动。
+    nt_scroll_seen: (u64, usize),
     /// 超采样画布（同设置页：hi = SS 倍 GDI 画布，lo = 降采样结果直接上屏）
     c_hi_bits: *mut u8,
     c_hi_dc: HDC,
@@ -1510,6 +1583,12 @@ impl State {
             cf_small: HFONT(ptr::null_mut()),
             cf_bold: HFONT(ptr::null_mut()),
             cf_note: HFONT(ptr::null_mut()),
+            cf_h1: HFONT(ptr::null_mut()),
+            cf_h2: HFONT(ptr::null_mut()),
+            cf_h3: HFONT(ptr::null_mut()),
+            cf_mono: HFONT(ptr::null_mut()),
+            cf_b15: HFONT(ptr::null_mut()),
+            cf_i15: HFONT(ptr::null_mut()),
             c_hi_bits: ptr::null_mut(),
             c_hi_dc: HDC(ptr::null_mut()),
             c_hi_bmp: HBITMAP(ptr::null_mut()),
@@ -1517,7 +1596,11 @@ impl State {
             c_lo_dc: HDC(ptr::null_mut()),
             c_lo_bmp: HBITMAP(ptr::null_mut()),
             card_bg: Vec::new(),
+            card_bg_hi_bits: ptr::null_mut(),
+            card_bg_hi_dc: HDC(ptr::null_mut()),
+            card_bg_hi_bmp: HBITMAP(ptr::null_mut()),
             nt_shown: false,
+            nt_picking: false,
             nt_pages: Vec::new(),
             nt_cur: 0,
             nt_caret: 0,
@@ -1525,11 +1608,28 @@ impl State {
             nt_blink: true,
             nt_tracking: false,
             nt_fg0: 0.0,
-            nt_dot_hover: usize::MAX,
-            nt_plus_hot: false,
+            nt_pager_hot: 0,
+            nt_tool_hot: 0,
+            nt_toast: String::new(),
+            nt_toast_until: 0.0,
+            nt_toast_undo: None,
+            nt_toast_hot: false,
+            nt_bold_want: false,
+            nt_bold_end: usize::MAX,
             nt_x: 0,
             nt_y: 0,
+            nt_imgs: Vec::new(),
+            nt_titles: Vec::new(),
+            nt_tseq: 0,
+            nt_sel: usize::MAX,
+            nt_sel_drag: false,
+            nt_edit_title: false,
+            nt_tcaret: 0,
+            nt_undo: Vec::new(),
+            nt_redo: Vec::new(),
             nt_lay: None,
+            nt_scroll: 0,
+            nt_scroll_seen: (0, usize::MAX),
             cl_thumbs: Vec::new(),
             cl_lay: Vec::new(),
             cl_x: 0,
@@ -1566,9 +1666,9 @@ const GRADS: [((u8, u8, u8), (u8, u8, u8)); 14] = [
 
 /// ── 配色：黑白灰（无彩色）──
 /// 亮色：浅灰底 + 白纸 + 近黑墨；强调色直接用墨色（不再是蓝色）
-const P_WALL: (u8, u8, u8) = (238, 238, 240); // #EEEEF0
-const P_WALL2: (u8, u8, u8) = (227, 227, 230); // #E3E3E6
-const P_PAPER: (u8, u8, u8) = (255, 255, 255);
+const P_WALL: (u8, u8, u8) = (229, 229, 232); // #E5E5E8（用户 2026-11-02：原来的 #EEEEF0 太亮晃眼）
+const P_WALL2: (u8, u8, u8) = (219, 219, 222); // #DBDBDE
+const P_PAPER: (u8, u8, u8) = (247, 247, 249); // #F7F7F9（纯白改纸白，降一档）
 const P_INK: (u8, u8, u8) = (28, 28, 30); // #1C1C1E
 const P_ACTION: (u8, u8, u8) = (28, 28, 30); // 强调 = 墨色
 /// 暗色：中性深灰（不带蓝调）
@@ -2637,6 +2737,12 @@ fn glass_note(bit: u32, msg: impl FnOnce() -> String) {
     diag_line(&format!("{}\\radial_log.txt", log_dir()), &msg());
 }
 
+/// 性能日志：抓屏 / 整帧超时就记一条到 `radial_log.txt`，
+/// 方便在公司机器（DLP 钩 BitBlt）上一眼看出是谁慢。
+fn perf_line(msg: &str) {
+    diag_line(&format!("{}\\radial_log.txt", log_dir()), msg);
+}
+
 /// 抓屏坐标 + 屏幕范围（一眼看出是不是「副屏 / 负坐标 / 越界」这类问题）。
 fn glass_where(x: i32, y: i32) -> String {
     let (vx, vy, vw, vh) = virtual_screen();
@@ -2708,9 +2814,10 @@ fn glass_offscreen(x: i32, y: i32) -> bool {
 /// 失败（GDI 报错 / 抓出来 почти全黑 = 受保护窗口）→ 留空，调用方退回纸面。
 unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
     set_glass_bg(st, Vec::new());
-    if !st.glass {
+    if !st.glass || capture_dead() {
         return;
     }
+    let t0 = std::time::Instant::now();
     let n = (CANVAS * CANVAS * 4) as usize;
     // 直接用 `make_dib`：它建的是 32bpp 顶朝下的 DIB，`bits` 就是像素，
     // 比 `CreateCompatibleBitmap` + `GetDIBits` 少一次拷贝、也躲开"选进 DC 时不能 GetDIBits"的坑。
@@ -2745,16 +2852,28 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
         });
     }
     if mostly_black(&raw) {
+        let n = CAP_BLACK.fetch_add(1, Ordering::Relaxed) + 1;
+        perf_line(&format!(
+            "PERF snap_black #{n} mean={} {}（DLP/受保护会话会稳定返回黑帧）",
+            glass_mean(&raw),
+            glass_where(x, y)
+        ));
         glass_note(GL_SNAP_BLACK, || {
             format!("GLASS reason=black snap（抓出来全黑 = DRM/受保护窗口 → 退回纸面）{}", glass_where(x, y))
         });
         return;
     }
-    let t0 = std::time::Instant::now();
+    let ms = t0.elapsed().as_millis();
+    if ms > CAP_SLOW_MS {
+        // 这台机器抓屏太慢（DLP / 审计钩住 GDI）→ 本次运行不再抓，轮盘用纸面
+        CAP_SLOW.store(true, Ordering::Relaxed);
+        perf_line(&format!("PERF snap_glass {ms}ms（超过 {CAP_SLOW_MS}ms）→ 本次运行退回纸面 {}", glass_where(x, y)));
+        return;
+    }
     set_glass_bg(st, build_glass(&raw));
-    // 只在需要时看：抓屏 + 模糊一共多久（菜单是"按下就出"，这段延迟用户能感觉到）
-    if std::env::var_os("RL_GLASSDBG").is_some() {
-        eprintln!("[glass] snap {}x{} at ({},{}) blur+blit = {:?}", CANVAS, CANVAS, x, y, t0.elapsed());
+    // 抓屏 + 模糊一共多久（菜单是"按下就出"，这段延迟用户能感觉到）
+    if std::env::var_os("RL_GLASSDBG").is_some() || ms > 40 {
+        perf_line(&format!("PERF snap_glass {ms}ms {}", glass_where(x, y)));
     }
 }
 
@@ -2896,6 +3015,12 @@ fn glass_live_spawn() {
                 if !GLASS_LIVE_ON.load(Ordering::Relaxed) {
                     let _ = GLASS_LIVE_WAKE.wait_timeout(guard, std::time::Duration::from_millis(500));
                 }
+                continue;
+            }
+            // 抓屏太慢的机器（DLP / 审计钩住 GDI）→ 实时玻璃整条停掉，轮盘退回纸面。
+            // 不停的话每 33ms 一次全屏 BitBlt 会把整台机器拖住（用户 2026-11-02 公司电脑卡顿）。
+            if capture_dead() {
+                GLASS_LIVE_ON.store(false, Ordering::Relaxed);
                 continue;
             }
             if on_since.is_none() {
@@ -6403,6 +6528,10 @@ unsafe fn focus_window(hwnd: HWND) {
     }
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
+    // ⚠️ 前台 ≠ 键盘焦点：实测卡片打开后 `GetForegroundWindow()` 就是它，
+    //    但该线程的 `hwndFocus` 是 NULL —— 所有真按键（含 Ctrl+C/V）全丢。
+    //    趁还挂在对方输入队列上补一次 SetFocus；对别人的窗口调用会安全失败。
+    let _ = SetFocus(hwnd);
     if attached {
         let _ = AttachThreadInput(my_tid, fg_tid, false);
     }
@@ -11646,7 +11775,10 @@ unsafe extern "system" fn mouse_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LR
         if CLIP_LIVE.load(Ordering::Relaxed) && !cursor_on_clip(l) {
             post(WM_APP_CLIPDISMISS, 0, 0);
         }
-        if NOTE_LIVE.load(Ordering::Relaxed) && !cursor_on_note(l) {
+        if NOTE_LIVE.load(Ordering::Relaxed)
+            && !NOTE_MODAL.load(Ordering::Relaxed)
+            && !cursor_on_note(l)
+        {
             // 便签的收起消息由它自己的窗口过程处理（`WM_APP_NOTESHOW` w=0）
             let nh = NOTE_HWND.load(Ordering::Relaxed);
             if nh != 0 {
@@ -17110,6 +17242,15 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             }
             LRESULT(0)
         }
+        WM_LBUTTONUP => {
+            let st = state_of(hwnd);
+            st.nt_sel_drag = false;
+            if st.nt_sel == st.nt_caret {
+                st.nt_sel = usize::MAX;
+            }
+            note_present(st);
+            LRESULT(0)
+        }
         WM_MOUSELEAVE_MSG => {
             let st = state_of(hwnd);
             st.set_tracking = false;
@@ -17606,6 +17747,34 @@ unsafe fn pick_file() -> Option<String> {
     ofn.lpstrFile = windows::core::PWSTR(buf.as_mut_ptr());
     ofn.nMaxFile = buf.len() as u32;
     ofn.lpstrDefExt = PCWSTR(defext.as_ptr());
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if !GetOpenFileNameW(&mut ofn).as_bool() {
+        return None;
+    }
+    let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// 选一张图片（便签底栏的图片按钮用）。`owner` = 便签窗口，
+/// 对话框挂在它下面，选完焦点才回得来。
+unsafe fn pick_image_file(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OPENFILENAMEW, OFN_DONTADDTORECENT, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST,
+    };
+    let filter: Vec<u16> = "图片\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp\0所有文件\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut buf = [0u16; 1024];
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+    ofn.lpstrFile = windows::core::PWSTR(buf.as_mut_ptr());
+    ofn.nMaxFile = buf.len() as u32;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
     if !GetOpenFileNameW(&mut ofn).as_bool() {
         return None;
@@ -19425,7 +19594,7 @@ unsafe fn clip_put(fmt: u32, data: &[u8]) -> bool {
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len());
     let _ = GlobalUnlock(hg);
-    if OpenClipboard(HWND(ptr::null_mut())).is_err() {
+    if !clip_open_retry() {
         let _ = GlobalFree(hg);
         clip_log("put FAIL open");
         return false;
@@ -19607,7 +19776,8 @@ fn cl_meta(it: &ClipItem) -> String {
     // 文字条**不报字数**（用户 2026-11-01：「不需要展示多少个字」）——
     // 块里本来就看得见有多少内容，那个数只占地方。
     let head = match it.kind {
-        1 => format!("{}×{}", it.w, it.h),
+        // 图片块**不报尺寸**（用户 2026-11-02：「粘贴板的图片不需要展示尺寸」）
+        1 => String::new(),
         2 => {
             let n = it.text.lines().count();
             if n > 1 {
@@ -20095,6 +20265,14 @@ unsafe fn ensure_clip_fonts(st: &mut State) {
     st.cf_small = CreateFontW(-11 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.cf_bold = CreateFontW(-12 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.cf_note = CreateFontW(-15 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_h1 = CreateFontW(-24 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_h2 = CreateFontW(-20 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.cf_h3 = CreateFontW(-17 * SS, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    let mono: Vec<u16> = wide("Consolas");
+    st.cf_mono = CreateFontW(-14 * SS, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(mono.as_ptr()));
+    st.cf_b15 = CreateFontW(-15 * SS, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    // 斜体：YaHei 没有真斜体，走 GDI 的倾斜合成（0x01 = ITALIC）
+    st.cf_i15 = CreateFontW(-15 * SS, 0, 0, 0, 400, 1, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
 }
 
 unsafe fn ensure_clip_surfaces(st: &mut State) {
@@ -20117,7 +20295,9 @@ unsafe fn ensure_clip_surfaces(st: &mut State) {
 /// hi 那张是 SS² 倍大，常驻纯浪费）。
 unsafe fn clip_free(st: &mut State) {
     clip_thumbs_clear(st);
-    for f in [&mut st.cf_body, &mut st.cf_tile, &mut st.cf_small, &mut st.cf_bold, &mut st.cf_note] {
+    for f in [&mut st.cf_body, &mut st.cf_tile, &mut st.cf_small, &mut st.cf_bold, &mut st.cf_note,
+              &mut st.cf_h1, &mut st.cf_h2, &mut st.cf_h3, &mut st.cf_mono,
+              &mut st.cf_b15, &mut st.cf_i15] {
         if !f.0.is_null() {
             let _ = DeleteObject(HGDIOBJ((*f).0));
             *f = HFONT(ptr::null_mut());
@@ -20462,9 +20642,10 @@ unsafe fn clip_draw(st: &mut State, dc: HDC) {
 /// 失败（受保护窗口 / 全黑 / 抓屏失败）→ `card_bg` 留空，`clip_render` 自动退回实心 paper。
 unsafe fn clip_snap_bg(st: &mut State, x: i32, y: i32) {
     st.card_bg.clear();
-    if !st.glass {
+    if !st.glass || capture_dead() {
         return;
     }
+    let t0 = std::time::Instant::now();
     let (bits, mdc, bmp) = make_dib(CL_WW, CL_HH);
     if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
         return;
@@ -20481,12 +20662,78 @@ unsafe fn clip_snap_bg(st: &mut State, x: i32, y: i32) {
     }
     let _ = DeleteObject(HGDIOBJ(bmp.0));
     let _ = DeleteDC(mdc);
-    if raw.len() != n || mostly_black(&raw) {
+    if raw.len() != n {
+        return;
+    }
+    if mostly_black(&raw) {
+        let nb = CAP_BLACK.fetch_add(1, Ordering::Relaxed) + 1;
+        clip_log(&format!("snap_bg black #{nb}（抓出来全黑）"));
         return;
     }
     let mut bg = blur_glass_sq(&raw, CL_WW as usize);
     clip_frost_tint(st, &mut bg);
+    let ms = t0.elapsed().as_millis();
+    if ms > CAP_SLOW_MS {
+        // 太慢：这张卡这次就用实心纸，别让「打开」这一下卡住
+        CAP_SLOW.store(true, Ordering::Relaxed);
+        clip_log(&format!("snap_bg SLOW {ms}ms -> 本次运行退回纸面"));
+        return;
+    }
+    clip_log(&format!("snap_bg {ms}ms"));
     st.card_bg = bg;
+    card_bg_hi_build(st);
+}
+
+/// 把 1× 的毛玻璃底一次性放大到 hi 画布尺寸，存进一张常驻 DIB。
+/// 之后每帧只用 `BitBlt` 拷过去（内存拷贝）；`StretchDIBits(HALFTONE)` 每帧做一次太贵。
+/// ⚠️ 源图已经模糊过，放大用 `COLORONCOLOR`（近邻/箱式）就够了，看不出区别。
+unsafe fn card_bg_hi_build(st: &mut State) {
+    card_bg_hi_free(st);
+    if st.card_bg.len() != (CL_WW * CL_HH * 4) as usize {
+        return;
+    }
+    let (bits, dc, bmp) = make_dib(CL_WW * SS, CL_HH * SS);
+    if bits.is_null() || dc.is_invalid() || bmp.is_invalid() {
+        return;
+    }
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = CL_WW;
+    bmi.bmiHeader.biHeight = -CL_HH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    let _ = SetStretchBltMode(dc, COLORONCOLOR);
+    let _ = StretchDIBits(
+        dc,
+        0,
+        0,
+        CL_WW * SS,
+        CL_HH * SS,
+        0,
+        0,
+        CL_WW,
+        CL_HH,
+        Some(st.card_bg.as_ptr() as *const c_void),
+        &bmi as *const BITMAPINFO,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+    st.card_bg_hi_bits = bits;
+    st.card_bg_hi_dc = dc;
+    st.card_bg_hi_bmp = bmp;
+}
+
+unsafe fn card_bg_hi_free(st: &mut State) {
+    if !st.card_bg_hi_dc.0.is_null() {
+        let _ = DeleteDC(st.card_bg_hi_dc);
+        st.card_bg_hi_dc = HDC(ptr::null_mut());
+    }
+    if !st.card_bg_hi_bmp.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(st.card_bg_hi_bmp.0));
+        st.card_bg_hi_bmp = HBITMAP(ptr::null_mut());
+    }
+    st.card_bg_hi_bits = ptr::null_mut();
 }
 
 /// 毛玻璃的**染色**这一步单独拆出来：真机走「抓屏 → 模糊 → 这里」，
@@ -20503,38 +20750,8 @@ fn clip_frost_tint(st: &State, bg: &mut [u8]) {
     }
 }
 
-/// 把 1× 的毛玻璃底拉满整块 hi 画布（`CL_WW² → (CL_WW*SS)²`）。
-/// 用 `StretchDIBits` 而不是逐像素：卡片一帧要把 100 万像素降采样，
-/// 再手写一遍 440 万次缩放，光这一层就能吃掉好几毫秒。
-unsafe fn blit_frost(dc: HDC, bg: &[u8]) {
-    let mut bmi = BITMAPINFO::default();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = CL_WW;
-    bmi.bmiHeader.biHeight = -CL_HH; // 顶朝下，和 `make_dib` 一致
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB.0;
-    let _ = SetStretchBltMode(dc, HALFTONE);
-    let _ = StretchDIBits(
-        dc,
-        0,
-        0,
-        CL_WW * SS,
-        CL_HH * SS,
-        0,
-        0,
-        CL_WW,
-        CL_HH,
-        Some(bg.as_ptr() as *const c_void),
-        &bmi as *const BITMAPINFO,
-        DIB_RGB_COLORS,
-        SRCCOPY,
-    );
-}
-
 /// 两张卡片（剪贴板 / 便签）共用的渲染管线：同尺寸、同材质、同一套降采样 + SDF 补 alpha + 投影。
 /// 差异只有「画什么」，所以用 `card` 选一个 draw 函数，别的**一个字节都不要分叉**。
-/// （同时只有一张卡开着，画布/字体也就共用一份。）
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Card {
     Clip,
@@ -20542,6 +20759,8 @@ enum Card {
 }
 
 unsafe fn card_render(st: &mut State, card: Card) {
+    let dbg = std::env::var("RL_FRAMEDBG").is_ok();
+    let t_all = std::time::Instant::now();
     ensure_clip_surfaces(st);
     if st.c_hi_dc.0.is_null() || st.c_lo_dc.0.is_null() || st.c_hi_bits.is_null() {
         return;
@@ -20551,15 +20770,21 @@ unsafe fn card_render(st: &mut State, card: Card) {
     let lo_w = CL_WW as usize;
     let lo_h = CL_HH as usize;
 
-    g_fill(st.c_hi_dc, RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M }, pal.paper);
-    // 毛玻璃：底图先铺满（含投影留白那一圈，反正最后按卡片形状裁 alpha）
-    if st.card_bg.len() == (CL_WW * CL_HH * 4) as usize {
-        blit_frost(st.c_hi_dc, &st.card_bg);
+    let t_fill = std::time::Instant::now();
+    if !st.card_bg_hi_dc.0.is_null() {
+        // 毛玻璃底：一次 BitBlt（快）；整块画布连投影留白一起铺，最后按卡片形状裁 alpha
+        let _ = BitBlt(st.c_hi_dc, 0, 0, CL_WW * SS, CL_HH * SS, st.card_bg_hi_dc, 0, 0, SRCCOPY);
+    } else {
+        g_fill(st.c_hi_dc, RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M }, pal.paper);
     }
+    let d_fill = t_fill.elapsed().as_secs_f32() * 1000.0;
+
+    let t_draw = std::time::Instant::now();
     match card {
         Card::Clip => clip_draw(st, st.c_hi_dc),
         Card::Note => note_draw(st, st.c_hi_dc),
     }
+    let d_draw = t_draw.elapsed().as_secs_f32() * 1000.0;
 
     let hi = std::slice::from_raw_parts(st.c_hi_bits, hi_w * (CL_HH * SS) as usize * 4);
     let lo = std::slice::from_raw_parts_mut(st.c_lo_bits, lo_w * lo_h * 4);
@@ -20589,17 +20814,25 @@ unsafe fn card_render(st: &mut State, card: Card) {
     let ccy = (S_M + CL_H / 2) as f32;
     let (sh_dy, sh_blur, sh_a) = (8.0f32, 14.0f32, 0.26f32);
     let shc = [SHADOW.2 as f32, SHADOW.1 as f32, SHADOW.0 as f32];
+    // 内部快路：离边缘比圆角半径还远的点**一定**不透明，直接写 255 跳过 SDF。
+    // 卡片 90% 的像素都落在这块里，SDF（每像素一次 sqrt）只留给边缘一圈。
+    let (ix, iy) = (hw - 1.0 - CARD_RAD as f32, hh - 1.0 - CARD_RAD as f32);
     for y in 0..lo_h {
         for x in 0..lo_w {
             let fx = x as f32 + 0.5;
             let fy = y as f32 + 0.5;
             let o = (y * lo_w + x) * 4;
-            let ac = cov1(-sdf_rounded_rect(fx - ccx, fy - ccy, hw + 1.0, hh + 1.0, CARD_RAD as f32));
+            let (dx, dy) = (fx - ccx, fy - ccy);
+            if dx.abs() <= ix && dy.abs() <= iy {
+                lo[o + 3] = 255;
+                continue;
+            }
+            let ac = cov1(-sdf_rounded_rect(dx, dy, hw + 1.0, hh + 1.0, CARD_RAD as f32));
             if ac >= 0.999 {
                 lo[o + 3] = 255;
                 continue;
             }
-            let ds = -sdf_rounded_rect(fx - ccx, fy - ccy - sh_dy, (hw - 6.0).max(2.0), (hh - 4.0).max(2.0), CARD_RAD as f32);
+            let ds = -sdf_rounded_rect(dx, dy - sh_dy, (hw - 6.0).max(2.0), (hh - 4.0).max(2.0), CARD_RAD as f32);
             let ash = if ds > 0.0 {
                 let t = 1.0 - (ds / sh_blur).clamp(0.0, 1.0);
                 t * t * sh_a
@@ -20619,8 +20852,23 @@ unsafe fn card_render(st: &mut State, card: Card) {
             lo[o + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
-    if std::env::var("RL_SETDBG").is_ok() {
-        eprintln!("[clipdbg] card_render {:?}", card);
+
+    {
+        let ms = t_all.elapsed().as_millis();
+        if ms > 40 && SLOW_FRAMES.fetch_add(1, Ordering::Relaxed) < 20 {
+            clip_log(&format!("PERF frame {:?} {ms}ms frost={}", card, !st.card_bg_hi_dc.0.is_null()));
+        }
+    }
+    if dbg {
+        eprintln!(
+            "[frame] {:?} total={:.1}ms fill+frost={:.1}ms draw={:.1}ms rest={:.1}ms frost={}",
+            card,
+            t_all.elapsed().as_secs_f32() * 1000.0,
+            d_fill,
+            d_draw,
+            t_all.elapsed().as_secs_f32() * 1000.0 - d_fill - d_draw,
+            !st.card_bg_hi_dc.0.is_null()
+        );
     }
 }
 
@@ -20933,8 +21181,9 @@ unsafe fn close_clip(st: &mut State) {
     }
     st.cl_shown = false;
     CLIP_LIVE.store(false, Ordering::SeqCst);
-    // 毛玻璃底（约 1MB）只服务这一次呼出，收起就还回去
+    // 毛玻璃底（1× 约 1MB + hi 约 4MB）只服务这一次呼出，收起就还回去
     st.card_bg.clear();
+    card_bg_hi_free(st);
     let h = CLIP_HWND.load(Ordering::SeqCst);
     if h != 0 {
         let hwnd = HWND(h as *mut c_void);
@@ -21094,10 +21343,12 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
         let mut bg = blur_glass_sq(&raw, CL_WW as usize);
         clip_frost_tint(st, &mut bg);
         st.card_bg = bg;
+        card_bg_hi_build(st);
         cl_clamp(st);
         snap(name, st);
         st.glass = false;
         st.card_bg.clear();
+        card_bg_hi_free(st);
     }
     // 图片 tab（整页都是缩略图，看「井」和等比放法）
     st.glass_liquid = true;
@@ -21171,15 +21422,26 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
 
     // ── 便签卡片：一页正文 + 一页短的（看页点和「第 x / y 页」） ──
     st.nt_pages = vec![
-        "周三之前要交的：
-· 把剪贴板卡片的 9 格改完
-· 便签能不能直接打字（中文）
-· 毛玻璃在浅色桌面上够不够看
+        "# 周三之前要交的
+下面前两条已经交了，后两条还没动：
+- [x] 剪贴板卡片改成 9 格
+- [x] 便签能直接打字（中文）
+- [ ] 毛玻璃在浅色桌面上够不够看
+- [ ] 补选中复制
 
-记完记得顺手 Ctrl+C 带到聊天窗口。".to_string(),
+## 备注
+> 记完记得顺手 Ctrl+C 带到聊天窗口。
+- 普通项目
+1. 有序列表
+```
+fn main() { println!(\"hi\"); }
+```
+---
+行内也能变样：**粗体**、*斜体*、`行内代码`、~~删除线~~。".to_string(),
         "买：牛奶、鸡蛋、咖啡豆".to_string(),
         String::new(),
     ];
+    st.nt_titles = vec!["周一清单".to_string(), "买东西".to_string(), "便签 3".to_string()];
     st.nt_blink = true;
     for (name, dark, page) in [
         ("note_dark", true, 0usize),
@@ -21189,7 +21451,7 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
         st.glass_liquid = dark;
         st.nt_cur = page;
         st.nt_lay = None;
-        st.nt_dot_hover = 1;
+        st.nt_pager_hot = 0;
         st.card_bg.clear();
         snap_note(name, st);
     }
@@ -21210,12 +21472,48 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
         st.glass_liquid = true;
         clip_frost_tint(st, &mut bg);
         st.card_bg = bg;
+        card_bg_hi_build(st);
         st.nt_cur = 0;
         st.nt_lay = None;
-        st.nt_dot_hover = usize::MAX;
+        st.nt_pager_hot = 0;
         snap_note("note_frost_dark", st);
         st.card_bg.clear();
+        card_bg_hi_free(st);
     }
+    // 选区高亮（反白）：选前半段（含一处粗体），看反白和样式能不能共存
+    st.nt_pages = vec!["把这一段选中：**粗体**、*斜体*、`代码`。\n第二行也一起。".to_string()];
+    st.nt_titles = vec!["选中效果".to_string()];
+    st.nt_cur = 0;
+    st.nt_sel = 0;
+    st.nt_caret = "把这一段选中：**粗体**、*斜".len();
+    st.nt_blink = true;
+    st.nt_lay = None;
+    st.glass_liquid = false;
+    st.card_bg.clear();
+    snap_note("note_sel", st);
+    st.nt_sel = usize::MAX;
+    // 以换行结尾：光标必须画在**新的一行**开头（用户 2026-11-02 报「光标位置很远」）
+    st.nt_pages = vec!["重排 重排模型 取top5\n是否需要完全召回，还是召回部分相关内容\n".to_string()];
+    st.nt_titles = vec!["光标位置".to_string()];
+    st.nt_cur = 0;
+    st.nt_caret = st.nt_pages[0].len();
+    st.nt_lay = None;
+    st.nt_blink = true;
+    snap_note("note_eol", st);
+
+    // 图片块（`![](名字@宽)`）：贴图 + 整页排版
+    st.nt_pages = vec!["上面一行字
+![](n1.dib@220)
+下面一行字".to_string()];
+    st.nt_titles = vec!["贴图".to_string()];
+    st.nt_cur = 0;
+    st.nt_caret = 0;
+    st.nt_sel = usize::MAX;
+    st.nt_lay = None;
+    st.nt_imgs.clear();
+    st.nt_blink = true;
+    snap_note("note_img", st);
+
     // 光标落点：正文以换行结尾时，光标必须在**新的一行**开头（不是上一行行尾）
     st.nt_pages = vec!["第一行文字\n第二行里有光标\n第三行".to_string()];
     st.nt_cur = 0;
@@ -21224,9 +21522,56 @@ unsafe fn clip_dump(dir: &str, st: &mut State) {
 第二行里".len();
     st.nt_blink = true;
     st.nt_lay = None;
-    st.nt_dot_hover = usize::MAX;
+    st.nt_pager_hot = 0;
     st.glass_liquid = false;
     snap_note("note_caret", st);
+
+    // 超过一屏：右侧滚动条 + 滚动位置（顶 / 底各一张）
+    {
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&format!("第 {} 行：正文超过一屏时，滚轮在正文里上下滚动。\n", i + 1));
+        }
+        st.nt_pages = vec![body];
+        st.nt_titles = vec!["滚动".to_string()];
+        st.nt_cur = 0;
+        st.nt_sel = usize::MAX;
+        st.nt_lay = None;
+        st.nt_blink = true;
+        st.glass_liquid = false;
+        st.card_bg.clear();
+        st.nt_caret = 0;
+        st.nt_scroll = 0;
+        snap_note("note_scroll_top", st);
+        st.nt_caret = st.nt_pages[0].len();
+        st.nt_lay = None;
+        snap_note("note_scroll_bottom", st);
+    }
+    // 多页：页码器 + 标题右端删除按钮 + 删除 toast
+    {
+        st.nt_pages = vec!["第一页正文".to_string(), "第二页正文".to_string(), "第三页正文".to_string()];
+        st.nt_titles = vec!["周一".to_string(), "周二".to_string(), "周三".to_string()];
+        st.nt_cur = 1;
+        st.nt_caret = 0;
+        st.nt_sel = usize::MAX;
+        st.nt_lay = None;
+        st.nt_blink = false;
+        st.nt_pager_hot = -1;
+        st.nt_tool_hot = 2;
+        st.nt_toast.clear();
+        st.nt_toast_until = 0.0;
+        snap_note("note_pager", st);
+        st.nt_toast = "已删除".to_string();
+        st.nt_toast_until = now_s() + 9999.0;
+        st.nt_toast_undo = Some((0, String::new(), String::new()));
+        snap_note("note_toast", st);
+        st.nt_toast_undo = None;
+        st.nt_toast.clear();
+        st.nt_toast_until = 0.0;
+        st.nt_pager_hot = 0;
+        st.nt_tool_hot = 0;
+        st.nt_blink = true;
+    }
     st.glass_liquid = false;
 }
 
@@ -21291,6 +21636,15 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 st.cl_tip = tip;
                 clip_kick(st);
             }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let st = state_of(hwnd);
+            st.nt_sel_drag = false;
+            if st.nt_sel == st.nt_caret {
+                st.nt_sel = usize::MAX;
+            }
+            note_present(st);
             LRESULT(0)
         }
         WM_MOUSELEAVE_MSG => {
@@ -21537,6 +21891,14 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
 // v1 只做**尾部追加**：没有选区、不能点哪写哪 —— 换来的是中文输入法能直接打字
 // （组字串自己画在光标处，见 `WM_IME_COMPOSITION`）。
 
+/// 复选框：行首标记（Markdown 任务列表那一套，纯文本存储、不引入富文本格式）
+const NT_TASK_U: &str = "- [ ] ";
+const NT_TASK_C: &str = "- [x] ";
+/// 复选框行正文的缩进（框 12 + 间距 8）
+const NT_BOX_INDENT: i32 = 20;
+/// 撤销栈上限（够用了；便签是临时记东西，不需要无限历史）
+const NT_UNDO_MAX: usize = 100;
+
 /// 便签的底栏比剪贴板高一档：右边要放一颗「＋」新页按钮（22px）
 const NT_FOOT_H: i32 = 26;
 /// 便签纸：卡片里那张「纸」，四周留出投影留白和一条拖拽带
@@ -21552,21 +21914,113 @@ fn nt_plus_rect() -> RECT {
 fn nt_can_new_page(st: &State) -> bool {
     !note_text(st).trim().is_empty() && st.nt_pages.len() < NT_CAP_PAGES
 }
-/// 纸上的正文区（上沿那条 18px 是拖拽带，下面才是字）
+/// 纸上沿的**标题条**（可点击进去改名；默认「便签 N」）
+fn nt_title_rect() -> RECT {
+    let s = nt_sheet();
+    RECT { left: s.left + 16, top: s.top + 8, right: s.right - 16, bottom: s.top + 34 }
+}
+/// 纸上的正文区（标题条下面才是字）
 fn nt_text_rect() -> RECT {
     let s = nt_sheet();
-    RECT { left: s.left + 16, top: s.top + 18, right: s.right - 16, bottom: s.bottom - 14 }
+    RECT { left: s.left + 16, top: s.top + 42, right: s.right - 16, bottom: s.bottom - 14 }
 }
-/// 顶上那条拖拽带（和剪贴板卡片头部一个意思：按住能拖卡片）
+/// 新页的默认标题：「便签 N」
+fn nt_default_title(st: &State) -> String {
+    format!("便签 {}", st.nt_tseq + 1)
+}
+/// 当前页标题（越界给空）
+fn note_title(st: &State) -> &str {
+    st.nt_titles.get(st.nt_cur).map(|s| s.as_str()).unwrap_or("")
+}
+/// 顶上那条拖拽带（标题条现在要点进去改名，所以只留标题上方那一条）
 fn nt_drag_band(y: i32) -> bool {
-    y >= 0 && y < nt_text_rect().top
+    y >= 0 && y < nt_title_rect().top
 }
-fn nt_dot_rect(i: usize) -> RECT {
+/// 底栏页码器：`‹ 3 / 14 ›`（固定宽度，不随页数增长）
+fn nt_pager_rect() -> RECT {
     let fy0 = CL_H - CL_PAD - NT_FOOT_H;
-    let fy1 = CL_H - CL_PAD;
-    let y = (fy0 + fy1) / 2 - 3;
-    let x = CL_PAD + i as i32 * 11;
-    RECT { left: x, top: y, right: x + 6, bottom: y + 6 }
+    RECT { left: CL_PAD, top: fy0, right: CL_PAD + 96, bottom: CL_H - CL_PAD }
+}
+/// 页码器左右箭头（16px 命中区）
+fn nt_pager_arrow(dir: i32) -> RECT {
+    let p = nt_pager_rect();
+    let x = if dir < 0 { p.left } else { p.right - 16 };
+    RECT { left: x, top: p.top, right: x + 16, bottom: p.bottom }
+}
+/// 标题条右端的「删除本页」（只有多页时才显示）
+fn nt_del_rect() -> RECT {
+    let t = nt_title_rect();
+    let s = nt_sheet();
+    RECT { left: s.right - 34, top: t.top + 2, right: s.right - 16, bottom: t.bottom - 2 }
+}
+/// 底栏工具按钮：0 待办 / 1 删除线 / 2 图片 —— 排在**页码器右边**；
+/// 「＋新页」单独留在最右侧。
+fn nt_tool_rect(i: i32) -> RECT {
+    let y = nt_plus_rect();
+    let x0 = CL_PAD + 96 + 12 + i * 26;
+    RECT { left: x0, top: y.top, right: x0 + 22, bottom: y.bottom }
+}
+
+// 图标来自 Ant Design 官方图标库（阿里巴巴 / @ant-design/icons-svg，ISC），
+// 离屏渲染成 32×32 alpha 蒙版后嵌进来（见 assets/note_icons/）。
+// 用蒙版而不是画线：路径已由设计团队调好，1:1 落在 SS=2 的画布上最干净。
+const NT_ICON_TODO: &[u8; 1024] = include_bytes!("../assets/note_icons/check-square.a8");
+const NT_ICON_BOLD: &[u8; 1024] = include_bytes!("../assets/note_icons/bold.a8");
+const NT_ICON_LIST: &[u8; 1024] = include_bytes!("../assets/note_icons/unordered-list.a8");
+const NT_ICON_DIVIDER: &[u8; 1024] = include_bytes!("../assets/note_icons/line.a8");
+const NT_ICON_IMAGE: &[u8; 1024] = include_bytes!("../assets/note_icons/picture.a8");
+const NT_ICON_DEL: &[u8; 1024] = include_bytes!("../assets/note_icons/delete.a8");
+const NT_ICON_PLUS: &[u8; 1024] = include_bytes!("../assets/note_icons/plus.a8");
+
+/// 画一枚 16×16（逻辑）图标，中心在 `(cx, cy)`。蒙版 32×32 = SS 画布上的 1:1。
+unsafe fn g_icon(dc: HDC, cx: i32, cy: i32, mask: &[u8; 1024], ink: (u8, u8, u8)) {
+    let (bits, mem, bmp) = make_dib(32, 32);
+    if bits.is_null() {
+        return;
+    }
+    {
+        let dst = std::slice::from_raw_parts_mut(bits, 32 * 32 * 4);
+        for i in 0..1024 {
+            let a = mask[i] as u32;
+            let o = i * 4;
+            // 预乘 alpha（AlphaBlend 的 AC_SRC_ALPHA 要求）
+            dst[o] = ((ink.2 as u32 * a) / 255) as u8;
+            dst[o + 1] = ((ink.1 as u32 * a) / 255) as u8;
+            dst[o + 2] = ((ink.0 as u32 * a) / 255) as u8;
+            dst[o + 3] = a as u8;
+        }
+    }
+    let bf = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA
+    };
+    // ⚠️ hi 画布带 S_M 投影留白：必须走 sxv()，少加 S_M 会整枚图标往上偏 22px
+    let _ = AlphaBlend(
+        dc,
+        sxv(cx - 8),
+        sxv(cy - 8),
+        16 * SS,
+        16 * SS,
+        mem,
+        0,
+        0,
+        32,
+        32,
+        bf,
+    );
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem);
+}
+/// 删除 toast：和剪贴板卡片同款（定宽胶囊 + 右端「撤销」小按钮）
+fn nt_toast_rect() -> RECT {
+    let y = CL_H - CL_PAD - NT_FOOT_H - CL_TOAST_H - 6;
+    RECT { left: (CL_W - 148) / 2, top: y, right: (CL_W + 148) / 2, bottom: y + CL_TOAST_H }
+}
+fn nt_undo_rect() -> RECT {
+    let t = nt_toast_rect();
+    RECT { left: t.right - 52, top: t.top + 3, right: t.right - 4, bottom: t.bottom - 3 }
 }
 
 fn note_path() -> String {
@@ -21576,13 +22030,21 @@ fn note_path() -> String {
 /// 读盘。没有文件 / 全是空页 → 留一页空白（打开就能写）。
 fn note_load(st: &mut State) {
     st.nt_pages.clear();
+    st.nt_titles.clear();
     if let Ok(txt) = std::fs::read_to_string(note_path()) {
         for ln in txt.lines().skip(1) {
             let f: Vec<&str> = ln.split('\t').collect();
             if f.len() < 2 {
                 continue;
             }
-            st.nt_pages.push(cl_unesc(f[1]));
+            // 新格式：ts / 标题 / 正文；老格式（两列）：ts / 正文
+            if f.len() >= 3 {
+                st.nt_titles.push(cl_unesc(f[1]));
+                st.nt_pages.push(cl_unesc(f[2]));
+            } else {
+                st.nt_titles.push(String::new());
+                st.nt_pages.push(cl_unesc(f[1]));
+            }
             if st.nt_pages.len() >= NT_CAP_PAGES {
                 break;
             }
@@ -21590,17 +22052,35 @@ fn note_load(st: &mut State) {
     }
     if st.nt_pages.is_empty() {
         st.nt_pages.push(String::new());
+        st.nt_titles.push(String::new());
+    }
+    // 标题编号：从已有的「便签 N」里取最大值，新页接着往下数
+    st.nt_tseq = st
+        .nt_titles
+        .iter()
+        .filter_map(|t| t.strip_prefix("便签 ").and_then(|n| n.trim().parse::<usize>().ok()))
+        .max()
+        .unwrap_or(0);
+    for (i, t) in st.nt_titles.iter_mut().enumerate() {
+        if t.trim().is_empty() {
+            *t = format!("便签 {}", i + 1);
+        }
     }
     st.nt_cur = 0; // 第 1 页 = 最新那页
     st.nt_caret = note_text(st).len();
+    st.nt_tcaret = note_title(st).len();
     st.nt_lay = None;
 }
 
 /// 落盘。**空页不写**：想扔掉一页就把字删光，不用另做一个「删除页」的按钮/撤销。
 fn note_save(st: &mut State) {
     let mut out = String::from("notefile v1\n");
-    for p in st.nt_pages.iter().filter(|p| !p.trim().is_empty()) {
-        out.push_str(&format!("{}\t{}\n", unix_now(), cl_esc(p)));
+    for (i, p) in st.nt_pages.iter().enumerate() {
+        if p.trim().is_empty() {
+            continue;
+        }
+        let title = st.nt_titles.get(i).cloned().unwrap_or_default();
+        out.push_str(&format!("{}\t{}\t{}\n", unix_now(), cl_esc(&title), cl_esc(p)));
     }
     if let Err(e) = std::fs::write(note_path(), out) {
         clip_log(&format!("notes save FAIL {e}"));
@@ -21637,26 +22117,363 @@ fn note_caret_clamp(st: &mut State) {
     }
 }
 
+/// 这一行是不是任务行：返回 `(已完成, 前缀字节数)`。
+/// 认 `- [ ] ` / `- [x] `（大小写都认）——纯文本存储，外部编辑器也能看懂。
+fn nt_task(line: &str) -> Option<(bool, usize)> {
+    let lower_start: String = line.chars().take(6).collect();
+    let low = lower_start.to_lowercase();
+    if low.starts_with(NT_TASK_U) {
+        Some((false, NT_TASK_U.len()))
+    } else if low.starts_with(NT_TASK_C) {
+        Some((true, NT_TASK_C.len()))
+    } else {
+        None
+    }
+}
+
+/// 光标所在**逻辑行**的起点（字节下标）
+fn note_line_start(text: &str, idx: usize) -> usize {
+    text[..idx.min(text.len())].rfind('\n').map(|i| i + 1).unwrap_or(0)
+}
+
+/// 逻辑行边界（不含结尾换行）
+fn note_line_span(text: &str, at: usize) -> (usize, usize) {
+    let at = at.min(text.len());
+    let a = note_line_start(text, at);
+    let b = text[a..].find('\n').map(|i| a + i).unwrap_or(text.len());
+    (a, b)
+}
+
+/// 这一行是不是分割线块（`---` / `***`）
+fn note_is_hr(line: &str) -> bool {
+    let t = line.trim_end();
+    t == "---" || t == "***"
+}
+
+/// 改文字之前先把「整页 + 光标」压进撤销栈（每页都很小，整页快照最稳）
+unsafe fn note_snap(st: &mut State) {
+    let page = note_text(st).to_string();
+    st.nt_undo.push((st.nt_cur, page, st.nt_caret));
+    if st.nt_undo.len() > NT_UNDO_MAX {
+        st.nt_undo.remove(0);
+    }
+    st.nt_redo.clear();
+}
+
+/// 撤销 / 重做（dir = -1 撤销，+1 重做）
+unsafe fn note_undo_step(st: &mut State, dir: i32, hwnd: HWND) -> bool {
+    let (from, to) = if dir < 0 {
+        (&mut st.nt_undo as *mut Vec<(usize, String, usize)>, &mut st.nt_redo as *mut Vec<(usize, String, usize)>)
+    } else {
+        (&mut st.nt_redo as *mut Vec<(usize, String, usize)>, &mut st.nt_undo as *mut Vec<(usize, String, usize)>)
+    };
+    let cur = (st.nt_cur, note_text(st).to_string(), st.nt_caret);
+    let popped = unsafe { (*from).pop() };
+    let Some((page, text, caret)) = popped else {
+        return false;
+    };
+    unsafe { (*to).push(cur) };
+    if page >= st.nt_pages.len() {
+        st.nt_pages.resize(page + 1, String::new());
+    }
+    st.nt_pages[page] = text;
+    st.nt_cur = page;
+    st.nt_caret = caret;
+    // 撤销栈里的光标是「当时的字节下标」，文字可能已经被别的操作改短/改长
+    note_caret_clamp(st);
+    st.nt_comp.clear();
+    st.nt_lay = None;
+    st.nt_bold_want = false;
+    st.nt_bold_end = usize::MAX;
+    st.nt_blink = true;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+    true
+}
+
+/// 标题编辑：插入 / 退格（标题最多 40 字）
+fn note_title_insert(st: &mut State, s: &str) {
+    if let Some(t) = st.nt_titles.get_mut(st.nt_cur) {
+        let at = st.nt_tcaret.min(t.len());
+        if t.chars().count() + s.chars().count() > 40 {
+            return;
+        }
+        t.insert_str(at, s);
+        st.nt_tcaret = at + s.len();
+    }
+}
+
+fn note_title_backspace(st: &mut State) {
+    if let Some(t) = st.nt_titles.get_mut(st.nt_cur) {
+        let at = st.nt_tcaret.min(t.len());
+        if at == 0 {
+            return;
+        }
+        let prev = t[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+        t.replace_range(prev..at, "");
+        st.nt_tcaret = prev;
+    }
+}
+
+/// 当前选区（字节区间，左小右大）；没有选区给 None
+fn note_sel(st: &State) -> Option<(usize, usize)> {
+    if st.nt_sel == usize::MAX || st.nt_sel == st.nt_caret {
+        None
+    } else {
+        Some((st.nt_sel.min(st.nt_caret), st.nt_sel.max(st.nt_caret)))
+    }
+}
+
+/// 把选中的那段文字取出来（原文，含 Markdown 标记 —— 复制出去要能再粘回来）
+fn note_sel_text(st: &State) -> Option<String> {
+    note_sel(st).map(|(a, b)| note_text(st)[a..b].to_string())
+}
+
+/// 有选区就先删掉它（打字 / 退格 / Del 都先走这条）
+unsafe fn note_del_sel(st: &mut State, hwnd: HWND) -> bool {
+    let Some((a, b)) = note_sel(st) else { return false };
+    note_snap(st);
+    st.nt_pages[st.nt_cur].replace_range(a..b, "");
+    st.nt_caret = a;
+    st.nt_sel = usize::MAX;
+    st.nt_lay = None;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+    true
+}
+
+/// 切换第 `line_start`（逻辑行首）那一行的复选框
+unsafe fn note_toggle_task(st: &mut State, hwnd: HWND, line_start: usize) -> bool {
+    if st.nt_cur >= st.nt_pages.len() {
+        return false;
+    }
+    let text = note_text(st).to_string();
+    let Some((checked, plen)) = nt_task(&text[line_start..]) else {
+        return false;
+    };
+    let at = line_start + plen - 3; // 指向 `[ ]` 中间那个字符（"- [ ] " → 下标 3）
+    if at >= text.len() {
+        return false;
+    }
+    note_snap(st);
+    let page = &mut st.nt_pages[st.nt_cur];
+    page.replace_range(at..at + 1, if checked { " " } else { "x" });
+    st.nt_lay = None;
+    st.nt_blink = true;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+    true
+}
+
 /// 在**光标处**插入（v2：不再是只能往末尾追加）
 unsafe fn note_insert(st: &mut State, hwnd: HWND, s: &str) {
     if st.nt_cur >= st.nt_pages.len() {
         return;
     }
     note_caret_clamp(st);
+    // 有选区 = 替换选区（`note_del_sel` 自己压过撤销栈了）
+    if !note_del_sel(st, hwnd) {
+        note_snap(st);
+    }
     let at = st.nt_caret;
+    // 图片行是原子块：字不能插进 `![](…)` 里，也不能接在同一行后面
+    // （两种都会让 token 失配，图片退化成代码文本）。统一另起一行。
+    let text = note_text(st).to_string();
+    if let Some((a, b)) = nt_img_line_at(&text, at) {
+        if at <= b {
+            if at <= a {
+                st.nt_pages[st.nt_cur].insert_str(a, &format!("{s}\n"));
+                st.nt_caret = a + s.len();
+            } else {
+                st.nt_pages[st.nt_cur].insert_str(b, &format!("\n{s}"));
+                st.nt_caret = b + 1 + s.len();
+            }
+            note_touch(st, hwnd);
+            return;
+        }
+    }
     st.nt_pages[st.nt_cur].insert_str(at, s);
     st.nt_caret = at + s.len();
     note_touch(st, hwnd);
 }
 
+/// 当前行里的加粗片段（可见文本区间，绝对值）。没有就给 None。
+fn note_bold_span_at(text: &str, idx: usize) -> Option<(usize, usize)> {
+    let (ls, le) = note_line_span(text, idx);
+    if ls >= le {
+        return None;
+    }
+    let line = &text[ls..le];
+    for (sa, sb, sty) in nt_runs(line) {
+        if sty == NtSty::Bold && idx >= ls + sa && idx <= ls + sb + 2 {
+            return Some((ls + sa, ls + sb));
+        }
+    }
+    None
+}
+
+/// 光标所在（或紧挨着的）那个词：按空白切，中文没有空格就是整行。
+fn note_word_at(text: &str, at: usize) -> Option<(usize, usize)> {
+    let (ls, le) = note_line_span(text, at);
+    if ls >= le {
+        return None;
+    }
+    let at = at.min(le);
+    let chars: Vec<(usize, char)> = text[ls..le].char_indices().collect();
+    let word = |c: char| !c.is_whitespace() && c != '*';
+    let mut i = chars.partition_point(|(off, _)| ls + *off < at);
+    if i > 0 && !word(chars[i - 1].1) {
+        while i > 0 && !word(chars[i - 1].1) {
+            i -= 1;
+        }
+    }
+    if i == 0 || !word(chars[i - 1].1) {
+        let mut j = i;
+        while j < chars.len() && !word(chars[j].1) {
+            j += 1;
+        }
+        if j >= chars.len() {
+            return None;
+        }
+        let s = ls + chars[j].0;
+        let mut e = j;
+        while e + 1 < chars.len() && word(chars[e + 1].1) {
+            e += 1;
+        }
+        return Some((s, ls + chars[e].0 + chars[e].1.len_utf8()));
+    }
+    let mut s = i;
+    while s > 0 && word(chars[s - 1].1) {
+        s -= 1;
+    }
+    let mut e = i;
+    while e < chars.len() && word(chars[e].1) {
+        e += 1;
+    }
+    Some((ls + chars[s].0, if e < chars.len() { ls + chars[e].0 } else { le }))
+}
+
+/// 去掉包住 `(a,b)` 的那对 `**`（a/b 是可见区间）
+unsafe fn note_unbold(st: &mut State, hwnd: HWND, a: usize, b: usize) -> bool {
+    let text = note_text(st).to_string();
+    if a < 2 || b + 2 > text.len() || &text[a - 2..a] != "**" || &text[b..b + 2] != "**" {
+        return false;
+    }
+    note_snap(st);
+    st.nt_pages[st.nt_cur].replace_range(b..b + 2, "");
+    st.nt_pages[st.nt_cur].replace_range(a - 2..a, "");
+    // 去掉闭合 ** 不影响前面的下标；再去掉开头 ** 整体前移 2 —— 光标应停在 b-2
+    st.nt_caret = b.saturating_sub(2);
+    note_caret_clamp(st);
+    st.nt_sel = usize::MAX;
+    note_touch(st, hwnd);
+    true
+}
+
+/// B：对选区 / 光标所在词做 加粗 ↔ 取消加粗（所见即所得，不露标记）
+unsafe fn note_bold_toggle(st: &mut State, hwnd: HWND) {
+    let text = note_text(st).to_string();
+    // 有选区：整段都在同一个加粗片段里 → 取消；否则包起来
+    if let Some((a, b)) = note_sel(st) {
+        if let Some((sa, sb)) = note_bold_span_at(&text, a) {
+            if b <= sb && note_unbold(st, hwnd, sa, sb) {
+                return;
+            }
+        }
+        let sel = text[a..b].to_string();
+        st.nt_caret = a;
+        st.nt_sel = b;
+        note_insert(st, hwnd, &format!("**{sel}**"));
+        return;
+    }
+    // 光标在加粗片段里 → 取消这一段
+    if let Some((sa, sb)) = note_bold_span_at(&text, st.nt_caret.min(text.len())) {
+        if note_unbold(st, hwnd, sa, sb) {
+            return;
+        }
+    }
+    // 否则给光标所在的词加粗
+    if let Some((a, b)) = note_word_at(&text, st.nt_caret.min(text.len())) {
+        let word = text[a..b].to_string();
+        st.nt_caret = a;
+        st.nt_sel = b;
+        note_insert(st, hwnd, &format!("**{word}**"));
+        return;
+    }
+    // 空行：退回「接下来打的字加粗」
+    st.nt_bold_want = !st.nt_bold_want;
+    st.nt_bold_end = usize::MAX;
+}
+
+/// 键盘 / 输入法打字的入口（和工具按钮的 `note_insert` 分开）：
+/// 加粗模式下直接写成 `**…**`，但标记对用户不可见 —— 所见即所得。
+unsafe fn note_type(st: &mut State, hwnd: HWND, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if !st.nt_bold_want {
+        note_insert(st, hwnd, s);
+        return;
+    }
+    let text = note_text(st).to_string();
+    let at = st.nt_caret.min(text.len());
+    if st.nt_bold_end != usize::MAX {
+        // 光标被挪走 / 出现选区 → 加粗模式自然结束
+        if at != st.nt_bold_end || st.nt_sel != usize::MAX {
+            st.nt_bold_want = false;
+            st.nt_bold_end = usize::MAX;
+            note_insert(st, hwnd, s);
+            return;
+        }
+        note_snap(st);
+        st.nt_pages[st.nt_cur].insert_str(at, s);
+        st.nt_caret = at + s.len();
+        st.nt_bold_end += s.len();
+        note_touch(st, hwnd);
+        return;
+    }
+    // 第一次输入：`**s**`，光标停在闭合标记之前，继续打字就是同一段加粗
+    note_insert(st, hwnd, &format!("**{s}**"));
+    st.nt_bold_end = st.nt_caret.saturating_sub(2);
+    st.nt_caret = st.nt_bold_end;
+    st.nt_blink = true;
+}
+
 /// 退格：删光标**前一个字符**（按字符不按字节，中文才不会删成乱码）
 unsafe fn note_backspace(st: &mut State, hwnd: HWND) {
+    if note_del_sel(st, hwnd) {
+        return;
+    }
     note_caret_clamp(st);
     let at = st.nt_caret;
     if at == 0 || st.nt_cur >= st.nt_pages.len() {
         return;
     }
-    let prev = note_text(st)[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+    // 分割线是整块：退格删整行，别把 `---` 删成 `--` 露出源码
+    let text = note_text(st).to_string();
+    let (ls, le) = note_line_span(&text, at);
+    if note_is_hr(&text[ls..le]) {
+        note_remove_line(st, hwnd, ls, le);
+        return;
+    }
+    // 光标在本行行首、上一行是分割线 → 吃掉的也是整条分割线
+    if at == ls && ls > 0 {
+        let (pa, pb) = note_line_span(&text, ls - 1);
+        if note_is_hr(&text[pa..pb]) {
+            note_remove_line(st, hwnd, pa, pb);
+            return;
+        }
+    }
+    // 光标在图片右侧/ token 里：退格删的是**整张图**（按块删，不逐字切 token）
+    if let Some((a, b)) = nt_img_line_at(&text, at) {
+        if at > a && at <= b {
+            note_snap(st);
+            let end = if b < text.len() && text.as_bytes()[b] == b'\n' { b + 1 } else { b };
+            st.nt_pages[st.nt_cur].replace_range(a..end, "");
+            st.nt_caret = a;
+            note_touch(st, hwnd);
+            return;
+        }
+    }
+    let prev = text[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+    note_snap(st);
     st.nt_pages[st.nt_cur].replace_range(prev..at, "");
     st.nt_caret = prev;
     note_touch(st, hwnd);
@@ -21664,30 +22481,124 @@ unsafe fn note_backspace(st: &mut State, hwnd: HWND) {
 
 /// 光标左移一个字符
 fn note_left(st: &mut State) {
-    st.nt_caret = note_text(st)[..st.nt_caret.min(note_text(st).len())]
-        .char_indices()
-        .next_back()
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let t = note_text(st);
+    let i = st.nt_caret.min(t.len());
+    // 图片行：光标在行尾/ token 里 → 直接跳到行首（不逐字走进 `![](…)`）
+    if let Some((a, b)) = nt_img_line_at(t, i) {
+        if i > a && i <= b {
+            st.nt_caret = a;
+            return;
+        }
+    }
+    st.nt_caret = t[..i].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
 }
 
 /// 光标右移一个字符
 fn note_right(st: &mut State) {
     let t = note_text(st);
     let i = st.nt_caret.min(t.len());
+    // 图片行：行首/token 里 → 跳到行尾（图片右边），别走进 Markdown 源码
+    if let Some((a, b)) = nt_img_line_at(t, i) {
+        if i >= a && i < b {
+            st.nt_caret = b;
+            return;
+        }
+    }
     st.nt_caret = t[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(t.len());
 }
 
-/// 当前滚动位置（绘制和命中必须用**同一个**算法，否则点哪写哪会错行）
-unsafe fn note_scroll(st: &State, _dc: HDC, lines: &[(usize, usize)], lh: i32) -> usize {
-    let ta = nt_text_rect();
-    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
-    let cur = note_line_of(lines, st.nt_caret.min(note_text(st).len()));
-    if cur + 1 > visible {
-        (cur + 1 - visible).min(lines.len().saturating_sub(visible))
-    } else {
-        0
+/// 从视觉行起点量到 `up_to` 的宽度（按各片段的样式字体，标记天然被跳过）
+unsafe fn nt_x_in(st: &State, dc: HDC, l: &NtLine, text: &str, up_to: usize) -> i32 {
+    let mut x = 0;
+    for (sa, sb, sty) in l.segs.iter() {
+        if *sa >= up_to {
+            break;
+        }
+        let mut end = (*sb).min(up_to);
+        while end > *sa && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > *sa {
+            let f = nt_sty_font(st, l.font, *sty);
+            x += s_text_w(dc, &text[*sa..end], f);
+        }
     }
+    x
+}
+
+/// 正文总高（逻辑 px）
+unsafe fn note_content_h(dc: HDC, lines: &[NtLine]) -> i32 {
+    lines.iter().map(|l| nt_line_h(dc, l)).sum()
+}
+
+/// 可见窗口能滚到的**最大首行下标**：再往下就露白（底部不能空一块）
+unsafe fn note_max_top(dc: HDC, lines: &[NtLine]) -> usize {
+    let ta = nt_text_rect();
+    let view = (ta.bottom - ta.top).max(1);
+    let total = note_content_h(dc, lines);
+    if total <= view {
+        return 0;
+    }
+    let mut rem = total;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let h = nt_line_h(dc, &lines[i]);
+        rem -= h;
+        if rem < view {
+            break;
+        }
+        i += 1;
+    }
+    i.min(lines.len().saturating_sub(1))
+}
+
+/// 把 `nt_scroll` 夹进合法范围，并保证**光标行**在可见窗口里（键盘移动时自动跟随）。
+unsafe fn note_follow_caret(st: &mut State, dc: HDC, lines: &[NtLine], caret: usize) {
+    if lines.is_empty() {
+        st.nt_scroll = 0;
+        return;
+    }
+    let ta = nt_text_rect();
+    let view = (ta.bottom - ta.top).max(1);
+    let max_top = note_max_top(dc, lines);
+    let cur = nt_line_of(lines, caret.min(note_text(st).len()));
+    let mut top = st.nt_scroll.min(max_top);
+    if cur < top {
+        top = cur;
+    }
+    while top < cur {
+        let mut h = 0;
+        for k in top..=cur {
+            h += nt_line_h(dc, &lines[k]);
+        }
+        if h <= view {
+            break;
+        }
+        top += 1;
+    }
+    st.nt_scroll = top.min(max_top);
+}
+
+/// `idx` 落在某个**图片行**里 → `(行首, 行尾)`（行尾 = token 之后 / 换行符之前）。
+/// 图片是独立一行的原子块：光标只能停在行首或行尾，字也不能插进 token 里。
+fn nt_img_line_at(text: &str, idx: usize) -> Option<(usize, usize)> {
+    let idx = idx.min(text.len());
+    let start = note_line_start(text, idx);
+    let end = text[start..].find('\n').map(|i| start + i).unwrap_or(text.len());
+    if nt_image(&text[start..end]).is_some() {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// 某条视觉行在屏幕上的 y（前提：从 `top` 起画）
+unsafe fn note_line_y(dc: HDC, lines: &[NtLine], top: usize, i: usize) -> i32 {
+    let mut y = nt_text_rect().top;
+    for k in top..i {
+        y += nt_line_h(dc, &lines[k]);
+    }
+    y
 }
 
 /// ↑/↓：按列上下移动（目标行里找离当前 x 最近的字符边界）
@@ -21698,83 +22609,167 @@ unsafe fn note_move_line(st: &mut State, dir: i32) {
     }
     let ta = nt_text_rect();
     let text = note_text(st).to_string();
-    let lines = note_lines(st, dc, &text, ta.right - ta.left);
+    let lines = note_layout(st, dc, &text, ta.right - ta.left);
     if lines.is_empty() {
         return;
     }
-    let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
+    let cur = nt_line_of(&lines, st.nt_caret.min(text.len()));
     let target = if dir < 0 { cur.saturating_sub(1) } else { (cur + 1).min(lines.len() - 1) };
     if target == cur {
         return;
     }
-    let (a0, _) = lines[cur];
-    let x = s_text_w(dc, &text[a0..st.nt_caret.max(a0)], st.cf_note);
-    let (ta0, tb0) = lines[target];
-    let mut best = ta0;
+    let l0 = lines[cur].clone();
+    let x = nt_x_in(st, dc, &l0, &text, st.nt_caret.max(l0.a));
+    let lt = lines[target].clone();
+    let mut best = lt.a;
     let mut bestd = i32::MAX;
-    let mut idx = ta0;
-    loop {
-        let d = (s_text_w(dc, &text[ta0..idx], st.cf_note) - x).abs();
-        if d < bestd {
-            bestd = d;
-            best = idx;
+    let mut acc = 0;
+    for (sa, sb, sty) in lt.segs.iter() {
+        let f = nt_sty_font(st, lt.font, *sty);
+        let mut idx = *sa;
+        loop {
+            let d = (acc + s_text_w(dc, &text[*sa..idx], f) - x).abs();
+            if d < bestd {
+                bestd = d;
+                best = idx;
+            }
+            if idx >= *sb {
+                break;
+            }
+            match text[idx..].chars().next() {
+                Some(c) if idx + c.len_utf8() <= *sb => idx += c.len_utf8(),
+                _ => break,
+            }
         }
-        if idx >= tb0 {
-            break;
-        }
-        match text[idx..].chars().next() {
-            Some(c) if idx + c.len_utf8() <= tb0 => idx += c.len_utf8(),
-            _ => break,
-        }
+        acc += s_text_w(dc, &text[*sa..*sb], f);
     }
     st.nt_caret = best;
     st.nt_blink = true;
 }
 
+/// 滚轮停在图上 = 缩放那张图（改写 `![](name@宽)` 里的宽度）。
+/// 返回 false = 光标不在图上，交给调用方翻页。
+unsafe fn note_zoom_under(st: &mut State, x: i32, y: i32, d: i16) -> bool {
+    let dc = st.c_lo_dc;
+    if dc.0.is_null() || d == 0 {
+        return false;
+    }
+    let ta = nt_text_rect();
+    let text = note_text(st).to_string();
+    let lines = note_layout(st, dc, &text, ta.right - ta.left);
+    if lines.is_empty() {
+        return false;
+    }
+    let top = st.nt_scroll.min(lines.len().saturating_sub(1));
+    let mut yy = ta.top;
+    for i in top..lines.len() {
+        let h = nt_line_h(dc, &lines[i]);
+        if y >= yy && y < yy + h {
+            let l = lines[i].clone();
+            if let NtBlk::Image(_idx, w0) = l.blk {
+                let x0 = ta.left + l.indent;
+                if x < x0 || x > x0 + w0 {
+                    return false;
+                }
+                let step = ((w0 as f32) * 0.12).max(12.0) as i32;
+                let nw = (w0 + if d > 0 { step } else { -step }).clamp(60, ta.right - ta.left);
+                let line = &text[l.a..l.b];
+                if let Some((name, _)) = nt_image(line) {
+                    let token = format!("![]({}@{})", name, nw);
+                    note_snap(st);
+                    st.nt_pages[st.nt_cur].replace_range(l.a..l.b, &token);
+                    // 光标保持在图后面（原来是换行结尾就还是结尾）
+                    if st.nt_caret > l.b {
+                        st.nt_caret = st.nt_caret - (l.b - l.a) + token.len();
+                    }
+                    note_caret_clamp(st);
+                    st.nt_lay = None;
+                    let _ = SetTimer(HWND(NOTE_HWND.load(Ordering::SeqCst) as *mut c_void), TIMER_NOTE_SAVE, 400, None);
+                    return true;
+                }
+            }
+            return false;
+        }
+        yy += h;
+        if yy > ta.bottom {
+            break;
+        }
+    }
+    false
+}
+
 /// 鼠标点在正文里 → 光标落到最近的字符边界（**点哪写哪**）。
 /// 点在最后一行下面 = 跳到末尾（编辑器都这样）。
 unsafe fn note_click(st: &mut State, x: i32, y: i32) {
+    st.nt_bold_want = false;
+    st.nt_bold_end = usize::MAX;
     let dc = st.c_lo_dc;
     if dc.0.is_null() {
         return;
     }
     let ta = nt_text_rect();
     let text = note_text(st).to_string();
-    let mut lines = note_lines(st, dc, &text, ta.right - ta.left);
+    let lines = note_layout(st, dc, &text, ta.right - ta.left);
     if lines.is_empty() {
         st.nt_caret = text.len();
         st.nt_blink = true;
         return;
     }
-    let lh = c_font_h(dc, st.cf_note).max(1);
-    let scroll = note_scroll(st, dc, &lines, lh);
-    let row = ((y - ta.top) / lh).max(0) as usize;
-    if scroll + row >= lines.len() {
+    let top = st.nt_scroll.min(lines.len().saturating_sub(1));
+    let mut yy = ta.top;
+    let mut hit = usize::MAX;
+    for i in top..lines.len() {
+        let h = nt_line_h(dc, &lines[i]);
+        if y < yy + h {
+            hit = i;
+            break;
+        }
+        yy += h;
+        if yy > ta.bottom {
+            break;
+        }
+    }
+    if hit == usize::MAX {
         st.nt_caret = text.len();
         st.nt_blink = true;
         return;
     }
-    let (a, b) = lines[scroll + row];
-    let mut best = a;
+    let l = lines[hit].clone();
+    let x0 = ta.left + l.indent;
+    // 图片行是原子块：点在图片右半边/右侧 → 光标到行尾（图片右边）；
+    // 点在图片上/左边 → 行首。以前 segs 是空的，怎么点都停在行首。
+    if let NtBlk::Image(_idx, w) = l.blk {
+        st.nt_caret = if x >= x0 + w { l.b } else { l.a };
+        st.nt_blink = true;
+        return;
+    }
+    let mut best = l.a;
     let mut bestd = i32::MAX;
-    let mut idx = a;
-    loop {
-        let d = (ta.left + s_text_w(dc, &text[a..idx], st.cf_note) - x).abs();
-        if d < bestd {
-            bestd = d;
-            best = idx;
+    // 在所有可见片段里找最近的字符边界（标记不参与，点不到）。
+    // ⚠️ 必须累加**前面各段**的宽度：多段行（带粗体/代码的行）里只从本段起点量，
+    //    越往后算出的 x 越靠左，点右边会把光标甩到很后面（用户 2026-11-02 报）。
+    let mut acc = 0;
+    for (sa, sb, sty) in l.segs.iter() {
+        let f = nt_sty_font(st, l.font, *sty);
+        let mut idx = *sa;
+        loop {
+            let d = (x0 + acc + s_text_w(dc, &text[*sa..idx], f) - x).abs();
+            if d < bestd {
+                bestd = d;
+                best = idx;
+            }
+            if idx >= *sb {
+                break;
+            }
+            match text[idx..].chars().next() {
+                Some(c) if idx + c.len_utf8() <= *sb => idx += c.len_utf8(),
+                _ => break,
+            }
         }
-        if idx >= b {
-            break;
-        }
-        match text[idx..].chars().next() {
-            Some(c) if idx + c.len_utf8() <= b => idx += c.len_utf8(),
-            _ => break,
-        }
+        acc += s_text_w(dc, &text[*sa..*sb], f);
     }
     st.nt_caret = best;
     st.nt_blink = true;
-    let _ = &mut lines;
 }
 
 /// 翻到第 `p` 页（越界不动），返回「有没有真的翻」
@@ -21783,9 +22778,15 @@ unsafe fn note_go(st: &mut State, p: usize) -> bool {
         return false;
     }
     st.nt_cur = p;
+    st.nt_edit_title = false;
+    st.nt_tcaret = note_title(st).len();
     st.nt_caret = note_text(st).len();
     st.nt_comp.clear();
     st.nt_lay = None;
+    st.nt_scroll = 0;
+    st.nt_scroll_seen = (0, usize::MAX);
+    st.nt_bold_want = false;
+    st.nt_bold_end = usize::MAX;
     st.nt_blink = true;
     true
 }
@@ -21797,20 +22798,51 @@ unsafe fn note_new_page(st: &mut State, hwnd: HWND) {
     }
     // 新页放在**第一页**（用户 2026-11-02：「新开一页应该是第一页而不是第二页吧」）——
     // 便签是"往上摞的纸"：最新那张在最上面，越往下越旧。
+    // 组字没上屏就切页：先把这段落进**旧页**，别让 IME 以为还在组字
+    if !st.nt_comp.is_empty() {
+        let comp = st.nt_comp.clone();
+        st.nt_comp.clear();
+        note_insert(st, hwnd, &comp);
+    }
+    // 新页带默认标题「便签 N」（用户 2026-11-02：标题默认就是标签+数字）
+    let title = nt_default_title(st);
+    st.nt_tseq += 1;
     st.nt_pages.insert(0, String::new());
+    st.nt_titles.insert(0, title.clone());
     st.nt_cur = 0;
     st.nt_caret = 0;
-    st.nt_plus_hot = false;
-    st.nt_comp.clear();
+    st.nt_edit_title = false;
+    st.nt_tcaret = title.len();
+    st.nt_tool_hot = 0;
     st.nt_lay = None;
+    st.nt_scroll = 0;
+    st.nt_scroll_seen = (0, usize::MAX);
+    st.nt_bold_want = false;
+    st.nt_bold_end = usize::MAX;
     st.nt_blink = true;
+    // 点完按钮别把键盘焦点丢掉（用户 2026-11-02 报「新页打不了字」）：
+    // 客户端点击**不保证**把键盘焦点给窗口（我们的 WM_LBUTTONDOWN 没走 DefWindowProc），
+    // 所以这里显式抢一次焦点，再拿一次前台。
+    let _ = SetFocus(hwnd);
+    focus_window(hwnd);
+    clip_log(&format!(
+        "note newpage pages={} cur={} fg={} focus={}",
+        st.nt_pages.len(),
+        st.nt_cur,
+        GetForegroundWindow() == hwnd,
+        GetFocus() == hwnd
+    ));
     let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
 }
 
 /// Ctrl+V：把剪贴板里的**文字**接到光标处（v1 不接图片/文件）
 unsafe fn note_paste(st: &mut State, hwnd: HWND) {
+    // 剪贴板里有图（CF_DIB）→ 存成 notes/<名字>.dib 并插一行 `![](名字@宽)`
+    if note_paste_image(st, hwnd) {
+        return;
+    }
     let mut txt = String::new();
-    if OpenClipboard(HWND(ptr::null_mut())).is_ok() {
+    if clip_open_retry() {
         if let Ok(h) = GetClipboardData(13) {
             let hg = HGLOBAL(h.0);
             let p = GlobalLock(hg);
@@ -21828,75 +22860,786 @@ unsafe fn note_paste(st: &mut State, hwnd: HWND) {
         let _ = CloseClipboard();
     }
     if txt.is_empty() {
+        clip_log("note paste text none");
         return;
     }
+    clip_log(&format!("note paste text len={}", txt.chars().count()));
     let clean: String = txt.chars().filter(|c| *c != '\r').collect();
     note_insert(st, hwnd, &clean);
 }
 
-/// Ctrl+C：v1 没有选区，复制**整页**（记完的东西顺手带走）
-unsafe fn note_copy(st: &mut State) {
-    let txt = note_text(st).to_string();
-    if txt.is_empty() || OpenClipboard(HWND(ptr::null_mut())).is_err() {
-        return;
+/// Ctrl+V 贴图：把剪贴板的 CF_DIB 落到 `notes/<时间戳>.dib`，正文里插一行
+/// `![](名字@宽)`（宽按"能放下"给个初值，之后滚轮可调）。
+unsafe fn note_paste_image(st: &mut State, hwnd: HWND) -> bool {
+    if !clip_open_retry() {
+        clip_log("note paste img open-busy");
+        return false;
+    }
+    // 来源不同，挂的格式也不同：
+    //   CF_DIB      截图工具 / 老程序
+    //   "PNG"       浏览器、Electron 系应用（只有 PNG，没有 DIB）
+    //   CF_HDROP    在资源管理器里复制的图片文件
+    let png_fmt = RegisterClipboardFormatW(PCWSTR(wide("PNG").as_ptr()));
+    let has_dib = IsClipboardFormatAvailable(8).is_ok();
+    let has_bmp = IsClipboardFormatAvailable(2).is_ok();
+    let has_png = png_fmt != 0 && IsClipboardFormatAvailable(png_fmt).is_ok();
+    let has_files = IsClipboardFormatAvailable(15).is_ok();
+    let mut dib = if has_dib { clip_fmt_bytes(8).filter(|b| dib_info(b).is_some()) } else { None };
+    if dib.is_none() && has_bmp && !has_dib {
+        dib = dib_from_cf_bitmap();
+    }
+    if dib.is_none() && has_png {
+        if let Some(raw) = clip_fmt_bytes(png_fmt) {
+            dib = wic_image_to_dib(&raw);
+        }
+    }
+    if dib.is_none() && has_files {
+        if let Some(path) = hdrop_first_image() {
+            if let Ok(raw) = std::fs::read(&path) {
+                dib = wic_image_to_dib(&raw);
+            }
+        }
     }
     let _ = CloseClipboard();
+    let Some(bytes) = dib else {
+        clip_log(&format!(
+            "note paste img none dib={has_dib} bmp={has_bmp} png={has_png} files={has_files}"
+        ));
+        return false;
+    };
+    note_put_image(st, hwnd, &bytes)
+}
+
+/// 把一张 DIB 落盘成 `notes/<name>.dib` 并在光标处插入图片行（粘贴 / 文件按钮共用）。
+unsafe fn note_put_image(st: &mut State, hwnd: HWND, bytes: &[u8]) -> bool {
+    let _ = std::fs::create_dir_all(note_img_dir());
+    let name = format!("n{}.dib", unix_now() as i64);
+    if std::fs::write(note_img_path(&name), bytes).is_err() {
+        clip_log("note paste img write-fail");
+        return false;
+    }
+    // 宽度初值：图本身比正文窄就按原尺寸，否则铺满正文宽度
+    let (bmi, _) = dib_info(bytes).unwrap();
+    let iw = bmi.bmiHeader.biWidth.max(1);
+    let ta = nt_text_rect();
+    let maxw = (ta.right - ta.left).max(40);
+    let w = iw.min(maxw);
+    let token = format!("![]({}@{})", name, w);
+    let text = note_text(st).to_string();
+    let mut at = st.nt_caret.min(text.len());
+    // 光标在旧图片行里：先挪到行尾，交给 `note_insert` 的图片行分支另起一行
+    let on_img = nt_img_line_at(&text, at).map(|(_, b)| b).filter(|b| at <= *b);
+    if let Some(b) = on_img {
+        at = b;
+        st.nt_caret = b;
+    }
+    // 贴图单独占一行：前后各补一个换行（行首/行尾不重复补）
+    let lead = if on_img.is_some() || at == 0 || text[..at].ends_with('\n') { "" } else { "\n" };
+    let tail = if on_img.is_some() || at >= text.len() || text[at..].starts_with('\n') { "" } else { "\n" };
+    note_insert(st, hwnd, &format!("{lead}{token}{tail}"));
+    true
+}
+
+/// 底栏工具：0 待办 / 1 粗体 / 2 无序列表 / 3 分割线 / 4 图片 / 5 新页
+unsafe fn note_tool(st: &mut State, hwnd: HWND, which: i32) {
+    let _ = SetFocus(hwnd);
+    if which != 1 {
+        st.nt_bold_want = false;
+        st.nt_bold_end = usize::MAX;
+    }
+    match which {
+        0 => {
+            // 待办是**开关**：这一行已经有 `- [ ] ` / `- [x] ` 就取消，没有才加。
+            let text = note_text(st).to_string();
+            let at = st.nt_caret.min(text.len());
+            let (lstart, lend) = note_line_span(&text, at);
+            let line = &text[lstart..lend];
+            if let Some((_done, plen)) = nt_task(line) {
+                note_snap(st);
+                let end = (lstart + plen).min(lend);
+                st.nt_pages[st.nt_cur].replace_range(lstart..end, "");
+                st.nt_caret = lstart;
+                st.nt_sel = usize::MAX;
+                note_touch(st, hwnd);
+            } else {
+                st.nt_caret = lstart;
+                st.nt_sel = usize::MAX;
+                note_insert(st, hwnd, NT_TASK_U);
+            }
+        }
+        1 => note_bold_toggle(st, hwnd),
+        2 => {
+            // 无序列表：`- ` 开关；任务行则降级成普通列表
+            let text = note_text(st).to_string();
+            let at = st.nt_caret.min(text.len());
+            let (lstart, lend) = note_line_span(&text, at);
+            let line = &text[lstart..lend];
+            note_snap(st);
+            if let Some((_done, plen)) = nt_task(line) {
+                let end = (lstart + plen).min(lend);
+                st.nt_pages[st.nt_cur].replace_range(lstart..end, "- ");
+                st.nt_caret = lstart + 2;
+            } else if line.starts_with("- ") {
+                st.nt_pages[st.nt_cur].replace_range(lstart..lstart + 2, "");
+                st.nt_caret = lstart;
+            } else {
+                st.nt_pages[st.nt_cur].insert_str(lstart, "- ");
+                st.nt_caret = lstart + 2;
+            }
+            st.nt_sel = usize::MAX;
+            note_touch(st, hwnd);
+        }
+        3 => {
+            // 分割线是**开关**：光标所在行已经是 `---` 就整行删掉；否则另起一行插入。
+            let text = note_text(st).to_string();
+            let at = st.nt_caret.min(text.len());
+            let (lstart, lend) = note_line_span(&text, at);
+            // 刚插完时光标在下面那行（空行）：再点一次 = 撤掉上面这条分割线
+            let prev_hr = lstart > 0 && {
+                let (pa, pb) = note_line_span(&text, lstart - 1);
+                note_is_hr(&text[pa..pb])
+            };
+            if note_is_hr(&text[lstart..lend]) {
+                note_remove_line(st, hwnd, lstart, lend);
+            } else if prev_hr && text[lstart..lend].trim().is_empty() {
+                let (pa, pb) = note_line_span(&text, lstart - 1);
+                note_remove_line(st, hwnd, pa, pb);
+            } else {
+                // 光标要落在线**下面**：行尾没有换行就补一个；已经有换行就跨过去。
+                let lead = if at == 0 || text[..at].ends_with('\n') { "" } else { "\n" };
+                let has_nl = at < text.len() && text[at..].starts_with('\n');
+                let tail = if has_nl { "" } else { "\n" };
+                note_insert(st, hwnd, &format!("{lead}---{tail}"));
+                if has_nl {
+                    st.nt_caret = (st.nt_caret + 1).min(note_text(st).len());
+                }
+            }
+        }
+        4 => {
+            // 系统文件对话框期间：钩子的「点外面就收」、失焦看门狗、WM_ACTIVATE 都要停
+            st.nt_picking = true;
+            NOTE_MODAL.store(true, Ordering::SeqCst);
+            let picked = pick_image_file(hwnd);
+            NOTE_MODAL.store(false, Ordering::SeqCst);
+            st.nt_picking = false;
+            st.nt_fg0 = now_s();
+            if let Some(path) = picked {
+                if let Ok(raw) = std::fs::read(&path) {
+                    if let Some(dib) = wic_image_to_dib(&raw) {
+                        note_put_image(st, hwnd, &dib);
+                    }
+                }
+            }
+            focus_window(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+        _ => note_new_page(st, hwnd),
+    }
+    st.nt_lay = None;
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+}
+
+/// 整行删掉（分割线用）：中间行连结尾换行一起删，末行则吃掉前面的换行，免得留空行。
+unsafe fn note_remove_line(st: &mut State, hwnd: HWND, lstart: usize, lend: usize) {
+    let text = note_text(st).to_string();
+    note_snap(st);
+    // 删完不能留下一个空行：这行在文末时，连**前面**那个换行一起删
+    let mut a = lstart;
+    let b = if lend < text.len() { lend + 1 } else { lend };
+    if b == text.len() && a > 0 && text.as_bytes()[a - 1] == b'\n' {
+        a -= 1;
+    }
+    st.nt_pages[st.nt_cur].replace_range(a..b.min(text.len()), "");
+    st.nt_caret = a.min(note_text(st).len());
+    st.nt_sel = usize::MAX;
+    note_touch(st, hwnd);
+}
+
+/// 删除当前页（多页才可删），弹 2.5s「已删除 · 撤销」
+unsafe fn note_delete_page(st: &mut State, hwnd: HWND) {
+    let n = st.nt_pages.len();
+    if n <= 1 {
+        return;
+    }
+    let i = st.nt_cur.min(n - 1);
+    let title = st.nt_titles.get(i).cloned().unwrap_or_default();
+    let text = st.nt_pages[i].clone();
+    st.nt_pages.remove(i);
+    st.nt_titles.remove(i);
+    // 撤销栈里记的是页号，删页后就对不上了 —— 清空比错乱安全
+    st.nt_undo.clear();
+    st.nt_redo.clear();
+    st.nt_cur = i.min(st.nt_pages.len() - 1);
+    st.nt_caret = note_text(st).len();
+    st.nt_sel = usize::MAX;
+    st.nt_edit_title = false;
+    st.nt_tcaret = note_title(st).len();
+    st.nt_lay = None;
+    st.nt_scroll = 0;
+    st.nt_scroll_seen = (0, usize::MAX);
+    st.nt_toast = "已删除".to_string();
+    st.nt_toast_until = now_s() + 1.8;
+    st.nt_toast_undo = Some((i, title, text));
+    let _ = SetFocus(hwnd);
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+}
+
+unsafe fn note_undo_delete(st: &mut State, hwnd: HWND) {
+    let Some((i, title, text)) = st.nt_toast_undo.take() else {
+        return;
+    };
+    let i = i.min(st.nt_pages.len());
+    st.nt_pages.insert(i, text);
+    st.nt_titles.insert(i, title);
+    st.nt_cur = i;
+    st.nt_caret = note_text(st).len();
+    st.nt_sel = usize::MAX;
+    st.nt_lay = None;
+    st.nt_scroll = 0;
+    st.nt_scroll_seen = (0, usize::MAX);
+    st.nt_toast.clear();
+    st.nt_toast_until = 0.0;
+    let _ = SetFocus(hwnd);
+    let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+}
+
+/// Ctrl+C：v1 没有选区，复制**整页**（记完的东西顺手带走）
+unsafe fn note_copy(st: &mut State) {
+    // 有选区就只复制选区（用户 2026-11-02 要的"选中一段复制"）
+    let sel = note_sel_text(st);
+    let txt = sel.clone().unwrap_or_else(|| note_text(st).to_string());
+    if txt.is_empty() {
+        clip_log("note copy none (empty)");
+        return;
+    }
     let mut bytes: Vec<u8> = Vec::with_capacity((txt.len() + 1) * 2);
     for c in txt.encode_utf16().chain(std::iter::once(0)) {
         bytes.extend_from_slice(&c.to_le_bytes());
     }
-    if clip_put(13, &bytes) {
+    let ok = clip_put(13, &bytes);
+    clip_log(&format!(
+        "note copy sel={} chars={} ok={}",
+        sel.is_some() as u8,
+        txt.chars().count(),
+        ok as u8
+    ));
+    if ok {
         // 自己写的那一次别记进历史（和 `clip_paste` 同一条规矩）
         CLIP_SELF_SEQ.store(GetClipboardSequenceNumber(), Ordering::SeqCst);
     }
 }
 
-/// 当前页 → 排版行区间（带一条缓存：光标每 500ms 闪一次就重排一遍太浪费）
-unsafe fn note_lines(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<(usize, usize)> {
+/// Markdown 块（Typora 那套"+ 空格立刻变成标题"的最小版）：
+/// 只做**行级**格式，行内粗体/斜体是下一步（要按 run 排版，改动更大）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NtBlk {
+    Plain,
+    H1,
+    H2,
+    H3,
+    Bullet,
+    Ordered,
+    Quote,
+    Task(bool),
+    Fence,
+    Code,
+    Hr,
+    /// 一张图：`(nt_imgs 下标, 显示宽度)`
+    Image(usize, i32),
+}
+
+/// 一行（逻辑行）的块类型 + 行首标记的字节长度（渲染时标记要吃掉/换符号）
+fn nt_block(line: &str) -> (NtBlk, usize) {
+    if let Some(t) = nt_task(line) {
+        return (NtBlk::Task(t.0), t.1);
+    }
+    let b = line.as_bytes();
+    let hashes = b.iter().take_while(|c| **c == b'#').count();
+    if (1..=3).contains(&hashes) && b.get(hashes) == Some(&b' ') {
+        return (
+            match hashes {
+                1 => NtBlk::H1,
+                2 => NtBlk::H2,
+                _ => NtBlk::H3,
+            },
+            hashes + 1,
+        );
+    }
+    if line.starts_with("```") {
+        return (NtBlk::Fence, 3);
+    }
+    if line.trim_end() == "---" || line.trim_end() == "***" {
+        return (NtBlk::Hr, line.trim_end().len());
+    }
+    if let Some(r) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("+ ")) {
+        return (NtBlk::Bullet, line.len() - r.len());
+    }
+    // 有序列表：`1. ` / `12. `
+    let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && digits <= 3 && b.get(digits) == Some(&b'.') && b.get(digits + 1) == Some(&b' ') {
+        return (NtBlk::Ordered, digits + 2);
+    }
+    if let Some(r) = line.strip_prefix("> ") {
+        return (NtBlk::Quote, line.len() - r.len());
+    }
+    (NtBlk::Plain, 0)
+}
+
+/// 行内样式（Typora 那种打完就变样，标记被吃掉）
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NtSty {
+    Plain,
+    Bold,
+    Italic,
+    Code,
+    Strike,
+}
+
+/// 便签里贴的图（`notes/<name>` 里的 DIB 原样载入，绘制时缩放）
+struct NtImg {
+    name: String,
+    w: i32,
+    h: i32,
+    bmi: BITMAPINFO,
+    bits: Vec<u8>,
+}
+
+fn note_img_dir() -> String {
+    format!("{}\\notes", config_dir())
+}
+
+fn note_img_path(name: &str) -> String {
+    format!("{}\\{}", note_img_dir(), name)
+}
+
+/// 打开剪贴板，失败退避重试。
+/// 输入法 / 同步盘 / 截图工具都会短暂占用剪贴板 —— 一次失败就放弃，
+/// 在用户眼里就是「Ctrl+C / Ctrl+V 完全没反应」。
+unsafe fn clip_open_retry() -> bool {
+    for i in 0..6 {
+        if OpenClipboard(HWND(ptr::null_mut())).is_ok() {
+            return true;
+        }
+        if i < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    false
+}
+
+/// 剪贴板格式 → 连续字节（CF_DIB / 注册的 "PNG" 这类 HGLOBAL 格式）。
+unsafe fn clip_fmt_bytes(fmt: u32) -> Option<Vec<u8>> {
+    let h = GetClipboardData(fmt).ok()?;
+    let hg = HGLOBAL(h.0);
+    let n = GlobalSize(hg);
+    if n == 0 || n > CL_MAX_DIB {
+        return None;
+    }
+    let p = GlobalLock(hg) as *const u8;
+    if p.is_null() {
+        return None;
+    }
+    let v = std::slice::from_raw_parts(p, n).to_vec();
+    let _ = GlobalUnlock(hg);
+    Some(v)
+}
+
+/// 剪贴板里的文件列表（CF_HDROP）→ 第一张图片文件的路径。
+unsafe fn hdrop_first_image() -> Option<String> {
+    let h = GetClipboardData(15).ok()?;
+    let hd = HDROP(h.0);
+    let n = DragQueryFileW(hd, u32::MAX, None);
+    for i in 0..n {
+        let mut buf = [0u16; 520];
+        let len = DragQueryFileW(hd, i, Some(&mut buf)) as usize;
+        if len == 0 || len > buf.len() {
+            continue;
+        }
+        let path = String::from_utf16_lossy(&buf[..len]);
+        let lower = path.to_ascii_lowercase();
+        let image = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"];
+        if image.iter().any(|e| lower.ends_with(e)) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// PNG / JPEG / GIF / WebP / BMP 字节 → 32 位 DIB（WIC 解码，透明处按纸色合成）。
+/// 剪贴板里只有 "PNG" 格式（Electron 系应用很常见）时走这条。
+fn wic_image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let stream = factory.CreateStream().ok()?;
+        // InitializeFromMemory 不复制内容，解码头活在这段 bytes 里 —— 调用方保证 bytes 活到解码完
+        stream
+            .InitializeFromMemory(bytes)
+            .ok()?;
+        let decoder = factory
+            .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+            .ok()?;
+        let frame = decoder.GetFrame(0).ok()?;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        frame.GetSize(&mut w, &mut h).ok()?;
+        if w == 0 || h == 0 || w > 16384 || h > 16384 {
+            return None;
+        }
+        let conv = factory.CreateFormatConverter().ok()?;
+        conv.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )
+        .ok()?;
+        let need = (w * h * 4) as usize;
+        let mut px = vec![0u8; need];
+        conv.CopyPixels(std::ptr::null(), w * 4, &mut px).ok()?;
+        // 透明像素在 DIB 里是黑的（SRCCOPY 不看 alpha），先按纸色合成掉
+        let (pr, pg, pb) = (P_PAPER.2 as u32, P_PAPER.1 as u32, P_PAPER.0 as u32);
+        for p in px.chunks_mut(4) {
+            if p[3] < 255 {
+                let a = p[3] as u32;
+                p[0] = ((p[0] as u32 * a + pb * (255 - a)) / 255) as u8;
+                p[1] = ((p[1] as u32 * a + pg * (255 - a)) / 255) as u8;
+                p[2] = ((p[2] as u32 * a + pr * (255 - a)) / 255) as u8;
+                p[3] = 255;
+            }
+        }
+        let mut dib = Vec::with_capacity(40 + need);
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&(w as i32).to_le_bytes());
+        dib.extend_from_slice(&(-(h as i32)).to_le_bytes()); // 负高度 = 自上而下（WIC 的行序）
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib.extend_from_slice(&(need as u32).to_le_bytes());
+        dib.extend_from_slice(&[0u8; 16]); // 分辨率 / 调色板
+        dib.extend_from_slice(&px);
+        Some(dib)
+    }
+}
+
+/// 取一张图（第一次用就解码并缓存）
+unsafe fn note_img_get(st: &mut State, name: &str) -> Option<usize> {
+    if let Some(i) = st.nt_imgs.iter().position(|m| m.name == name) {
+        return Some(i);
+    }
+    let bytes = std::fs::read(note_img_path(name)).ok()?;
+    let (bmi, off) = dib_info(&bytes)?;
+    let w = bmi.bmiHeader.biWidth;
+    let h = bmi.bmiHeader.biHeight.abs();
+    if off >= bytes.len() {
+        return None;
+    }
+    st.nt_imgs.push(NtImg { name: name.to_string(), w, h, bmi, bits: bytes[off..].to_vec() });
+    Some(st.nt_imgs.len() - 1)
+}
+
+/// 一条**视觉行**：可见片段的字节区间 + 块级字体/缩进 + 块类型（标记只在第一视觉行画）
+#[derive(Clone)]
+struct NtLine {
+    a: usize,
+    b: usize,
+    font: HFONT,
+    indent: i32,
+    blk: NtBlk,
+    first: bool,
+    /// 代码块（围栏内）的正文
+    in_code: bool,
+    /// 这一行里**可见**的片段（绝对字节区间 + 样式）；标记 `**` `*` `` ` `` 已剔除
+    segs: Vec<(usize, usize, NtSty)>,
+    /// 图片行的高度（0 = 普通文字行，高度按字体算）
+    ih: i32,
+}
+
+/// 行高：图片行用 `ih`，文字行按字体
+unsafe fn nt_line_h(dc: HDC, l: &NtLine) -> i32 {
+    if l.ih > 0 {
+        l.ih
+    } else {
+        c_font_h(dc, l.font).max(1)
+    }
+}
+
+/// 行首是 `![](name)` / `![](name@宽)` → 图片行
+fn nt_image(line: &str) -> Option<(String, i32)> {
+    let t = line.trim();
+    let inner = t.strip_prefix("![](")?.strip_suffix(')')?;
+    let (name, w) = match inner.rsplit_once('@') {
+        Some((n, w)) => (n, w.trim().parse::<i32>().unwrap_or(0)),
+        None => (inner, 0),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), w))
+}
+
+/// 把一行切成样式片段。**不嵌套**（够用）：`**粗**`、`*斜*`、`` `代码` ``、`~~删除~~`。
+/// 返回的区间不含标记本身 —— 标记只是语法，不显示。
+fn nt_runs(line: &str) -> Vec<(usize, usize, NtSty)> {
+    let mut out: Vec<(usize, usize, NtSty)> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut plain = 0usize;
+    while i < bytes.len() {
+        if !line.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &line[i..];
+        let (marker, sty) = if rest.starts_with("**") {
+            ("**", NtSty::Bold)
+        } else if rest.starts_with("~~") {
+            ("~~", NtSty::Strike)
+        } else if rest.starts_with('`') {
+            ("`", NtSty::Code)
+        } else if rest.starts_with('*') {
+            ("*", NtSty::Italic)
+        } else {
+            i += 1;
+            continue;
+        };
+        let ml = marker.len();
+        if let Some(rel) = rest[ml..].find(marker) {
+            let inner_a = i + ml;
+            let inner_b = inner_a + rel;
+            if inner_b > inner_a {
+                if plain < i {
+                    out.push((plain, i, NtSty::Plain));
+                }
+                out.push((inner_a, inner_b, sty));
+                i = inner_b + ml;
+                plain = i;
+                continue;
+            }
+        }
+        i += ml;
+    }
+    if plain < bytes.len() {
+        out.push((plain, bytes.len(), NtSty::Plain));
+    }
+    out
+}
+
+unsafe fn nt_sty_font(st: &State, base: HFONT, sty: NtSty) -> HFONT {
+    match sty {
+        NtSty::Bold => st.cf_b15,
+        NtSty::Italic => st.cf_i15,
+        NtSty::Code => st.cf_mono,
+        _ => base,
+    }
+}
+
+unsafe fn nt_font(st: &State, blk: NtBlk, in_code: bool) -> HFONT {
+    if in_code || blk == NtBlk::Fence {
+        return st.cf_mono;
+    }
+    match blk {
+        NtBlk::H1 => st.cf_h1,
+        NtBlk::H2 => st.cf_h2,
+        NtBlk::H3 => st.cf_h3,
+        NtBlk::Fence | NtBlk::Code => st.cf_mono,
+        _ => st.cf_note,
+    }
+}
+
+fn nt_indent(blk: NtBlk) -> i32 {
+    match blk {
+        NtBlk::H1 | NtBlk::H2 | NtBlk::H3 => 0,
+        NtBlk::Bullet | NtBlk::Task(_) | NtBlk::Ordered => 20,
+        NtBlk::Quote => 14,
+        NtBlk::Fence | NtBlk::Code => 12,
+        _ => 0,
+    }
+}
+
+/// 整页排版：按逻辑行分块、每块用自己的字体/缩进换行。
+/// 缓存一条（`(文本摘要, 框宽) → 结果`）：光标每 500ms 闪一次，不能每次都重排。
+unsafe fn note_layout(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<NtLine> {
     let h = cl_hash(text);
     if let Some((th, w, lines)) = &st.nt_lay {
         if *th == h && *w == maxw {
             return lines.clone();
         }
     }
-    let (lines, _more) = cl_layout(dc, text, st.cf_note, maxw, 20000);
-    st.nt_lay = Some((h, maxw, lines.clone()));
-    lines
+    let mut out: Vec<NtLine> = Vec::new();
+    let mut lstart = 0usize;
+    let mut in_code = false;
+    loop {
+        let lend = text[lstart..].find('\n').map(|i| lstart + i).unwrap_or(text.len());
+        let line = &text[lstart..lend];
+        // 图片行：`![](name)` / `![](name@宽)`（没有闭引号就是普通文字）
+        if !in_code {
+            if let Some((name, wreq)) = nt_image(line) {
+                st.nt_imgs.retain(|m| std::path::Path::new(&note_img_path(&m.name)).exists());
+                if let Some(idx) = note_img_get(st, &name) {
+                    let (iw, ih0) = (st.nt_imgs[idx].w.max(1), st.nt_imgs[idx].h.max(1));
+                    let avail0 = (maxw - 12).max(40);
+                    let w = if wreq > 0 { wreq.clamp(40, maxw * 3) } else { iw.min(avail0) };
+                    let h = ((w as f32) * ih0 as f32 / iw as f32).round() as i32;
+                    out.push(NtLine {
+                        a: lstart,
+                        b: lend,
+                        font: st.cf_note,
+                        indent: 6,
+                        blk: NtBlk::Image(idx, w),
+                        first: true,
+                        in_code: false,
+                        segs: Vec::new(),
+                        ih: h.max(8) + 8,
+                    });
+                    if lend >= text.len() {
+                        break;
+                    }
+                    lstart = lend + 1;
+                    if lstart > text.len() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        let (blk0, mlen) = nt_block(line);
+        let mut blk = blk0;
+        if blk == NtBlk::Fence {
+            in_code = !in_code;
+        } else if in_code {
+            blk = NtBlk::Code;
+        }
+        let font = nt_font(st, blk, in_code && blk == NtBlk::Code);
+        let indent = nt_indent(blk);
+        let body_start = lstart + mlen.min(line.len());
+        // Markdown 的块标记不当文字：`# ` `> ` `- [ ] ` 已经吃掉，这里再处理行内标记
+        let body = &text[body_start..lend];
+        let runs_rel = if in_code || blk == NtBlk::Code {
+            vec![(0usize, body.len(), NtSty::Plain)]
+        } else {
+            nt_runs(body)
+        };
+        // 切单元（CJK 一字一单元 / 拉丁按词），按各自的字体量宽
+        let mut units: Vec<(usize, usize, NtSty)> = Vec::new();
+        for (ra, rb, sty) in runs_rel {
+            let mut i = ra;
+            while i < rb {
+                let c = body[i..].chars().next().unwrap_or(' ');
+                let (u0, u1) = if c.is_whitespace() || cl_is_cjk(c) {
+                    (i, i + c.len_utf8())
+                } else {
+                    let mut j = i + c.len_utf8();
+                    while j < rb {
+                        let c2 = body[j..].chars().next().unwrap_or(' ');
+                        if c2.is_whitespace() || cl_is_cjk(c2) {
+                            break;
+                        }
+                        j += c2.len_utf8();
+                    }
+                    (i, j)
+                };
+                units.push((u0, u1, sty));
+                i = u1;
+            }
+        }
+        // 贪心填行
+        let avail = (maxw - indent).max(20);
+        let mut segs: Vec<(usize, usize, NtSty)> = Vec::new();
+        let mut cur_w = 0i32;
+        let mut pushed_any = false;
+        // 收一条视觉行（不能写成闭包：它要同时改 `out` / `pushed_any` / `segs`）
+        macro_rules! flush {
+            () => {{
+                let a = segs.first().map(|x| x.0).unwrap_or(0);
+                let b = segs.last().map(|x| x.1).unwrap_or(0);
+                out.push(NtLine {
+                    a: body_start + a,
+                    b: body_start + b,
+                    font,
+                    indent,
+                    blk,
+                    first: !pushed_any,
+                    in_code: blk == NtBlk::Code,
+                    segs: segs.iter().map(|(x, y, st)| (body_start + x, body_start + y, *st)).collect(),
+                    ih: 0,
+                });
+                pushed_any = true;
+                segs.clear();
+                cur_w = 0;
+            }};
+        }
+        for (ua, ub, sty) in units {
+            let f = nt_sty_font(st, font, sty);
+            let w = s_text_w(dc, &body[ua..ub], f);
+            if cur_w > 0 && cur_w + w > avail {
+                flush!();
+            }
+            segs.push((ua, ub, sty));
+            cur_w += w;
+        }
+        if !segs.is_empty() || !pushed_any {
+            flush!();
+        }
+        let _ = (cur_w, pushed_any);
+        if lend >= text.len() {
+            break;
+        }
+        lstart = lend + 1;
+        if lstart > text.len() {
+            break;
+        }
+    }
+    st.nt_lay = Some((h, maxw, out.clone()));
+    out
 }
 
-/// 字节下标落在第几行（`lines` 是 `cl_layout` 输出的 (start,end)，start 单调递增）
-fn note_line_of(lines: &[(usize, usize)], idx: usize) -> usize {
+/// 光标落在第几条视觉行/// 光标落在第几条视觉行（取最后一个 `a <= idx` 的行）
+fn nt_line_of(lines: &[NtLine], idx: usize) -> usize {
     lines
         .iter()
-        .rposition(|(a, _)| *a <= idx)
+        .rposition(|l| l.a <= idx)
         .unwrap_or(0)
         .min(lines.len().saturating_sub(1))
 }
 
-/// 光标在卡片坐标里的落点（IME 候选窗用它定位）。量不出来就给正文区左上角。
+/// 当前页 → 排版行区间（带一条缓存：光标每 500ms 闪一次就重排一遍太浪费）/// 光标在卡片坐标里的落点（IME 候选窗用它定位）。量不出来就给正文区左上角。
 unsafe fn note_caret_point(st: &State) -> (i32, i32) {
     let ta = nt_text_rect();
     if st.c_lo_dc.0.is_null() {
         return (ta.left, ta.top);
     }
-    let Some((_, _w, lines)) = &st.nt_lay else {
+    let Some((_, _, lines)) = &st.nt_lay else {
         return (ta.left, ta.top);
     };
     if lines.is_empty() {
         return (ta.left, ta.top);
     }
-    let lh = c_font_h(st.c_lo_dc, st.cf_note).max(1);
-    let full = {
+    let text = {
         let mut s = note_text(st).to_string();
         s.push_str(&st.nt_comp);
         s
     };
-    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
-    let scroll = lines.len().saturating_sub(visible);
-    let (a, b) = lines[lines.len() - 1];
-    let tail = full.get(a..b).unwrap_or("");
-    let x = (ta.left + s_text_w(st.c_lo_dc, tail, st.cf_note)).min(ta.right - 4);
-    let y = ta.top + (lines.len() - 1 - scroll) as i32 * lh;
+    let lno = nt_line_of(lines, st.nt_caret.min(text.len()));
+    let l = lines[lno].clone();
+    let top = st.nt_scroll.min(lines.len().saturating_sub(1));
+    let y = note_line_y(st.c_lo_dc, lines, top, lno);
+    let x = if let NtBlk::Image(_, w) = l.blk {
+        (ta.left + l.indent + if st.nt_caret >= l.b { w } else { 0 }).min(ta.right - 4)
+    } else {
+        let mut e = st.nt_caret.max(l.a).min(text.len());
+        while e > l.a && !text.is_char_boundary(e) {
+            e -= 1;
+        }
+        (ta.left + l.indent + s_text_w(st.c_lo_dc, &text[l.a..e], l.font)).min(ta.right - 4)
+    };
     (x, y)
 }
 
@@ -21906,7 +23649,14 @@ unsafe fn note_ime_place(st: &State, hwnd: HWND) {
     if himc.0.is_null() {
         return;
     }
-    let (x, y) = note_caret_point(st);
+    let (x, y) = if st.nt_edit_title {
+        let tr = nt_title_rect();
+        let t = note_title(st).to_string();
+        let at = st.nt_tcaret.min(t.len());
+        (tr.left + s_text_w(st.c_lo_dc, &t[..at], st.cf_h3), tr.top)
+    } else {
+        note_caret_point(st)
+    };
     let mut cf = COMPOSITIONFORM {
         dwStyle: CFS_POINT,
         ptCurrentPos: POINT { x: x + S_M, y: y + S_M },
@@ -21945,10 +23695,34 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         g_shadow(dc, s, CL_RAD, &pal);
         g_rrect(dc, s, CL_RAD, pal.paper, Some(mixc(pal.edge, pal.ink, 0.18)), 1);
     }
+    // ── 标题条（可点击进去改名）──
+    {
+        let tr = nt_title_rect();
+        let title = note_title(st).to_string();
+        let tfont = st.cf_h3;
+        let dim = title.trim().is_empty();
+        let has_del = st.nt_pages.len() > 1;
+        c_text(dc, &title, RECT { left: tr.left, top: tr.top, right: if has_del { s.right - 40 } else { tr.right }, bottom: tr.bottom },
+            if dim { pal.edge } else { pal.ink }, tfont, 0);
+        if st.nt_edit_title && st.nt_blink {
+            let at = st.nt_tcaret.min(title.len());
+            let x = tr.left + s_text_w(dc, &title[..at], tfont);
+            c_stroke(dc, x as f32, (tr.top + 4) as f32, x as f32, (tr.bottom - 4) as f32, SS + SS / 2, pal.ink);
+        }
+        // 一道很淡的分隔线：标题和正文分开，但不抢眼
+        c_line(dc, tr.left, tr.bottom + 3, tr.right, tr.bottom + 3, 1, mixc(pal.edge, pal.paper, 0.55));
+        // 标题条右端：删除本页（垃圾桶；只有多页时才出现）
+        if has_del {
+            let r = nt_del_rect();
+            let ink = mixc(pal.edge, pal.ink, 0.32);
+            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+            g_icon(dc, cx, cy, NT_ICON_DEL, ink);
+        }
+    }
     let ta = nt_text_rect();
     let page = note_text(st).to_string();
     let comp = st.nt_comp.clone();
-    // v2：正文 + 组字串按**光标位置**拼起来画（组字串就在光标处上屏）
+    // 正文 + 组字串按**光标位置**拼起来画（组字串就在光标处上屏）
     let caret = st.nt_caret.min(page.len());
     let full = if comp.is_empty() {
         page.clone()
@@ -21956,83 +23730,267 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         format!("{}{}{}", &page[..caret], comp, &page[caret..])
     };
     let caret_at = caret + comp.len();
-    let mut lines = note_lines(st, dc, &full, ta.right - ta.left);
-    // 结尾是换行时 `cl_layout` 只给到这一行为止（它是"填满一行"输出，不留空气行），
-    // 光标就会被画回**上一行**行尾 —— 用户 2026-11-01 报「回车后光标位置不对」。
-    if lines.is_empty() || full.ends_with('\n') {
-        lines.push((full.len(), full.len()));
+    let mut lines = note_layout(st, dc, &full, ta.right - ta.left);
+    // ⚠️ 只补"整页空"这一种：`note_layout` 是按**逻辑行**输出的，文末那个换行
+    //    本身就会产出一条空气行。以前这里又补了一条 → 光标被画到下一行去
+    //    （用户 2026-11-02 报「光标位置咋这么远，打完字却不在光标处」）。
+    if lines.is_empty() {
+        let n = full.len();
+        lines.push(NtLine { a: n, b: n, font: st.cf_note, indent: 0, blk: NtBlk::Plain, first: true, in_code: false, segs: Vec::new(), ih: 0 });
     }
-    let lh = c_font_h(dc, st.cf_note).max(1);
-    let visible = (((ta.bottom - ta.top) / lh).max(1)) as usize;
-    // 光标在哪一行（取最后一个 `a <= caret` 的行）
-    let lno = note_line_of(&lines, caret_at);
-    // 滚动只跟光标走：v1 是"永远滚到底"，v2 点哪写哪之后必须跟着光标
-    let scroll = if lno + 1 > visible {
-        (lno + 1 - visible).min(lines.len().saturating_sub(visible))
-    } else {
-        0
-    };
-    // 组字区间（在 full 里的字节范围），用来画淡色 + 下划线
+    let lno = nt_line_of(&lines, caret_at);
+    // 只在「正文或光标变了」时把滚动拉回光标；滚轮自己滚的时候不要打断
+    let sig = (cl_hash(&page), caret_at);
+    if sig != st.nt_scroll_seen {
+        note_follow_caret(st, dc, &lines, caret_at);
+        st.nt_scroll_seen = sig;
+    }
+    let max_top = note_max_top(dc, &lines);
+    let top = st.nt_scroll.min(max_top);
+    st.nt_scroll = top;
     let comp_a = caret;
     let comp_b = caret + comp.len();
-    for (i, (a, b)) in lines.iter().enumerate().skip(scroll) {
-        let y = ta.top + (i - scroll) as i32 * lh;
-        if y + lh > ta.bottom {
+    let mut y = ta.top;
+    for i in top..lines.len() {
+        let l = lines[i].clone();
+        let lh = nt_line_h(dc, &l);
+        if y + lh > ta.bottom + 2 {
             break;
         }
-        let seg = &full[*a..*b];
-        if !seg.is_empty() {
-            let overlaps_comp = !comp.is_empty() && *b > comp_a && *a < comp_b;
-            let ink = if overlaps_comp { pal.edge } else { pal.ink };
-            c_text(dc, seg, RECT { left: ta.left, top: y, right: ta.right, bottom: y + lh }, ink, st.cf_note, 0);
+        let x0 = ta.left + l.indent;
+        if l.first {
+            match l.blk {
+                NtBlk::Task(done) => {
+                    let by = y + (lh - 12) / 2;
+                    let br = RECT { left: ta.left + 1, top: by, right: ta.left + 13, bottom: by + 12 };
+                    if done {
+                        g_rrect(dc, br, 3, mixc(pal.block, pal.paper, 0.04), None, 0);
+                        c_stroke(dc, (br.left + 3) as f32, (br.top + 6) as f32, (br.left + 5) as f32, (br.top + 9) as f32, SS, pal.paper);
+                        c_stroke(dc, (br.left + 5) as f32, (br.top + 9) as f32, (br.left + 9) as f32, (br.top + 3) as f32, SS, pal.paper);
+                    } else {
+                        g_rrect_stroke(dc, br, 3, mixc(pal.edge, pal.ink, 0.20), 1);
+                    }
+                }
+                NtBlk::Bullet => {
+                    g_dot(dc, ta.left + 6, y + lh / 2, 2, mixc(pal.edge, pal.ink, 0.35));
+                }
+                NtBlk::Ordered => {
+                    // 编号照留着（Typora 也保留）：把被吃掉的 "1. " 画回去
+                    let lstart = note_line_start(&full, l.a);
+                    let mark = &full[lstart..l.a];
+                    c_text(dc, mark, RECT { left: ta.left, top: y, right: x0, bottom: y + lh }, mixc(pal.edge, pal.ink, 0.25), l.font, 0);
+                }
+                NtBlk::Quote => {
+                    g_fill(dc, RECT { left: ta.left + 2, top: y + 2, right: ta.left + 5, bottom: y + lh - 2 }, mixc(pal.edge, pal.ink, 0.25));
+                }
+                NtBlk::Hr => {
+                    let yy = y + lh / 2;
+                    c_line(dc, ta.left, yy, ta.right, yy, 1, mixc(pal.edge, pal.ink, 0.2));
+                }
+                _ => {}
+            }
         }
-        if !comp.is_empty() && *b > comp_a && *a < comp_b {
-            let x0 = ta.left + s_text_w(dc, &full[*a..comp_a.max(*a)], st.cf_note);
-            let x1 = ta.left + s_text_w(dc, &full[*a..comp_b.min(*b)], st.cf_note);
-            c_line(dc, x0, y + lh - 2, x1.max(x0 + 2), y + lh - 2, 1, pal.edge);
+        // 图片行：把 DIB 缩放画进这块矩形
+        if let NtBlk::Image(idx, w) = l.blk {
+            let img = &st.nt_imgs[idx];
+            let ih = (l.ih - 8).max(8);
+            let _ = SetStretchBltMode(dc, HALFTONE);
+            let _ = StretchDIBits(
+                dc,
+                sxv(ta.left + l.indent),
+                sxv(y),
+                w * SS,
+                ih * SS,
+                0,
+                0,
+                img.w,
+                img.h,
+                Some(img.bits.as_ptr() as *const c_void),
+                &img.bmi as *const BITMAPINFO,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            y += lh;
+            continue;
         }
+        // 代码块（围栏内的正文）：铺一条淡底，字体换成等宽
+        if l.in_code || l.blk == NtBlk::Code {
+            g_rrect(dc, RECT { left: ta.left, top: y, right: ta.right, bottom: y + lh }, 4, mixc(pal.paper, pal.ink, 0.05), None, 0);
+        }
+        // 选区：先铺一层反色块，再把选中那段文字画成纸色（反白）
+        let sel_rng = note_sel(st);
+        if let Some((sa, sb)) = sel_rng {
+            if l.b > sa && l.a < sb {
+                let a2 = l.a.max(sa);
+                let b2 = l.b.min(sb);
+                if b2 > a2 {
+                    let xa = x0 + nt_x_in(st, dc, &l, &full, a2);
+                    let xb = x0 + nt_x_in(st, dc, &l, &full, b2);
+                    if xb > xa {
+                        g_rrect(dc, RECT { left: xa, top: y + 1, right: xb, bottom: y + lh - 1 }, 3, pal.block, None, 0);
+                    }
+                }
+            }
+        }
+        if l.blk != NtBlk::Hr {
+            let mut x = x0;
+            for (sa, sb, sty) in l.segs.iter() {
+                let t = &full[*sa..*sb];
+                if t.is_empty() {
+                    continue;
+                }
+                let f = nt_sty_font(st, l.font, *sty);
+                let w = s_text_w(dc, t, f);
+                let overlaps = !comp.is_empty() && *sb > comp_a && *sa < comp_b;
+                let selected = sel_rng.map(|(sa2, sb2)| *sb > sa2 && *sa < sb2).unwrap_or(false);
+                let dim = overlaps || matches!(l.blk, NtBlk::Task(true)) || l.in_code;
+                let ink = if selected {
+                    pal.paper
+                } else if dim {
+                    pal.edge
+                } else {
+                    pal.ink
+                };
+                if *sty == NtSty::Code {
+                    // 行内代码：一小块淡底，和正文分开
+                    g_rrect(dc, RECT { left: x - 2, top: y + 2, right: x + w + 2, bottom: y + lh - 2 }, 4, mixc(pal.paper, pal.ink, 0.07), None, 0);
+                }
+                c_text(dc, t, RECT { left: x, top: y, right: ta.right, bottom: y + lh }, ink, f, 0);
+                if *sty == NtSty::Strike {
+                    // 删除线：文字中线上一笔
+                    let yy = y + lh / 2;
+                    c_line(dc, x, yy, x + w, yy, 1, ink);
+                }
+                x += w;
+            }
+        }
+        if !comp.is_empty() && l.b > comp_a && l.a < comp_b {
+            let ux0 = x0 + nt_x_in(st, dc, &l, &full, comp_a.max(l.a));
+            let ux1 = x0 + nt_x_in(st, dc, &l, &full, comp_b.min(l.b.max(comp_a)));
+            c_line(dc, ux0, y + lh - 2, ux1.max(ux0 + 2), y + lh - 2, 1, pal.edge);
+        }
+        y += lh;
     }
     // 光标：组字期间藏起来（IME 自己有）
     if comp.is_empty() && st.nt_blink {
-        let y = ta.top + (lno.saturating_sub(scroll)) as i32 * lh;
-        let (a, _) = lines[lno];
-        let x = (ta.left + s_text_w(dc, &full[a..caret_at.max(a)], st.cf_note)).min(ta.right - 3);
-        if y + lh <= ta.bottom {
+        let l = lines[lno].clone();
+        let lh = nt_line_h(dc, &l);
+        let ly = note_line_y(dc, &lines, top, lno);
+        let x0 = ta.left + l.indent;
+        let at = caret_at.max(l.a);
+        // 图片行没有文字片段：光标落在行尾时画在图片右边缘（不是行首）
+        let x = if let NtBlk::Image(_i, w) = l.blk {
+            (x0 + if at >= l.b { w } else { 0 }).min(ta.right - 3)
+        } else {
+            (x0 + nt_x_in(st, dc, &l, &full, at)).min(ta.right - 3)
+        };
+        if ly >= ta.top - 1 && ly + lh <= ta.bottom + 2 {
             // 1.5 逻辑 px 圆头：1px 的竖线在浅色纸面 + 2 倍降采样下几乎看不见（离屏出图核对过）
-            c_stroke(dc, x as f32, (y + 2) as f32, x as f32, (y + lh - 2) as f32, SS + SS / 2, pal.ink);
+            c_stroke(dc, x as f32, (ly + 2) as f32, x as f32, (ly + lh - 2) as f32, SS + SS / 2, pal.ink);
+        }
+    }
+    // ── 滚动条：只有一屏装不下时才出现（右侧细条，不占正文宽度） ──
+    {
+        if max_top > 0 {
+            let total = note_content_h(dc, &lines).max(1);
+            let view = (ta.bottom - ta.top).max(1);
+            let mut before = 0;
+            for k in 0..top {
+                before += nt_line_h(dc, &lines[k]);
+            }
+            // 苹果式 overlay：不要轨道，只留一颗淡色圆角滑块，贴着纸边
+            let th = (((view as i64 * view as i64) / total as i64) as i32).clamp(24, view);
+            let travel = (view - th).max(0);
+            let pos = if total > view { before * travel / (total - view) } else { 0 };
+            let s = nt_sheet();
+            let bar = RECT {
+                left: s.right - 8,
+                top: ta.top + pos + 2,
+                right: s.right - 3,
+                bottom: ta.top + pos + th - 2,
+            };
+            // 半透明墨色（糖纸/毛玻璃上都压得住），不画轨道
+            g_rrect_alpha(dc, bar, 3, pal.ink, 64);
         }
     }
 
-    // 底栏：页点 + 「第 x / y 页」+ 右侧「＋ 新页」
+    // 底栏：左侧页码器（固定宽度）+ 右侧 3 颗格式工具 + 「＋新页」
     let n = st.nt_pages.len();
-    let fy0 = CL_H - CL_PAD - NT_FOOT_H;
-    let fy1 = CL_H - CL_PAD;
-    for i in 0..n.min(16) {
-        let d = nt_dot_rect(i);
-        let c = if i == st.nt_cur {
-            pal.block
-        } else if i == st.nt_dot_hover {
-            mixc(pal.edge, pal.ink, 0.6)
-        } else {
-            mixc(pal.edge, pal.paper, 0.4)
-        };
-        g_rrect(dc, d, 3, c, None, 0);
-    }
     if n > 1 {
-        let info = format!("第 {} / {} 页", st.nt_cur + 1, n);
-        let x0 = CL_PAD + n.min(16) as i32 * 11 + 4;
-        c_text(dc, &info, RECT { left: x0, top: fy0, right: x0 + 140, bottom: fy1 }, pal.edge, st.cf_small, 0);
+        let p = nt_pager_rect();
+        for dir in [-1i32, 1i32] {
+            let r = nt_pager_arrow(dir);
+            let active = if dir < 0 { st.nt_cur > 0 } else { st.nt_cur + 1 < n };
+            let col = if !active {
+                mixc(pal.edge, pal.paper, 0.5)
+            } else if st.nt_pager_hot == dir {
+                pal.ink
+            } else {
+                mixc(pal.edge, pal.ink, 0.35)
+            };
+            let my = (r.top + r.bottom) / 2;
+            // 左箭头朝左、右箭头朝右（第一版画反了，像两个「展开」）
+            let (x, apex) = if dir < 0 { (r.left + 10, r.left + 6) } else { (r.right - 10, r.right - 6) };
+            c_stroke(dc, x as f32, (my - 4) as f32, apex as f32, my as f32, SS, col);
+            c_stroke(dc, apex as f32, my as f32, x as f32, (my + 4) as f32, SS, col);
+        }
+        let info = format!("{} / {}", st.nt_cur + 1, n);
+        c_text(
+            dc,
+            &info,
+            RECT { left: p.left + 18, top: p.top, right: p.right - 18, bottom: p.bottom },
+            mixc(pal.edge, pal.ink, 0.28),
+            st.cf_small,
+            1,
+        );
     }
-    // 「＋ 新页」：空页时置灰（点了也没意义），有字才亮起来
-    {
-        let r = nt_plus_rect();
-        let on = nt_can_new_page(st);
-        let hv = if on && st.nt_plus_hot { 1.0 } else { 0.0 };
-        g_rrect(dc, r, 7, mixc(pal.paper, pal.ink, 0.05 + 0.10 * hv), Some(mixc(pal.edge, pal.ink, 0.30 + 0.2 * hv)), 1);
-        let ink = if on { mixc(pal.ink, pal.edge, 0.35 - 0.35 * hv) } else { mixc(pal.edge, pal.paper, 0.35) };
+    // 工具：待办 / 粗体 / 无序列表 / 分割线 / 图片；「＋新页」单独在最右。
+    // 苹果风：**不画按钮外框**，常态只是一枚细线图标；悬停才浮一层淡底。
+    for i in 0..6i32 {
+        let r = if i == 5 { nt_plus_rect() } else { nt_tool_rect(i) };
+        let hv = st.nt_tool_hot == i + 1;
+        // 加粗模式开着时，B 常亮，告诉用户「接下来打的是粗体」
+        let active = i == 1 && (st.nt_bold_want || note_bold_span_at(&page, caret).is_some());
+        let enabled = i != 5 || nt_can_new_page(st);
+        let ink = if !enabled {
+            mixc(pal.edge, pal.paper, 0.45)
+        } else if hv || active {
+            pal.ink
+        } else {
+            mixc(pal.edge, pal.ink, 0.45)
+        };
+        if (hv || active) && enabled {
+            g_rrect_alpha(dc, r, 7, pal.ink, 16);
+        }
         let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-        c_stroke(dc, cx as f32, (cy - 5) as f32, cx as f32, (cy + 5) as f32, SS, ink);
-        c_stroke(dc, (cx - 5) as f32, cy as f32, (cx + 5) as f32, cy as f32, SS, ink);
+        let mask = match i {
+            0 => NT_ICON_TODO,
+            1 => NT_ICON_BOLD,
+            2 => NT_ICON_LIST,
+            3 => NT_ICON_DIVIDER,
+            4 => NT_ICON_IMAGE,
+            _ => NT_ICON_PLUS,
+        };
+        g_icon(dc, cx, cy, mask, ink);
+    }
+    // 删除 toast：和剪贴板卡片**同一套样式**（深色胶囊 + 右端「撤销」小按钮）
+    if !st.nt_toast.is_empty() && now_s() < st.nt_toast_until {
+        let r = nt_toast_rect();
+        g_rrect(dc, r, 13, pal.block, None, 0);
+        c_text(
+            dc,
+            &st.nt_toast,
+            RECT { left: r.left + 14, top: r.top, right: r.right - 58, bottom: r.bottom },
+            pal.paper,
+            st.cf_body,
+            0,
+        );
+        if st.nt_toast_undo.is_some() {
+            let ur = nt_undo_rect();
+            let hv = if st.nt_toast_hot { 0.30 } else { 0.0 };
+            g_rrect(dc, ur, 9, mixc(pal.block, pal.paper, 0.20 + hv), None, 0);
+            c_text(dc, "撤销", ur, pal.paper, st.cf_small, 1);
+        }
     }
 }
 
@@ -22046,12 +24004,22 @@ unsafe fn open_note(st: &mut State) {
     st.nt_shown = true;
     st.nt_blink = true;
     st.nt_comp.clear();
-    st.nt_dot_hover = usize::MAX;
+    st.nt_pager_hot = 0;
+    st.nt_tool_hot = 0;
+    st.nt_toast.clear();
+    st.nt_toast_until = 0.0;
+    st.nt_toast_undo = None;
     st.nt_lay = None;
+    st.nt_scroll = 0;
+    st.nt_scroll_seen = (0, usize::MAX);
+    st.nt_bold_want = false;
+    st.nt_bold_end = usize::MAX;
     if st.nt_pages.is_empty() {
         st.nt_pages.push(String::new());
     }
     st.nt_cur = 0;                     // 呼出就落在第 1 页（最新那页）
+    st.nt_edit_title = false;
+    st.nt_tcaret = note_title(st).len();
     st.nt_caret = note_text(st).len(); // 呼出即"接着往下写"
     let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
     st.nt_x = (sw - CL_WW) / 2;
@@ -22061,6 +24029,11 @@ unsafe fn open_note(st: &mut State) {
     clip_snap_bg(st, st.nt_x, st.nt_y);
     let _ = ShowWindow(hwnd, SW_SHOW);
     focus_window(hwnd);
+    clip_log(&format!(
+        "note open fg={} focus={}",
+        GetForegroundWindow() == hwnd,
+        GetFocus() == hwnd
+    ));
     NOTE_LIVE.store(true, Ordering::SeqCst);
     st.nt_fg0 = now_s();
     let _ = SetTimer(hwnd, TIMER_NOTE_BLINK, 500, None);
@@ -22076,6 +24049,7 @@ unsafe fn close_note(st: &mut State) {
     NOTE_LIVE.store(false, Ordering::SeqCst);
     note_save(st);
     st.card_bg.clear();
+    card_bg_hi_free(st);
     let h = NOTE_HWND.load(Ordering::SeqCst);
     if h != 0 {
         let hwnd = HWND(h as *mut c_void);
@@ -22114,6 +24088,15 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let st = state_of(hwnd);
+            // 按着左键在正文里拖 = 扩选
+            if st.nt_sel_drag && (GetAsyncKeyState(0x01) as u16 & 0x8000) != 0 {
+                let before = st.nt_caret;
+                note_click(st, lx(), ly());
+                // 只有光标真的挪了才重绘（拖选时每帧都整页重画会显得不跟手）
+                if st.nt_caret != before {
+                    note_present(st);
+                }
+            }
             if !st.nt_tracking {
                 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
                 st.nt_tracking = true;
@@ -22126,62 +24109,185 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let _ = TrackMouseEvent(&mut tme);
             }
             let (x, y) = (lx(), ly());
-            let mut hit = usize::MAX;
-            for i in 0..st.nt_pages.len().min(16) {
-                if in_rect(nt_dot_rect(i), x, y) {
-                    hit = i;
-                    break;
+            let mut ph = 0;
+            if st.nt_pages.len() > 1 {
+                for dir in [-1i32, 1i32] {
+                    if in_rect(nt_pager_arrow(dir), x, y) {
+                        ph = dir;
+                    }
                 }
             }
-            let plus = in_rect(nt_plus_rect(), x, y) && nt_can_new_page(st);
-            if hit != st.nt_dot_hover || plus != st.nt_plus_hot {
-                st.nt_dot_hover = hit;
-                st.nt_plus_hot = plus;
+            let mut th = 0;
+            for i in 0..6i32 {
+                let r = if i == 5 { nt_plus_rect() } else { nt_tool_rect(i) };
+                if in_rect(r, x, y) {
+                    th = i + 1;
+                }
+            }
+            let toast_hot = !st.nt_toast.is_empty()
+                && now_s() < st.nt_toast_until
+                && st.nt_toast_undo.is_some()
+                && in_rect(nt_undo_rect(), x, y);
+            if ph != st.nt_pager_hot || th != st.nt_tool_hot || toast_hot != st.nt_toast_hot {
+                st.nt_pager_hot = ph;
+                st.nt_tool_hot = th;
+                st.nt_toast_hot = toast_hot;
                 note_present(st);
             }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let st = state_of(hwnd);
+            st.nt_sel_drag = false;
+            if st.nt_sel == st.nt_caret {
+                st.nt_sel = usize::MAX;
+            }
+            note_present(st);
             LRESULT(0)
         }
         WM_MOUSELEAVE_MSG => {
             let st = state_of(hwnd);
             st.nt_tracking = false;
-            if st.nt_dot_hover != usize::MAX || st.nt_plus_hot {
-                st.nt_dot_hover = usize::MAX;
-                st.nt_plus_hot = false;
+            if st.nt_pager_hot != 0 || st.nt_tool_hot != 0 || st.nt_toast_hot {
+                st.nt_pager_hot = 0;
+                st.nt_tool_hot = 0;
+                st.nt_toast_hot = false;
                 note_present(st);
             }
             LRESULT(0)
         }
-        WM_LBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            // ⚠️ 连点两下时第二下是 WM_LBUTTONDBLCLK（类注册时开了 CS_DBLCLKS）：
+            //    以前这里只收 LBUTTONDOWN，双击的第二下整条丢掉（用户 2026-11-02 报
+            //    「连续点击新增页面之后就打不了字」）。两下走同一条逻辑。
             let st = state_of(hwnd);
             let (x, y) = (lx(), ly());
-            let mut on_dot = false;
-            for i in 0..st.nt_pages.len().min(16) {
-                if in_rect(nt_dot_rect(i), x, y) {
-                    on_dot = true;
-                    if note_go(st, i) {
-                        note_present(st);
-                    }
-                    break;
-                }
-            }
-            // 「＋ 新页」：右下角那颗按钮
-            if in_rect(nt_plus_rect(), x, y) {
-                if nt_can_new_page(st) {
-                    note_new_page(st, hwnd);
+            // 删除 toast 的「撤销」
+            if !st.nt_toast.is_empty() && now_s() < st.nt_toast_until {
+                if st.nt_toast_undo.is_some() && in_rect(nt_undo_rect(), x, y) {
+                    note_undo_delete(st, hwnd);
                     note_present(st);
                 }
+                if in_rect(nt_toast_rect(), x, y) {
+                    return LRESULT(0);
+                }
+            }
+            if st.nt_pages.len() > 1 {
+                // 标题条右端：删除本页
+                if in_rect(nt_del_rect(), x, y) {
+                    note_delete_page(st, hwnd);
+                    note_present(st);
+                    return LRESULT(0);
+                }
+                // 底栏页码器左右箭头
+                for dir in [-1i32, 1i32] {
+                    if in_rect(nt_pager_arrow(dir), x, y) {
+                        let next = if dir < 0 { st.nt_cur.checked_sub(1) } else { Some(st.nt_cur + 1) };
+                        if let Some(p) = next {
+                            if note_go(st, p) {
+                                note_present(st);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                }
+            }
+            // 底栏工具：待办 / 粗体 / 列表 / 分割线 / 图片 / ＋新页
+            for i in 0..6i32 {
+                let r = if i == 5 { nt_plus_rect() } else { nt_tool_rect(i) };
+                if in_rect(r, x, y) {
+                    note_tool(st, hwnd, i);
+                    note_present(st);
+                    return LRESULT(0);
+                }
+            }
+            // 点标题条 = 进去改标题（键盘/组字都进标题）
+            if in_rect(nt_title_rect(), x, y) {
+                st.nt_edit_title = true;
+                st.nt_tcaret = note_title(st).len();
+                st.nt_blink = true;
+                note_present(st);
                 return LRESULT(0);
             }
             // 点在纸上（不在页点、不在拖拽带）= 把光标挪过去（v2 点哪写哪）
-            if !on_dot && y >= nt_text_rect().top - 6 && in_rect(nt_sheet(), x, y) {
-                note_click(st, x, y);
-                note_present(st);
+            if y >= nt_text_rect().top - 6 && in_rect(nt_sheet(), x, y) {
+                st.nt_edit_title = false;
+                st.nt_sel = usize::MAX;
+                st.nt_sel_drag = true;
+                // 点在复选框那一列：切换勾选，不动光标
+                let dc = st.c_lo_dc;
+                let mut toggled = false;
+                if !dc.0.is_null() {
+                    let ta = nt_text_rect();
+                    let text = note_text(st).to_string();
+                    let lines = note_layout(st, dc, &text, ta.right - ta.left);
+                    if !lines.is_empty() {
+                        let top = st.nt_scroll.min(lines.len().saturating_sub(1));
+                        let mut yy = ta.top;
+                        let mut hit = usize::MAX;
+                        for i in top..lines.len() {
+                            let h = nt_line_h(dc, &lines[i]);
+                            if y < yy + h {
+                                hit = i;
+                                break;
+                            }
+                            yy += h;
+                            if yy > ta.bottom {
+                                break;
+                            }
+                        }
+                        if hit != usize::MAX && x <= ta.left + NT_BOX_INDENT - 2 {
+                            let l = lines[hit].clone();
+                            let lstart = note_line_start(&text, l.a);
+                            // ⚠️ 新排版里 `l.a` 是**标记之后**的正文起点，不能再拿它跟行首比；
+                            //    用 `first` 认"逻辑行的第一视觉行"
+                            if l.first && matches!(l.blk, NtBlk::Task(_)) {
+                                toggled = note_toggle_task(st, hwnd, lstart);
+                            }
+                        }
+                    }
+                }
+                if toggled {
+                    note_present(st);
+                } else {
+                    note_click(st, x, y);
+                    // 按下即锚点：后面拖动就是在扩选
+                    st.nt_sel = st.nt_caret;
+                    note_present(st);
+                }
             }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let st = state_of(hwnd);
             let d = ((w.0 >> 16) & 0xFFFF) as u16 as i16;
+            // 光标停在图上 = 缩放那张图；否则翻页
+            let mut pt = POINT { x: ((l.0 & 0xFFFF) as i16) as i32, y: (((l.0 >> 16) & 0xFFFF) as i16) as i32 };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            if note_zoom_under(st, pt.x - S_M, pt.y - S_M, d) {
+                note_present(st);
+                return LRESULT(0);
+            }
+            // 超过一屏 + 光标在正文区里 → 上下滚动；否则（含没超过一屏）翻页
+            let dc = st.c_lo_dc;
+            if !dc.0.is_null() {
+                let ta = nt_text_rect();
+                if in_rect(ta, pt.x - S_M, pt.y - S_M) {
+                    let text = note_text(st).to_string();
+                    let lines = note_layout(st, dc, &text, ta.right - ta.left);
+                    let max_top = note_max_top(dc, &lines);
+                    if max_top > 0 {
+                        let step = 3usize;
+                        st.nt_scroll = if d > 0 {
+                            st.nt_scroll.saturating_sub(step)
+                        } else {
+                            (st.nt_scroll + step).min(max_top)
+                        };
+                        note_present(st);
+                        return LRESULT(0);
+                    }
+                }
+            }
             let moved = if d > 0 {
                 st.nt_cur > 0 && note_go(st, st.nt_cur - 1)
             } else {
@@ -22198,6 +24304,11 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 TIMER_NOTE_BLINK => {
                     if st.nt_shown {
                         st.nt_blink = !st.nt_blink;
+                        // 删除 toast 到点就撤（连撤销数据一起丢）
+                        if !st.nt_toast.is_empty() && now_s() >= st.nt_toast_until {
+                            st.nt_toast.clear();
+                            st.nt_toast_undo = None;
+                        }
                         note_present(st);
                     }
                 }
@@ -22209,7 +24320,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     // 失焦看门狗：前台不是自己（而是别的程序）就收。
                     // ⚠️ 只靠 `WM_ACTIVATE` 不够 —— 常驻轮盘是 NOACTIVATE，
                     //    点它/桌面/任务栏都不会让卡片失活（用户 2026-11-01 报）。
-                    if st.nt_shown && now_s() - st.nt_fg0 > CARD_FG_GRACE {
+                    if st.nt_shown && !st.nt_picking && now_s() - st.nt_fg0 > CARD_FG_GRACE {
                         let fg = GetForegroundWindow();
                         if !fg.is_invalid() && fg != hwnd {
                             close_note(st);
@@ -22223,9 +24334,43 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_CHAR => {
             let st = state_of(hwnd);
             let c = w.0 as u32;
+            // 标题编辑态：字符 / 退格 / 回车 / Esc 全给标题
+            if st.nt_edit_title {
+                match c {
+                    0x08 => note_title_backspace(st),
+                    0x0D => {
+                        // 回车 = 改完，光标落回正文末尾
+                        st.nt_edit_title = false;
+                        st.nt_caret = note_text(st).len();
+                    }
+                    0x1B => st.nt_edit_title = false,
+                    _ => {
+                        if let Some(ch) = char::from_u32(c) {
+                            if !ch.is_control() {
+                                let mut b = [0u8; 4];
+                                let s = ch.encode_utf8(&mut b).to_string();
+                                note_title_insert(st, &s);
+                            }
+                        }
+                    }
+                }
+                st.nt_blink = true;
+                let _ = SetTimer(hwnd, TIMER_NOTE_SAVE, 400, None);
+                note_present(st);
+                return LRESULT(0);
+            }
             match c {
                 0x08 => note_backspace(st, hwnd),
-                0x0D => note_insert(st, hwnd, "\n"),
+                0x0D => {
+                    // 任务行回车 = 接着来一条新的（编辑器都这样）
+                    let text = note_text(st).to_string();
+                    let lstart = note_line_start(&text, st.nt_caret);
+                    if nt_task(&text[lstart..]).is_some() {
+                        note_insert(st, hwnd, "\n- [ ] ");
+                    } else {
+                        note_insert(st, hwnd, "\n");
+                    }
+                }
                 0x1B => {
                     close_note(st);
                     return LRESULT(0);
@@ -22236,7 +24381,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         if !ch.is_control() {
                             let mut b = [0u8; 4];
                             let s = ch.encode_utf8(&mut b).to_string();
-                            note_insert(st, hwnd, &s);
+                            note_type(st, hwnd, &s);
                         }
                     }
                 }
@@ -22246,17 +24391,94 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         }
         WM_KEYDOWN => {
             let st = state_of(hwnd);
-            let vk = w.0 as u32;
+            let mut vk = w.0 as u32;
+            // 中文输入法开着时，WM_KEYDOWN 的 vk 会被换成 VK_PROCESSKEY(0xE5)，
+            // 真实键值由 IME 另存 —— 不翻译回来，Ctrl+C / Ctrl+V 在中文模式下全是死键
+            // （用户 2026-11-02 报「选区后复制不了 / 图片粘贴不进去」）。
+            if vk == 0xE5 {
+                // 先试扫描码：TSF 输入法（微软拼音 / 搜狗）下 ImmGetVirtualKey 也会回 0xE5，
+                // lParam 里的扫描码才是物理键位，MapVirtualKey 能还原出 VK。
+                let scan = ((l.0 >> 16) & 0xFF) as u32;
+                let mut real = if scan != 0 { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } else { 0 };
+                if real == 0 || real == 0xE5 {
+                    real = ImmGetVirtualKey(hwnd);
+                }
+                if real == 0 || real == 0xE5 {
+                    // 两种都拿不到：TSF 输入法把扫描码也抹成了 0。最后一条路是
+                    // **物理按键状态** —— IME 吃不掉 GetAsyncKeyState，按下的那个键一定是 down。
+                    // 只查我们真正用到的键，避免误判。
+                    const KEYS: [i32; 16] = [
+                        0x43, 0x56, 0x58, 0x41, 0x5A, 0x59, 0x4E, // C V X A Z Y N
+                        0x08, 0x0D, 0x1B, 0x2E, // Back Enter Esc Del
+                        0x25, 0x27, 0x26, 0x28, 0x24, // ← → ↑ ↓ Home
+                    ];
+                    for k in KEYS {
+                        if (GetAsyncKeyState(k) as u16 & 0x8000) != 0 {
+                            real = k as u32;
+                            break;
+                        }
+                    }
+                    clip_log(&format!("note processkey scan={scan:#x} poll={real:#x}"));
+                }
+                if real == 0 || real == 0xE5 {
+                    return LRESULT(0);
+                }
+                // 正在组字：这些键该由输入法处理（退格删组字、方向选候选、回车上屏），
+                // 我们若按真实键值再执行一遍就会删到正文 / 挪错光标。
+                if !st.nt_comp.is_empty() {
+                    return LRESULT(0);
+                }
+                vk = real;
+            }
             // ⚠️ 用 `GetAsyncKeyState` 而不是 `GetKeyState`：后者取的是**本线程消息队列**里的
             // 按键状态，自绘的呼出型窗口在自动化 / 非前台场景下经常读到 0（组合键就废了）
-            let ctrl = GetAsyncKeyState(0x11) as u16 & 0x8000 != 0;
+            // 左右专用码也认：真实键盘送来的是 VK_LCONTROL/VK_RCONTROL，
+            // 只查通用码在个别布局/键盘驱动下会漏。
+            let down = |vk: i32| (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
+            let ctrl = down(0x11) || down(0xA2) || down(0xA3);
+            let shift = down(0x10) || down(0xA0) || down(0xA1);
+            if matches!(vk, 0x08 | 0x09 | 0x0D | 0x1B | 0x21..=0x28 | 0x2E) {
+                st.nt_bold_want = false;
+                st.nt_bold_end = usize::MAX;
+            }
+            if ctrl {
+                clip_log(&format!(
+                    "note ctrl vk={vk:#x} title={} shown={}",
+                    st.nt_edit_title as u8, st.nt_shown as u8
+                ));
+            }
+            if st.nt_edit_title {
+                let t = note_title(st).to_string();
+                let at = st.nt_tcaret.min(t.len());
+                st.nt_tcaret = match vk {
+                    0x25 => t[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0),
+                    0x27 => t[at..].chars().next().map(|c| at + c.len_utf8()).unwrap_or(t.len()),
+                    0x24 => 0,
+                    0x23 => t.len(),
+                    _ => at,
+                };
+                st.nt_blink = true;
+                note_present(st);
+                return LRESULT(0);
+            }
             let mut moved = false;
             match vk {
                 0x25 if !ctrl => {
+                    // Shift+←：扩选
+                    if shift && st.nt_sel == usize::MAX {
+                        st.nt_sel = st.nt_caret;
+                    } else if !shift {
+                        st.nt_sel = usize::MAX;
+                    }
                     note_left(st);
                     moved = true;
                 }
                 0x27 if !ctrl => {
+                    if shift && st.nt_sel == usize::MAX {
+                        st.nt_sel = st.nt_caret;
+                    } else if !shift {
+                        st.nt_sel = usize::MAX;
+                    }
                     note_right(st);
                     moved = true;
                 }
@@ -22265,28 +24487,28 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     if !st.c_lo_dc.0.is_null() {
                         let ta = nt_text_rect();
                         let text = note_text(st).to_string();
-                        let lines = note_lines(st, st.c_lo_dc, &text, ta.right - ta.left);
+                        let lines = note_layout(st, st.c_lo_dc, &text, ta.right - ta.left);
                         if !lines.is_empty() {
-                            let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
-                            st.nt_caret = lines[cur].0;
+                            let cur = nt_line_of(&lines, st.nt_caret.min(text.len()));
+                            st.nt_caret = lines[cur].a;
                             st.nt_blink = true;
                             moved = true;
                         }
                     }
                 }
                 0x23 => {
-                    // End：本行结尾
-                    if !st.c_lo_dc.0.is_null() {
-                        let ta = nt_text_rect();
-                        let text = note_text(st).to_string();
-                        let lines = note_lines(st, st.c_lo_dc, &text, ta.right - ta.left);
-                        if !lines.is_empty() {
-                            let cur = note_line_of(&lines, st.nt_caret.min(text.len()));
-                            st.nt_caret = lines[cur].1;
-                            st.nt_blink = true;
-                            moved = true;
-                        }
-                    }
+                    // End：本行结尾 = **原始行尾**（不是最后一个可见片段）。
+                    // ⚠️ 带行内标记的行（`abc**X**`）最后一截可见文本结束在标记里面，
+                    //    用 `lines[cur].b` 会让光标停在 `**` 之间，接着打字/插分割线就把标记切碎。
+                    let text = note_text(st).to_string();
+                    let at = st.nt_caret.min(text.len());
+                    let lstart = note_line_start(&text, at);
+                    st.nt_caret = text[lstart..]
+                        .find('\n')
+                        .map(|i| lstart + i)
+                        .unwrap_or(text.len());
+                    st.nt_blink = true;
+                    moved = true;
                 }
                 0x26 if !ctrl => {
                     note_move_line(st, -1);
@@ -22314,6 +24536,47 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     moved = true;
                 }
                 0x43 if ctrl => note_copy(st),
+                0x41 if ctrl => {
+                    // Ctrl+A 全选
+                    st.nt_sel = 0;
+                    st.nt_caret = note_text(st).len();
+                    st.nt_blink = true;
+                    moved = true;
+                }
+                0x2E => {
+                    // Del：有选区删选区；分割线整行删；否则删光标后一个字符
+                    if note_del_sel(st, hwnd) {
+                        moved = true;
+                    } else {
+                        let text = note_text(st).to_string();
+                        let at = st.nt_caret.min(text.len());
+                        let (ls, le) = note_line_span(&text, at);
+                        if note_is_hr(&text[ls..le]) {
+                            note_remove_line(st, hwnd, ls, le);
+                            moved = true;
+                        } else if at < text.len() {
+                            let next = text[at..]
+                                .chars()
+                                .next()
+                                .map(|c| at + c.len_utf8())
+                                .unwrap_or(at);
+                            if next > at {
+                                note_snap(st);
+                                st.nt_pages[st.nt_cur].replace_range(at..next, "");
+                                note_touch(st, hwnd);
+                                moved = true;
+                            }
+                        }
+                    }
+                }
+                0x5A if ctrl => {
+                    // Ctrl+Z 撤销；Ctrl+Shift+Z 重做
+                    moved = note_undo_step(st, if shift { 1 } else { -1 }, hwnd);
+                }
+                0x59 if ctrl => {
+                    // Ctrl+Y 重做
+                    moved = note_undo_step(st, 1, hwnd);
+                }
                 _ => {}
             }
             if moved {
@@ -22333,9 +24596,18 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             if !himc.0.is_null() {
                 if flags & GCS_RESULTSTR.0 != 0 {
                     let s = imm_string(himc, GCS_RESULTSTR);
+                    if st.nt_edit_title {
+                        if !s.is_empty() {
+                            note_title_insert(st, &s);
+                        }
+                        st.nt_comp.clear();
+                        let _ = ImmReleaseContext(hwnd, himc);
+                        note_present(st);
+                        return LRESULT(0);
+                    }
                     st.nt_comp.clear();
                     if !s.is_empty() {
-                        note_insert(st, hwnd, &s);
+                        note_type(st, hwnd, &s);
                     }
                 } else if flags & GCS_COMPSTR.0 != 0 {
                     st.nt_comp = imm_string(himc, GCS_COMPSTR);
@@ -22354,9 +24626,12 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             LRESULT(0)
         }
         WM_ACTIVATE => {
-            // 呼出型窗口：焦点一走就收起（和剪贴板卡片同一条）
-            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                close_note(state_of(hwnd));
+            // 呼出型窗口：焦点一走就收起（和剪贴板卡片同一条）。
+            // 例外：系统文件对话框开着 —— 它一定让便签失活，这时收掉卡片，
+            // 用户选完图回来就只剩桌面了。
+            let st = state_of(hwnd);
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE && !st.nt_picking {
+                close_note(st);
             }
             LRESULT(0)
         }
@@ -22384,6 +24659,20 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 // 5 = 光标字节下标；6 = 首个字符的码点（"点哪写哪"的断言用）
                 5 => st.nt_caret,
                 6 => note_text(st).chars().next().map(|c| c as usize).unwrap_or(0),
+                // 7 = 首行是不是任务行：1 已完成 / 2 未完成 / 0 不是
+                // 8 = 标题长度 / 9 = 标题首个字符码点（标题编辑用例）
+                10 => note_sel_text(st).map(|t| t.chars().count()).unwrap_or(0),
+                // 11 = 正文滚动位置（第一条可见视觉行，0 = 顶部）
+                11 => st.nt_scroll,
+                // 12 = 加粗模式是否开着（工具栏 B 的开关状态）
+                12 => st.nt_bold_want as usize,
+                8 => note_title(st).chars().count(),
+                9 => note_title(st).chars().next().map(|c| c as usize).unwrap_or(0),
+                7 => match nt_task(note_text(st)) {
+                    Some((true, _)) => 1,
+                    Some((false, _)) => 2,
+                    None => 0,
+                },
                 _ => 0,
             };
             LRESULT(v as isize)
@@ -22626,6 +24915,25 @@ unsafe fn updater_apply(new_path: &str, target: &str, parent_pid: u32) {
 // ───────────────────── 入口 ─────────────────────
 
 fn main() {
+    // 崩溃取证：release 是 panic=abort，默认钩子只写 stderr（GUI 进程没有控制台=白丢）。
+    // 自己往 radial_log 落一行，出事后能直接看到 `PANIC 文件:行 消息`。
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        diag_line(
+            &format!("{}\\radial_log.txt", log_dir()),
+            &format!("PANIC {loc} {msg}"),
+        );
+    }));
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() >= 2 && args[1] == "--quit" {
@@ -23286,6 +25594,14 @@ fn main() {
         init_config_path(&mut st);
         load_ini(&mut st);
         read_persistent(&mut st);
+        // 玻璃相关的「这台机器到底什么条件」——一条日志把话说完（公司电脑排查用）：
+        //   glass/live 是 ini 里的开关；build/rdp 决定 WDA 能不能设；后面再看抓屏是黑还是慢。
+        perf_line(&format!(
+            "GLASS cfg glass={} live={} {}",
+            st.glass as u8,
+            st.glass_live as u8,
+            wda_where()
+        ));
         // 更新残留清理：updater 用完的副本 / 已应用的新版本临时文件
         // （新 PiPie 由 updater 拉起时顺手删；updater 可能还没完全退出，删不掉就下次再来）
         for f in [".pipie-updater.exe", ".pipie-update.new"] {

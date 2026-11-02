@@ -1,0 +1,26 @@
+Icons in this directory are derived from Ant Design Icons
+(@ant-design/icons-svg, https://github.com/ant-design/ant-design-icons),
+published by Ant Group / Alibaba under the ISC license.
+
+Source files fetched from:
+  inline-svg/outlined/{check-square,bold,unordered-list,line,picture,delete,plus}.svg
+
+Each icon was rasterized offscreen to a 32x32 alpha mask:
+  <name>.a8  : 32*32 bytes, row-major, 0 = transparent, 255 = opaque
+  <name>.png : the same mask, kept only for visual reference
+
+ISC License
+
+Copyright (c) 2018-present Ant UED, https://xtech.antfin.com/
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
