@@ -3,7 +3,7 @@ Icons in this directory are derived from Ant Design Icons
 published by Ant Group / Alibaba under the ISC license.
 
 Source files fetched from:
-  inline-svg/outlined/{check-square,bold,unordered-list,line,picture,delete,plus}.svg
+  inline-svg/outlined/{check-square,bold,unordered-list,line,picture,delete,plus,search}.svg
 
 Each icon was rasterized offscreen to a 32x32 alpha mask:
   <name>.a8  : 32*32 bytes, row-major, 0 = transparent, 255 = opaque

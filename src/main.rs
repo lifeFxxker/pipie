@@ -20,8 +20,11 @@
 //!
 //! 操作：按住中键（或侧键）呼出 → 悬停应用展开内容 → 松开执行；Esc / 点其他键取消
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -744,8 +747,10 @@ static NOTE_MODAL: AtomicBool = AtomicBool::new(false);
 /// 公司电脑上常见：DLP / 录屏审计会钩住 GDI 的 BitBlt，一次抓屏能慢十倍，
 /// 于是「一呼出就卡一下」，轮盘和卡片都中招（用户 2026-11-02 报）。
 static CAP_SLOW: AtomicBool = AtomicBool::new(false);
+/// 连续几次抓屏慢才降级（单次抖动不算；一次 164ms 就永久纸面反而更卡）
+static SLOW_HITS: AtomicU8 = AtomicU8::new(0);
 /// 判定阈值（毫秒）。正常机器 475²/524² 抓 + 模糊 ≈ 5~15ms
-const CAP_SLOW_MS: u128 = 150;
+const CAP_SLOW_MS: u128 = 250;
 /// 抓出来**全黑**的次数（DLP / 受保护会话会稳定返回黑帧）。连续两次 → 本次运行不再抓：
 /// 反正每次都黑，白抓只是每次呼出都多等一拍（用户 2026-11-02 公司电脑）。
 static CAP_BLACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1310,6 +1315,25 @@ struct State {
     /// `nt_bold_end` = 当前加粗段的闭合标记起点（`usize::MAX` = 还没打过字）
     nt_bold_want: bool,
     nt_bold_end: usize,
+    /// 底栏搜索：开着 = 只显示命中的页（清空输入 / Esc / 点别处退出）
+    nt_search_on: bool,
+    /// 搜索框内容（UTF-8）
+    nt_search: String,
+    /// 搜索框里的 IME 组字串（还没上屏那段）
+    nt_scomp: String,
+    /// 搜索框光标（`nt_search` 的字节下标）
+    nt_scaret: usize,
+    /// 命中的页下标（按页序，最新在前）
+    nt_hits: Vec<usize>,
+    /// 进入搜索前的 `(页, 光标)`，退出时恢复
+    nt_search_back: Option<(usize, usize)>,
+    /// 搜索图标 / 输入框悬停（图标一 hover 就展开输入框）
+    nt_search_hot: bool,
+    /// 展开进度（0 = 收起，1 = 全展开；缓动会略微过冲）
+    nt_search_anim: f32,
+    nt_anim_from: f32,
+    nt_anim_to: f32,
+    nt_anim_t0: f64,
     nt_x: i32,
     nt_y: i32,
     /// 便签里贴进来的图片（按文件名缓存解码结果）
@@ -1616,6 +1640,17 @@ impl State {
             nt_toast_hot: false,
             nt_bold_want: false,
             nt_bold_end: usize::MAX,
+            nt_search_on: false,
+            nt_search: String::new(),
+            nt_scomp: String::new(),
+            nt_scaret: 0,
+            nt_hits: Vec::new(),
+            nt_search_back: None,
+            nt_search_hot: false,
+            nt_search_anim: 0.0,
+            nt_anim_from: 0.0,
+            nt_anim_to: 0.0,
+            nt_anim_t0: 0.0,
             nt_x: 0,
             nt_y: 0,
             nt_imgs: Vec::new(),
@@ -2865,11 +2900,17 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
     }
     let ms = t0.elapsed().as_millis();
     if ms > CAP_SLOW_MS {
-        // 这台机器抓屏太慢（DLP / 审计钩住 GDI）→ 本次运行不再抓，轮盘用纸面
-        CAP_SLOW.store(true, Ordering::Relaxed);
-        perf_line(&format!("PERF snap_glass {ms}ms（超过 {CAP_SLOW_MS}ms）→ 本次运行退回纸面 {}", glass_where(x, y)));
+        let n = SLOW_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 2 {
+            // 连续两次都慢（DLP / 审计钩住 GDI）→ 本次运行不再抓，轮盘用纸面
+            CAP_SLOW.store(true, Ordering::Relaxed);
+            perf_line(&format!("PERF snap_glass {ms}ms（连续 {n} 次超过 {CAP_SLOW_MS}ms）→ 本次运行退回纸面 {}", glass_where(x, y)));
+        } else {
+            perf_line(&format!("PERF snap_glass {ms}ms（慢 #1，先不降级）{}", glass_where(x, y)));
+        }
         return;
     }
+    SLOW_HITS.store(0, Ordering::Relaxed);
     set_glass_bg(st, build_glass(&raw));
     // 抓屏 + 模糊一共多久（菜单是"按下就出"，这段延迟用户能感觉到）
     if std::env::var_os("RL_GLASSDBG").is_some() || ms > 40 {
@@ -6464,6 +6505,18 @@ unsafe fn find_window_of_exe(exe: &str) -> Option<HWND> {
         if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
             return BOOL(1);
         }
+        // DWM cloaked = 被挂起 / 在别的虚拟桌面 / UWP 的后台壳窗口：
+        // IsWindowVisible 仍为 true，但置前只会「闪一下」或完全没反应。
+        let mut cloaked = 0u32;
+        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(14), // DWMWA_CLOAKED
+            &mut cloaked as *mut _ as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if cloaked != 0 {
+            return BOOL(1);
+        }
         // 桌面 / 任务栏这些外壳窗口也是 explorer.exe 的，别当成「应用窗口」
         let mut cls = [0u16; 64];
         let n = GetClassNameW(hwnd, &mut cls).max(0) as usize;
@@ -7439,25 +7492,86 @@ unsafe fn update_exempt(st: &State) {
 ///    `switch_bg()`（点击路径的异步查询）负责；查过之后的第二次打开必须走这里，
 ///    否则会在 UI 线程上再联网抓一遍标题（= 环冻住 1~3 秒）。
 fn open_target(target: &str) {
+    use windows::Win32::System::Threading::{
+        CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
     unsafe {
-        // 目标程序**已经在跑** → 只把它的窗口弹到最前，不再重复启动
+        // 目标程序**已经在跑** → 只把它的窗口弹到最前，不再重复启动。
+        // ⚠️ 置前必须**复核结果**：被 UIPI/虚拟桌面/挂起窗口挡住时 focus_window 会静默失败，
+        //    直接 return 就是用户报的「点了打不开」。失败就走真正的启动。
         if let Some(exe) = resolve_target_exe(target) {
             if let Some(hw) = find_window_of_exe(&exe) {
                 focus_window(hw);
-                println!("[*] 聚焦已开窗口 · {target}");
-                return;
+                let mut hw_pid = 0u32;
+                GetWindowThreadProcessId(hw, Some(&mut hw_pid));
+                for _ in 0..3 {
+                    let fg = GetForegroundWindow();
+                    let mut fg_pid = 0u32;
+                    GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+                    // 有的应用会把**自己的另一个窗口**提到前台，pid 相同也算成功
+                    if fg == hw || (fg_pid != 0 && fg_pid == hw_pid) {
+                        println!("[*] 聚焦已开窗口 · {target}");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                diag_line(&format!("{}\radial_log.txt", log_dir()), &format!("LAUNCH focus failed → start · {target}"));
             }
         }
         let p = wide(target);
-        let _ = ShellExecuteW(
+        let dir = target_dir(target);
+        let dp = wide(&dir);
+        let r = ShellExecuteW(
             HWND(ptr::null_mut()),
             PCWSTR::null(),
             PCWSTR(p.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            if dir.is_empty() { PCWSTR::null() } else { PCWSTR(dp.as_ptr()) },
             SW_SHOWNORMAL,
         );
+        let code = r.0 as usize;
+        if code <= 32 {
+            // 常见：0x2 = 文件不存在，0x5 = 拒绝访问，0x1F = 没有关联，0x7A = 需要提权
+            diag_line(&format!("{}\radial_log.txt", log_dir()), &format!("LAUNCH shell failed code={code} target={target} dir={dir}"));
+            // .exe 关联被劫持/损坏时 ShellExecute 会失败，直接 CreateProcess 兜底
+            let low = target.trim().to_ascii_lowercase();
+            if low.ends_with(".exe") && std::path::Path::new(target).exists() {
+                let mut cmd: Vec<u16> = wide(&format!("\"{}\"", target));
+                let mut wd = wide(&dir);
+                let mut si = STARTUPINFOW::default();
+                si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+                let mut pi = PROCESS_INFORMATION::default();
+                let _ = CreateProcessW(
+                    PCWSTR::null(),
+                    PWSTR(cmd.as_mut_ptr()),
+                    None,
+                    None,
+                    false,
+                    PROCESS_CREATION_FLAGS(0),
+                    None,
+                    if dir.is_empty() { PCWSTR::null() } else { PCWSTR(wd.as_mut_ptr()) },
+                    &si,
+                    &mut pi,
+                );
+                if !pi.hProcess.is_invalid() {
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+            }
+        }
     }
+}
+
+/// exe 所在目录（`.lnk` / URL / 文件夹给空，交给 ShellExecute 自己决定工作目录）
+fn target_dir(target: &str) -> String {
+    let t = target.trim();
+    if !t.to_ascii_lowercase().ends_with(".exe") {
+        return String::new();
+    }
+    std::path::Path::new(t)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 fn launch(target: &str) {
@@ -11778,6 +11892,7 @@ unsafe extern "system" fn mouse_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LR
         if NOTE_LIVE.load(Ordering::Relaxed)
             && !NOTE_MODAL.load(Ordering::Relaxed)
             && !cursor_on_note(l)
+            && std::env::var_os("PIPIE_KEEP_CARDS").is_none()
         {
             // 便签的收起消息由它自己的窗口过程处理（`WM_APP_NOTESHOW` w=0）
             let nh = NOTE_HWND.load(Ordering::Relaxed);
@@ -14928,8 +15043,130 @@ fn rgb(c: (u8, u8, u8)) -> COLORREF {
     COLORREF((c.0 as u32) | ((c.1 as u32) << 8) | ((c.2 as u32) << 16))
 }
 
+/// 小圆角元件走**局部 3× 超采样**再降采样：GDI 的 RoundRect 在 2× 画布上只有
+/// 5 级灰度，胶囊/chip 的高对比边会有明显台阶（用户 2026-11-04 报 toast 锯齿）。
+/// 大面板（卡片）继续走原来的路径，避免每帧分配大 DIB。
+fn rr_small(r: RECT, rad: i32) -> bool {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    // ⚠️ 阈值必须把「网格卡片」挡在外面（141×116 × 9 格 × 每帧）：局部 4× 超采样
+    //    在滚动时会吃掉 20M+ 像素/帧，手感直接慢半拍（用户 2026-11-04 报）。
+    //    只给胶囊/chip/按钮这类小元件用。
+    w > 0 && h > 0 && rad >= 6 && w <= 200 && h <= 64 && w * h <= 9000
+}
+
+thread_local! {
+    /// 圆角形状的覆盖率蒙版缓存：同一个尺寸/圆角每帧要画很多次（tab、toast、搜索框），
+    /// 每次重做 4× 超采样会把滚动帧拖到 30ms+（2026-11-04 实测）。缓存后每帧只做一次
+    /// 颜色填充 + AlphaBlend。
+    static RR_MASK_CACHE: RefCell<HashMap<(i32, i32, i32, i32), Rc<Vec<u8>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 生成一张 `tw×th` 的 0..255 覆盖率蒙版（内部 4× 超采样）
+unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32) -> Vec<u8> {
+    const K: i32 = 4;
+    let ss = SS;
+    let (sw, sh) = (tw * K, th * K);
+    let mut out = vec![0u8; (tw * th) as usize];
+    let (sbits, sdc, sbmp) = make_dib(sw, sh);
+    if sbits.is_null() || sdc.is_invalid() || sbmp.is_invalid() {
+        return out;
+    }
+    let white = rgb((255, 255, 255));
+    if ring_ew > 0 {
+        let pen = CreatePen(PS_SOLID, (ring_ew * ss * K).max(1), white);
+        let op = SelectObject(sdc, HGDIOBJ(pen.0));
+        let ob = SelectObject(sdc, GetStockObject(NULL_BRUSH));
+        let _ = RoundRect(sdc, 0, 0, sw, sh, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = SelectObject(sdc, op);
+        let _ = SelectObject(sdc, ob);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    } else {
+        let br = CreateSolidBrush(white);
+        let pen = CreatePen(PS_NULL, 0, white);
+        let ob = SelectObject(sdc, HGDIOBJ(br.0));
+        let op = SelectObject(sdc, HGDIOBJ(pen.0));
+        let _ = RoundRect(sdc, 0, 0, sw, sh, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = SelectObject(sdc, ob);
+        let _ = SelectObject(sdc, op);
+        let _ = DeleteObject(HGDIOBJ(br.0));
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+    let samples = (K * K) as u32;
+    for y in 0..th {
+        for x in 0..tw {
+            let mut cov = 0u32;
+            for dy in 0..K {
+                let row = ((y * K + dy) * sw + x * K) * 4;
+                for dx in 0..K {
+                    cov += *sbits.add((row + dx * 4) as usize) as u32;
+                }
+            }
+            out[(y * tw + x) as usize] = (cov / samples) as u8;
+        }
+    }
+    let _ = DeleteObject(HGDIOBJ(sbmp.0));
+    let _ = DeleteDC(sdc);
+    out
+}
+
+/// 把一个圆角形状画成 alpha 蒙版，再 AlphaBlend 到 `dc`（目标坐标已带 SS/S_M）。
+/// `ring_ew > 0` = 只画描边，否则填实心；`a` = 整体不透明度。
+unsafe fn rr_aa_blit(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8, ring_ew: i32) {
+    if a == 0 {
+        return;
+    }
+    let ss = SS;
+    let tw = (r.right - r.left) * ss;
+    let th = (r.bottom - r.top) * ss;
+    if tw <= 0 || th <= 0 {
+        return;
+    }
+    let key = (tw, th, rad, ring_ew);
+    let cov = RR_MASK_CACHE.with(|cache| {
+        if let Some(v) = cache.borrow().get(&key) {
+            return v.clone();
+        }
+        let v = Rc::new(rr_aa_mask(tw, th, rad, ring_ew));
+        cache.borrow_mut().insert(key, v.clone());
+        v
+    });
+    let (dbits, ddc, dbmp) = make_dib(tw, th);
+    if dbits.is_null() || ddc.is_invalid() || dbmp.is_invalid() {
+        return;
+    }
+    for i in 0..(tw * th) as usize {
+        let aa = (cov[i] as u32 * a as u32 / 255).min(255) as u32;
+        let o = i * 4;
+        let prem = |v: u8| (v as u32 * aa / 255) as u8;
+        *dbits.add(o) = prem(c.2);
+        *dbits.add(o + 1) = prem(c.1);
+        *dbits.add(o + 2) = prem(c.0);
+        *dbits.add(o + 3) = aa as u8;
+    }
+    let bf = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA
+    };
+    let _ = AlphaBlend(dc, sxv(r.left), sxv(r.top), tw, th, ddc, 0, 0, tw, th, bf);
+    let _ = DeleteObject(HGDIOBJ(dbmp.0));
+    let _ = DeleteDC(ddc);
+}
+
 unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(u8, u8, u8)>, ew: i32) {
     if r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    if rr_small(r, rad) {
+        rr_aa_blit(dc, r, rad, fill, 255, 0);
+        if let Some(e) = edge {
+            if ew > 0 {
+                rr_aa_blit(dc, r, rad, e, 255, ew);
+            }
+        }
         return;
     }
     let br = CreateSolidBrush(rgb(fill));
@@ -14960,6 +15197,10 @@ unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(
 ///    而且填的是半透明色、边缘本来就软，落地看不出台阶。
 unsafe fn g_rrect_alpha(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8) {
     if r.right <= r.left || r.bottom <= r.top || a == 0 {
+        return;
+    }
+    if rr_small(r, rad) {
+        rr_aa_blit(dc, r, rad, c, a, 0);
         return;
     }
     if a >= 255 {
@@ -15005,7 +15246,12 @@ unsafe fn g_rrect_alpha(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8) {
 }
 
 /// 只描边不填充（卡片外框：画在内容之上，不能盖住内容）
-unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32) {    let pen = CreatePen(PS_SOLID, ew * SS, rgb(edge));
+unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32) {
+    if rr_small(r, rad) {
+        rr_aa_blit(dc, r, rad, edge, 255, ew.max(1));
+        return;
+    }
+    let pen = CreatePen(PS_SOLID, ew * SS, rgb(edge));
     let nb = GetStockObject(NULL_BRUSH);
     let op = SelectObject(dc, HGDIOBJ(pen.0));
     let ob = SelectObject(dc, nb);
@@ -16469,6 +16715,19 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
     Ctl::None
 }
 
+/// 光标在不在这个窗口上（失焦看门狗用：鼠标停在卡上 = 用户正在用，别收）
+unsafe fn cursor_on_window(hwnd: HWND) -> bool {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return false;
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return false;
+    }
+    pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+}
+
 fn in_rect(r: RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
@@ -17643,7 +17902,10 @@ fn autostart_sync(want: bool) {
     let cur = autostart_reg_value();
     let sandbox = autostart_sandbox();
     let (plan, act) = autostart_plan(sandbox, want, cur.as_deref(), &mine);
+    // 先读原始禁用状态（drop_legacy 会清掉它，日志要记下「之前是不是被禁用」）
+    let approved = autostart_approved_disabled();
     if !sandbox {
+        // 清旧名 + StartupApproved：任务管理器里禁用过的记录只重写 Run 项不会恢复
         autostart_drop_legacy();
     }
     if let Some(on) = act {
@@ -17654,9 +17916,14 @@ fn autostart_sync(want: bool) {
     diag_line(
         &format!("{}\\radial_log.txt", log_dir()),
         &format!(
-            "AUTOSTART ini={} 原值={} → {plan} → 现值={}（我={mine}）",
+            "AUTOSTART ini={} 原值={} approved={} → {plan} → 现值={}（我={mine}）",
             if want { 1 } else { 0 },
             cur.as_deref().unwrap_or("<无>"),
+            match approved {
+                Some(true) => "禁用",
+                Some(false) => "启用",
+                None => "无记录",
+            },
             autostart_reg_value().as_deref().unwrap_or("<无>"),
         ),
     );
@@ -17681,6 +17948,57 @@ fn autostart_drop_legacy() {
             let _ = RegCloseKey(hk);
         }
     }
+    autostart_clear_approved();
+}
+
+/// 清掉任务管理器「启动」页留下的禁用记录（StartupApproved）。
+/// 只重写 Run 项**不会**把被禁用的启动项重新启用 —— 这是「设了自启却起不来」的隐藏门禁。
+fn autostart_clear_approved() {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
+    let (sub, _) = autostart_approved_key();
+    unsafe {
+        let mut hk = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(sub.as_ptr()), 0, KEY_SET_VALUE, &mut hk).is_ok() {
+            for name in [wide("PiPie"), wide("RadialMenu"), wide("pigo")] {
+                let _ = RegDeleteValueW(hk, PCWSTR(name.as_ptr()));
+            }
+            let _ = RegCloseKey(hk);
+        }
+    }
+}
+
+/// `HKCU\...\Explorer\StartupApproved\Run` —— Windows 在这里记「启动项是否被用户禁用」。
+fn autostart_approved_key() -> (Vec<u16>, Vec<u16>) {
+    (
+        wide("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"),
+        wide("PiPie"),
+    )
+}
+
+/// `Some(true)` = 被任务管理器禁用；`None` = 没有记录（默认启用）。
+fn autostart_approved_disabled() -> Option<bool> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
+    let (sub, name) = autostart_approved_key();
+    let mut buf = [0u8; 32];
+    let mut sz: u32 = buf.len() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut sz),
+        )
+    };
+    if r.0 != 0 || sz == 0 {
+        return None;
+    }
+    // 0x03 = 禁用；0x02 = 启用（首字节）
+    Some(buf[0] == 3)
 }
 
 // ⚠️ 曾经有 `autostart_get()`（直读注册表）。现在 **ini 是唯一真相**
@@ -17714,6 +18032,7 @@ fn autostart_set(on: bool) {
             return;
         }
         if on {
+            autostart_clear_approved();
             let d: Vec<u16> = wide(&format!("\"{}\"", exe_path()));
             let bytes: &[u8] = std::slice::from_raw_parts(d.as_ptr() as *const u8, d.len() * 2);
             let _ = RegSetValueExW(hk, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes));
@@ -18608,23 +18927,29 @@ const CL_THUMB: i32 = 320;
 const CL_ANIM_S: f32 = 0.16;
 /// toast 胶囊：**定宽**，这样 `cl_hit` 不用拿 `dc` 量文字也能点到「撤销」。
 /// 文案压到最短（最长那条 11 字）后收窄到 280；超了走省略号而不是把胶囊撑破。
-const CL_TOAST_W: i32 = 280;
+/// 所有提示统一窄胶囊（和便签卡片一致）：删除 / 放回 / 置顶 / 失败都一样短
+const CL_TOAST_W: i32 = 148;
 const CL_TOAST_H: i32 = 26;
 /// 毛玻璃的雾面浓度（0 = 纯模糊桌面，1 = 全纸色）。
 /// 0.72：字清楚、又看得出底下那层被糊掉的东西。再低字就压在桌面上了
 /// —— 用户 2026-10-31 否掉液态玻璃就是这个原因（「看不见字」）。
 const CL_FROST_TINT: f32 = 0.72;
 /// 撤销窗口（秒）。设计稿 2s：够点一下，又不至于让「已删」的状态挂很久。
-const CL_UNDO_S: f64 = 2.0;
+const CL_UNDO_S: f64 = 1.8;
 
 const TIMER_CLIP_BLINK: usize = 6;
 const TIMER_NOTE_BLINK: usize = 7;
 const TIMER_NOTE_SAVE: usize = 8;
+/// 搜索框展开/收起的阻尼动画帧
+const TIMER_NOTE_ANIM: usize = 10;
 /// 卡片「失焦就收」的看门狗（250ms 一次）。为什么不能只靠 `WM_ACTIVATE`：
 /// 常驻轮盘是 `WS_EX_NOACTIVATE`，点它 / 点桌面 / 点任务栏都不会让卡片失活。
 const TIMER_CARD_FG: usize = 9;
 /// 卡片刚弹出这段时间内不查前台（`focus_window` 拿到焦点要几帧）
 const CARD_FG_GRACE: f64 = 0.45;
+/// 刚弹出这段时间里，如果前台被原程序抢回去，再抢回来几次；
+/// 从 NOACTIVATE 的轮盘弹卡片时，Windows 常常立刻把前台还回去。
+const CARD_FG_KEEP: f64 = 0.9;
 
 /// 便签：最多多少页 / 单页最长多少字（超过就截断 —— 便签不是笔记本，防跑飞）
 const NT_CAP_PAGES: usize = 200;
@@ -18958,8 +19283,13 @@ unsafe fn clip_thumb_get(st: &mut State, path: &str) -> Option<usize> {
     if let Some(i) = st.cl_thumbs.iter().position(|t| t.path == path) {
         return Some(i);
     }
+    let t0 = std::time::Instant::now();
     let bytes = std::fs::read(path).ok()?;
     let t = clip_make_thumb(path, &bytes)?;
+    let ms = t0.elapsed().as_millis();
+    if ms > 25 {
+        clip_log(&format!("PERF thumb {ms}ms {}", path.rsplit('\\').next().unwrap_or(path)));
+    }
     st.cl_thumbs.push(t);
     Some(st.cl_thumbs.len() - 1)
 }
@@ -19015,7 +19345,15 @@ unsafe fn clip_thumb_drop(st: &mut State, path: &str) {
 unsafe fn clip_thumbs_keep_pages(st: &mut State, pages: [usize; 2]) {
     let vis = cl_visible(st);
     let mut keep: Vec<String> = Vec::new();
-    for p in pages {
+    // 当前页前后各留一页：滚轮翻来翻去不会每次都重新读盘解码
+    let cur = st.cl_page;
+    let mut want: Vec<usize> = pages.to_vec();
+    for p in [cur.saturating_sub(1), cur, cur + 1] {
+        if !want.contains(&p) {
+            want.push(p);
+        }
+    }
+    for p in want {
         let s = (p * CL_PER).min(vis.len());
         for idx in vis[s..(s + CL_PER).min(vis.len())].iter() {
             let img = st.cl_items[*idx].img.clone();
@@ -19666,7 +20004,7 @@ unsafe fn clip_fire(st: &mut State, idx: usize) {
     st.cl_sel = idx;
     let ok = clip_paste(st, idx);
     if !ok {
-        clip_toast(st, "写回失败 · 剪贴板被占用");
+        clip_toast(st, "写回失败 · 被占用");
         clip_present(st);
         clip_kick(st);
         return;
@@ -19864,7 +20202,7 @@ fn cl_dot_rect(i: usize) -> RECT {
     let x = CL_PAD + i as i32 * 11;
     RECT { left: x, top: y + (CL_FOOT_H - 6) / 2, right: x + 6, bottom: y + (CL_FOOT_H - 6) / 2 + 6 }
 }
-/// toast 胶囊（定宽 + 水平居中，贴在网格下沿、footer 之上）
+/// toast 胶囊（定宽 148 + 水平居中，贴在网格下沿、footer 之上）
 fn cl_toast_rect() -> RECT {
     let y = CL_GRID_BOT - CL_TOAST_H - 6;
     RECT { left: (CL_W - CL_TOAST_W) / 2, top: y, right: (CL_W + CL_TOAST_W) / 2, bottom: y + CL_TOAST_H }
@@ -20615,9 +20953,9 @@ unsafe fn clip_draw(st: &mut State, dc: HDC) {
     // 命中判定拿不到 dc，不能在这儿靠量字宽定位那颗「撤销」。
     if !st.cl_toast.is_empty() {
         let txt = st.cl_toast.clone();
+        let can_undo = st.cl_undo.is_some();
         let r = cl_toast_rect();
         g_rrect(dc, r, 13, pal.block, None, 0);
-        let can_undo = st.cl_undo.is_some();
         c_text(
             dc,
             &txt,
@@ -20674,11 +21012,16 @@ unsafe fn clip_snap_bg(st: &mut State, x: i32, y: i32) {
     clip_frost_tint(st, &mut bg);
     let ms = t0.elapsed().as_millis();
     if ms > CAP_SLOW_MS {
-        // 太慢：这张卡这次就用实心纸，别让「打开」这一下卡住
-        CAP_SLOW.store(true, Ordering::Relaxed);
-        clip_log(&format!("snap_bg SLOW {ms}ms -> 本次运行退回纸面"));
+        let n = SLOW_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 2 {
+            CAP_SLOW.store(true, Ordering::Relaxed);
+            clip_log(&format!("snap_bg SLOW {ms}ms #{n} -> 本次运行退回纸面"));
+        } else {
+            clip_log(&format!("snap_bg SLOW {ms}ms #1 -> 这次先用纸面，先不全局降级"));
+        }
         return;
     }
+    SLOW_HITS.store(0, Ordering::Relaxed);
     clip_log(&format!("snap_bg {ms}ms"));
     st.card_bg = bg;
     card_bg_hi_build(st);
@@ -21720,11 +22063,21 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                 }
                 TIMER_CARD_FG => {
-                    // 失焦看门狗（和便签同一条）：前台不是自己 → 收起
-                    if st.cl_shown && now_s() - st.cl_fg0 > CARD_FG_GRACE {
+                    // 失焦看门狗（和便签同一条）：前台不是自己 → 收起。
+                    // 例外 1：刚弹出的 0.9s 内，主动再抢一次前台；
+                    // 例外 2：光标就在卡片上 —— 用户正在用，别收。
+                    if std::env::var_os("PIPIE_KEEP_CARDS").is_some() {
+                        // 测试沙箱专用：不让看门狗收卡（真实运行不会设置这个变量）
+                    } else if st.cl_shown && now_s() - st.cl_fg0 > CARD_FG_GRACE {
                         let fg = GetForegroundWindow();
                         if !fg.is_invalid() && fg != hwnd {
-                            close_clip(st);
+                            let age = now_s() - st.cl_fg0;
+                            if age < CARD_FG_KEEP {
+                                focus_window(hwnd);
+                            } else if !cursor_on_window(hwnd) {
+                                clip_log(&format!("clip close fg={:x} age={:.2}", fg.0 as usize, age));
+                                close_clip(st);
+                            }
                         }
                     }
                 }
@@ -21862,8 +22215,20 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_ACTIVATE => {
             // 卡片是「呼出型」窗口：焦点一走就收起，不然一张 480² 的卡会一直压在桌上。
             // （这也是为什么呼出时必须 SetForegroundWindow —— 它得真拿到焦点。）
-            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                close_clip(state_of(hwnd));
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE
+                && std::env::var_os("PIPIE_KEEP_CARDS").is_none()
+            {
+                let st = state_of(hwnd);
+                if st.cl_shown {
+                    let age = now_s() - st.cl_fg0;
+                    if age < CARD_FG_KEEP {
+                        // 刚弹出就被原程序抢回前台（从 NOACTIVATE 轮盘弹出时很常见）→ 再抢
+                        focus_window(hwnd);
+                    } else {
+                        clip_log("clip close reason=inactive");
+                        close_clip(st);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -21932,6 +22297,29 @@ fn nt_default_title(st: &State) -> String {
 fn note_title(st: &State) -> &str {
     st.nt_titles.get(st.nt_cur).map(|s| s.as_str()).unwrap_or("")
 }
+/// 标题条上横坐标 `x` 最接近的字符边界（点哪写哪）
+unsafe fn note_title_caret_at(st: &State, x: i32) -> usize {
+    let t = note_title(st).to_string();
+    if t.is_empty() || st.c_lo_dc.0.is_null() {
+        return t.len();
+    }
+    let tr = nt_title_rect();
+    let mut best = 0usize;
+    let mut best_d = i32::MAX;
+    let mut acc = 0i32;
+    for (i, ch) in t.char_indices() {
+        let d = (x - (tr.left + acc)).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+        acc += s_text_w(st.c_lo_dc, &t[i..i + ch.len_utf8()], st.cf_h3);
+    }
+    if (x - (tr.left + acc)).abs() < best_d {
+        best = t.len();
+    }
+    best
+}
 /// 顶上那条拖拽带（标题条现在要点进去改名，所以只留标题上方那一条）
 fn nt_drag_band(y: i32) -> bool {
     y >= 0 && y < nt_title_rect().top
@@ -21960,6 +22348,39 @@ fn nt_tool_rect(i: i32) -> RECT {
     let x0 = CL_PAD + 96 + 12 + i * 26;
     RECT { left: x0, top: y.top, right: x0 + 22, bottom: y.bottom }
 }
+/// 底栏搜索图标（「＋新页」左边，22×22）
+fn nt_search_icon_rect() -> RECT {
+    let p = nt_plus_rect();
+    RECT { left: p.left - 26, top: p.top, right: p.left - 4, bottom: p.bottom }
+}
+/// 展开后的搜索输入框：向左展开到工具图标右侧，右端仍是那颗搜索图标。
+/// 左侧留 12px 余量：阻尼动画末端会过冲约 5%，不能压到最后一颗工具图标。
+fn nt_search_box_rect() -> RECT {
+    let i = nt_search_icon_rect();
+    RECT { left: nt_tool_rect(4).right + 12, top: i.top, right: i.right, bottom: i.bottom }
+}
+fn nt_search_expanded(st: &State) -> bool {
+    st.nt_search_hot || st.nt_search_on
+}
+/// easeOutBack：末端略微过冲再回弹，看起来像有阻尼
+fn nt_ease_back(p: f32) -> f32 {
+    let c1 = 1.2f32;
+    let c3 = c1 + 1.0;
+    let q = p - 1.0;
+    1.0 + c3 * q * q * q + c1 * q * q
+}
+
+/// 启动搜索框展开/收起的阻尼动画（16ms 一帧，到位后自己停）
+unsafe fn note_search_kick(st: &mut State, hwnd: HWND) {
+    let to = if nt_search_expanded(st) { 1.0 } else { 0.0 };
+    if (to - st.nt_anim_to).abs() < 0.001 {
+        return; // 已经在往同一个方向走
+    }
+    st.nt_anim_from = st.nt_search_anim;
+    st.nt_anim_to = to;
+    st.nt_anim_t0 = now_s();
+    let _ = SetTimer(hwnd, TIMER_NOTE_ANIM, 16, None);
+}
 
 // 图标来自 Ant Design 官方图标库（阿里巴巴 / @ant-design/icons-svg，ISC），
 // 离屏渲染成 32×32 alpha 蒙版后嵌进来（见 assets/note_icons/）。
@@ -21971,6 +22392,7 @@ const NT_ICON_DIVIDER: &[u8; 1024] = include_bytes!("../assets/note_icons/line.a
 const NT_ICON_IMAGE: &[u8; 1024] = include_bytes!("../assets/note_icons/picture.a8");
 const NT_ICON_DEL: &[u8; 1024] = include_bytes!("../assets/note_icons/delete.a8");
 const NT_ICON_PLUS: &[u8; 1024] = include_bytes!("../assets/note_icons/plus.a8");
+const NT_ICON_SEARCH: &[u8; 1024] = include_bytes!("../assets/note_icons/search.a8");
 
 /// 画一枚 16×16（逻辑）图标，中心在 `(cx, cy)`。蒙版 32×32 = SS 画布上的 1:1。
 unsafe fn g_icon(dc: HDC, cx: i32, cy: i32, mask: &[u8; 1024], ink: (u8, u8, u8)) {
@@ -22545,6 +22967,9 @@ unsafe fn note_max_top(dc: HDC, lines: &[NtLine]) -> usize {
         let h = nt_line_h(dc, &lines[i]);
         rem -= h;
         if rem < view {
+            // ⚠️ 这里已经**移掉 i+1 行**了；返回 i 会少一行，滚到底时最后一行被裁掉
+            //    （搜索命中行正好是最后一行时看起来「完全没有高亮」，用户 2026-11-04 报）
+            i += 1;
             break;
         }
         i += 1;
@@ -22789,6 +23214,174 @@ unsafe fn note_go(st: &mut State, p: usize) -> bool {
     st.nt_bold_end = usize::MAX;
     st.nt_blink = true;
     true
+}
+
+/// 一段文字里 `needle` 的所有命中区间（ASCII 不区分大小写，其他逐字匹配）
+fn nt_find_all(hay: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    if hay.is_ascii() && needle.is_ascii() {
+        let h = hay.to_ascii_lowercase();
+        let n = needle.to_ascii_lowercase();
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while let Some(i) = h[off..].find(&n) {
+            let a = off + i;
+            out.push((a, a + n.len()));
+            off = a + n.len().max(1);
+        }
+        out
+    } else {
+        hay.match_indices(needle).map(|(i, _)| (i, i + needle.len())).collect()
+    }
+}
+
+fn nt_contains(hay: &str, needle: &str) -> bool {
+    !nt_find_all(hay, needle).is_empty()
+}
+
+/// 重算命中页；当前页不在命中里就跳到第一页命中
+unsafe fn note_search_apply(st: &mut State) {
+    let q = st.nt_search.trim().to_string();
+    st.nt_hits.clear();
+    if !q.is_empty() {
+        for i in 0..st.nt_pages.len() {
+            let hit = nt_contains(&st.nt_pages[i], &q)
+                || st.nt_titles.get(i).map(|t| nt_contains(t, &q)).unwrap_or(false);
+            if hit {
+                st.nt_hits.push(i);
+            }
+        }
+    }
+    if !st.nt_hits.is_empty() && !st.nt_hits.contains(&st.nt_cur) {
+        let p = st.nt_hits[0];
+        note_go(st, p);
+    }
+    // 长页面里命中常常在可视区下方 —— 直接滚到第一条命中，否则看起来「完全没高亮」
+    if !q.is_empty() && !st.nt_hits.is_empty() && !st.c_lo_dc.0.is_null() {
+        let ta = nt_text_rect();
+        let text = note_text(st).to_string();
+        let lines = note_layout(st, st.c_lo_dc, &text, ta.right - ta.left);
+        let max_top = note_max_top(st.c_lo_dc, &lines);
+        let ranges = nt_find_all(&text, &q);
+        if let Some(&(m0, _)) = ranges.first() {
+            // 复用「把光标行滚进视野」的逻辑：命中行会停在窗口底部，必定可见
+            st.nt_scroll = 0;
+            note_follow_caret(st, st.c_lo_dc, &lines, m0);
+        } else {
+            st.nt_scroll = 0; // 只命中标题
+        }
+        st.nt_scroll = st.nt_scroll.min(max_top);
+        st.nt_scroll_seen = (cl_hash(&text), st.nt_caret.min(text.len()));
+    }
+}
+
+/// 进入搜索：记下当前页/光标，输入框从此接管键盘
+unsafe fn note_search_begin(st: &mut State) {
+    if st.nt_search_on {
+        return;
+    }
+    st.nt_search_on = true;
+    st.nt_search.clear();
+    st.nt_scomp.clear();
+    st.nt_scaret = 0;
+    st.nt_hits.clear();
+    st.nt_search_back = Some((st.nt_cur, st.nt_caret));
+    st.nt_edit_title = false;
+    st.nt_comp.clear();
+    st.nt_blink = true;
+}
+
+/// 在搜索框光标处插入
+unsafe fn note_search_insert(st: &mut State, s: &str) {
+    let mut at = st.nt_scaret.min(st.nt_search.len());
+    while at > 0 && !st.nt_search.is_char_boundary(at) {
+        at -= 1;
+    }
+    st.nt_search.insert_str(at, s);
+    st.nt_scaret = at + s.len();
+    st.nt_blink = true;
+}
+
+/// 退格：删光标前一个字符
+unsafe fn note_search_backspace(st: &mut State) {
+    let mut at = st.nt_scaret.min(st.nt_search.len());
+    while at > 0 && !st.nt_search.is_char_boundary(at) {
+        at -= 1;
+    }
+    if at == 0 {
+        return;
+    }
+    let prev = st.nt_search[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+    st.nt_search.replace_range(prev..at, "");
+    st.nt_scaret = prev;
+    st.nt_blink = true;
+}
+
+/// Delete：删光标后一个字符（返回有没有删）
+unsafe fn note_search_delete(st: &mut State) -> bool {
+    let mut at = st.nt_scaret.min(st.nt_search.len());
+    while at < st.nt_search.len() && !st.nt_search.is_char_boundary(at) {
+        at += 1;
+    }
+    if at >= st.nt_search.len() {
+        return false;
+    }
+    let next = st.nt_search[at..].chars().next().map(|c| at + c.len_utf8()).unwrap_or(at);
+    st.nt_search.replace_range(at..next, "");
+    true
+}
+
+fn note_search_prev_boundary(st: &State) -> usize {
+    let mut at = st.nt_scaret.min(st.nt_search.len());
+    while at > 0 && !st.nt_search.is_char_boundary(at) {
+        at -= 1;
+    }
+    st.nt_search[..at].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+}
+
+fn note_search_next_boundary(st: &State) -> usize {
+    let at = st.nt_scaret.min(st.nt_search.len());
+    if at >= st.nt_search.len() {
+        return at;
+    }
+    st.nt_search[at..].chars().next().map(|c| at + c.len_utf8()).unwrap_or(at)
+}
+
+/// 退出搜索：清空条件、恢复进入前那一页和光标
+unsafe fn note_search_end(st: &mut State) {
+    if !st.nt_search_on {
+        return;
+    }
+    st.nt_search_on = false;
+    st.nt_search.clear();
+    st.nt_scomp.clear();
+    st.nt_scaret = 0;
+    st.nt_hits.clear();
+    if let Some((p, c)) = st.nt_search_back.take() {
+        if p < st.nt_pages.len() {
+            note_go(st, p);
+            st.nt_caret = c.min(note_text(st).len());
+            st.nt_lay = None;
+            st.nt_scroll_seen = (0, usize::MAX);
+        }
+    }
+    st.nt_blink = true;
+}
+
+/// 搜索结果里上/下翻一页（`dir` = ±1）
+unsafe fn note_search_step(st: &mut State, dir: i32) -> bool {
+    if !st.nt_search_on || st.nt_hits.is_empty() {
+        return false;
+    }
+    let pos = st.nt_hits.iter().position(|&p| p == st.nt_cur).unwrap_or(0) as i32;
+    let nxt = (pos + dir).clamp(0, st.nt_hits.len() as i32 - 1) as usize;
+    let p = st.nt_hits[nxt];
+    if p == st.nt_cur {
+        return false;
+    }
+    note_go(st, p)
 }
 
 /// 新开一页：插到**第一页**并跳过去（最新那张永远在最上面）；当前页空着 → 什么都不做。
@@ -23493,7 +24086,7 @@ unsafe fn note_layout(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<NtL
                         b: lend,
                         font: st.cf_note,
                         indent: 6,
-                        blk: NtBlk::Image(idx, w),
+                                        blk: NtBlk::Image(idx, w),
                         first: true,
                         in_code: false,
                         segs: Vec::new(),
@@ -23555,7 +24148,6 @@ unsafe fn note_layout(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<NtL
         let mut segs: Vec<(usize, usize, NtSty)> = Vec::new();
         let mut cur_w = 0i32;
         let mut pushed_any = false;
-        // 收一条视觉行（不能写成闭包：它要同时改 `out` / `pushed_any` / `segs`）
         macro_rules! flush {
             () => {{
                 let a = segs.first().map(|x| x.0).unwrap_or(0);
@@ -23588,7 +24180,6 @@ unsafe fn note_layout(st: &mut State, dc: HDC, text: &str, maxw: i32) -> Vec<NtL
         if !segs.is_empty() || !pushed_any {
             flush!();
         }
-        let _ = (cur_w, pushed_any);
         if lend >= text.len() {
             break;
         }
@@ -23649,7 +24240,11 @@ unsafe fn note_ime_place(st: &State, hwnd: HWND) {
     if himc.0.is_null() {
         return;
     }
-    let (x, y) = if st.nt_edit_title {
+    let (x, y) = if st.nt_search_on {
+        let br = nt_search_box_rect();
+        let q = format!("{}{}", st.nt_search, st.nt_scomp);
+        (br.left + 10 + s_text_w(st.c_lo_dc, &q, st.cf_small), br.top)
+    } else if st.nt_edit_title {
         let tr = nt_title_rect();
         let t = note_title(st).to_string();
         let at = st.nt_tcaret.min(t.len());
@@ -23706,7 +24301,8 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
             if dim { pal.edge } else { pal.ink }, tfont, 0);
         if st.nt_edit_title && st.nt_blink {
             let at = st.nt_tcaret.min(title.len());
-            let x = tr.left + s_text_w(dc, &title[..at], tfont);
+            let x = (tr.left + s_text_w(dc, &title[..at], tfont))
+                .min(if has_del { s.right - 44 } else { tr.right - 2 });
             c_stroke(dc, x as f32, (tr.top + 4) as f32, x as f32, (tr.bottom - 4) as f32, SS + SS / 2, pal.ink);
         }
         // 一道很淡的分隔线：标题和正文分开，但不抢眼
@@ -23738,6 +24334,13 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         let n = full.len();
         lines.push(NtLine { a: n, b: n, font: st.cf_note, indent: 0, blk: NtBlk::Plain, first: true, in_code: false, segs: Vec::new(), ih: 0 });
     }
+    // 搜索中一个都没命中：不画当前页，正文区给一行「无匹配」
+    let no_hits = st.nt_search_on && !st.nt_search.trim().is_empty() && st.nt_hits.is_empty();
+    if no_hits {
+        lines.clear();
+        let hint = RECT { left: ta.left, top: (ta.top + ta.bottom) / 2 - 12, right: ta.right, bottom: (ta.top + ta.bottom) / 2 + 12 };
+        c_text(dc, "无匹配", hint, mixc(pal.edge, pal.ink, 0.28), st.cf_small, 1);
+    }
     let lno = nt_line_of(&lines, caret_at);
     // 只在「正文或光标变了」时把滚动拉回光标；滚轮自己滚的时候不要打断
     let sig = (cl_hash(&page), caret_at);
@@ -23750,6 +24353,11 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
     st.nt_scroll = top;
     let comp_a = caret;
     let comp_b = caret + comp.len();
+    let hl_ranges = if st.nt_search_on {
+        nt_find_all(&page, st.nt_search.trim())
+    } else {
+        Vec::new()
+    };
     let mut y = ta.top;
     for i in top..lines.len() {
         let l = lines[i].clone();
@@ -23817,6 +24425,21 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         if l.in_code || l.blk == NtBlk::Code {
             g_rrect(dc, RECT { left: ta.left, top: y, right: ta.right, bottom: y + lh }, 4, mixc(pal.paper, pal.ink, 0.05), None, 0);
         }
+        // 搜索命中：给当前页里每一段命中铺一层淡底（跨视觉行也拆开铺）
+        if !hl_ranges.is_empty() {
+            for &(m0, m1) in &hl_ranges {
+                let a2 = m0.max(l.a);
+                let b2 = m1.min(l.b);
+                if b2 <= a2 {
+                    continue;
+                }
+                let xa = x0 + nt_x_in(st, dc, &l, &full, a2);
+                let xb = x0 + nt_x_in(st, dc, &l, &full, b2);
+                if xb > xa {
+                    g_rrect(dc, RECT { left: xa - 1, top: y + 1, right: xb + 1, bottom: y + lh - 1 }, 3, mixc(pal.paper, pal.ink, 0.36), None, 0);
+                }
+            }
+        }
         // 选区：先铺一层反色块，再把选中那段文字画成纸色（反白）
         let sel_rng = note_sel(st);
         if let Some((sa, sb)) = sel_rng {
@@ -23871,8 +24494,8 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         }
         y += lh;
     }
-    // 光标：组字期间藏起来（IME 自己有）
-    if comp.is_empty() && st.nt_blink {
+    // 光标：组字期间藏起来（IME 自己有）；搜索框 / 标题编辑时不画正文光标
+    if !lines.is_empty() && !st.nt_search_on && !st.nt_edit_title && comp.is_empty() && st.nt_blink {
         let l = lines[lno].clone();
         let lh = nt_line_h(dc, &l);
         let ly = note_line_y(dc, &lines, top, lno);
@@ -23914,13 +24537,18 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
         }
     }
 
-    // 底栏：左侧页码器（固定宽度）+ 右侧 3 颗格式工具 + 「＋新页」
+    // 底栏：左侧页码器（固定宽度）+ 格式工具 + 搜索 + 「＋新页」
     let n = st.nt_pages.len();
-    if n > 1 {
+    // 搜索过滤中：页码器只在命中的页之间翻
+    let filtering = st.nt_search_on && !st.nt_search.trim().is_empty();
+    let view: Vec<usize> = if filtering { st.nt_hits.clone() } else { (0..n).collect() };
+    if filtering || n > 1 {
         let p = nt_pager_rect();
+        let len = view.len();
+        let pos = view.iter().position(|&q| q == st.nt_cur).map(|i| i + 1).unwrap_or(0);
         for dir in [-1i32, 1i32] {
             let r = nt_pager_arrow(dir);
-            let active = if dir < 0 { st.nt_cur > 0 } else { st.nt_cur + 1 < n };
+            let active = if dir < 0 { pos > 1 } else { pos > 0 && pos < len };
             let col = if !active {
                 mixc(pal.edge, pal.paper, 0.5)
             } else if st.nt_pager_hot == dir {
@@ -23934,7 +24562,11 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
             c_stroke(dc, x as f32, (my - 4) as f32, apex as f32, my as f32, SS, col);
             c_stroke(dc, apex as f32, my as f32, x as f32, (my + 4) as f32, SS, col);
         }
-        let info = format!("{} / {}", st.nt_cur + 1, n);
+        let info = if pos == 0 {
+            "0 / 0".to_string()
+        } else {
+            format!("{} / {}", pos, len)
+        };
         c_text(
             dc,
             &info,
@@ -23972,6 +24604,61 @@ unsafe fn note_draw(st: &mut State, dc: HDC) {
             _ => NT_ICON_PLUS,
         };
         g_icon(dc, cx, cy, mask, ink);
+    }
+    // 搜索：常态只有一颗放大镜；悬停 / 输入时向左展开成输入框（阻尼弹簧）
+    {
+        let ir = nt_search_icon_rect();
+        let full = nt_search_box_rect();
+        let anim = st.nt_search_anim.clamp(0.0, 1.15);
+        if anim > 0.01 {
+            let w = (((full.right - full.left) as f32) * anim.min(1.06)).round() as i32;
+            let br = RECT { left: full.right - w, top: full.top, right: full.right, bottom: full.bottom };
+            g_rrect_alpha(dc, br, 11, pal.ink, 18);
+            g_rrect_stroke(dc, br, 11, mixc(pal.edge, pal.ink, 0.18), 1);
+            // 文字随展开淡入；展开途中被胶囊左缘裁住，不会压到工具图标
+            let fade = ((anim - 0.45) / 0.55).clamp(0.0, 1.0);
+            let q = if st.nt_search_on {
+                format!("{}{}", st.nt_search, st.nt_scomp)
+            } else {
+                String::new()
+            };
+            if fade > 0.01 {
+                let tr = RECT {
+                    left: (full.left + 10).max(br.left + 8),
+                    top: full.top,
+                    right: ir.left - 4,
+                    bottom: full.bottom,
+                };
+                if q.is_empty() {
+                    // 聚焦时只留光标，占位文案会和光标叠在同一个字上
+                    if !st.nt_search_on {
+                        let c = mixc(pal.paper, mixc(pal.edge, pal.ink, 0.25), fade);
+                        c_text(dc, "搜索便签", tr, c, st.cf_small, 0);
+                    }
+                } else {
+                    let c = mixc(pal.paper, pal.ink, fade);
+                    c_text(dc, &q, tr, c, st.cf_small, 0);
+                }
+            }
+            // 搜索框自己的光标：空输入也要有；IME 组字时交给输入法画
+            if st.nt_search_on && st.nt_blink && st.nt_scomp.is_empty() && anim > 0.85 {
+                let tx = full.left + 10;
+                let mut at = st.nt_scaret.min(st.nt_search.len());
+                while at > 0 && !st.nt_search.is_char_boundary(at) {
+                    at -= 1;
+                }
+                let w = s_text_w(dc, &st.nt_search[..at], st.cf_small);
+                let cx = (tx + w).min(ir.left - 6).max(br.left + 8);
+                let my = (full.top + full.bottom) / 2;
+                c_stroke(dc, cx as f32, (my - 6) as f32, cx as f32, (my + 6) as f32, SS + SS / 2, pal.ink);
+            }
+        }
+        let ink = if st.nt_search_hot || st.nt_search_on {
+            pal.ink
+        } else {
+            mixc(pal.edge, pal.ink, 0.45)
+        };
+        g_icon(dc, (ir.left + ir.right) / 2, (ir.top + ir.bottom) / 2, NT_ICON_SEARCH, ink);
     }
     // 删除 toast：和剪贴板卡片**同一套样式**（深色胶囊 + 右端「撤销」小按钮）
     if !st.nt_toast.is_empty() && now_s() < st.nt_toast_until {
@@ -24014,6 +24701,12 @@ unsafe fn open_note(st: &mut State) {
     st.nt_scroll_seen = (0, usize::MAX);
     st.nt_bold_want = false;
     st.nt_bold_end = usize::MAX;
+    st.nt_search_on = false;
+    st.nt_search.clear();
+    st.nt_scomp.clear();
+    st.nt_hits.clear();
+    st.nt_search_back = None;
+    st.nt_search_hot = false;
     if st.nt_pages.is_empty() {
         st.nt_pages.push(String::new());
     }
@@ -24128,11 +24821,23 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 && now_s() < st.nt_toast_until
                 && st.nt_toast_undo.is_some()
                 && in_rect(nt_undo_rect(), x, y);
-            if ph != st.nt_pager_hot || th != st.nt_tool_hot || toast_hot != st.nt_toast_hot {
+            // 搜索：hover 图标就展开输入框；移进展开后的框里保持展开
+            let was_expanded = nt_search_expanded(st);
+            let sh = in_rect(nt_search_icon_rect(), x, y)
+                || ((st.nt_search_hot || st.nt_search_on) && in_rect(nt_search_box_rect(), x, y));
+            if ph != st.nt_pager_hot
+                || th != st.nt_tool_hot
+                || toast_hot != st.nt_toast_hot
+                || sh != st.nt_search_hot
+            {
                 st.nt_pager_hot = ph;
                 st.nt_tool_hot = th;
                 st.nt_toast_hot = toast_hot;
+                st.nt_search_hot = sh;
                 note_present(st);
+            }
+            if nt_search_expanded(st) != was_expanded {
+                note_search_kick(st, hwnd);
             }
             LRESULT(0)
         }
@@ -24148,10 +24853,15 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_MOUSELEAVE_MSG => {
             let st = state_of(hwnd);
             st.nt_tracking = false;
-            if st.nt_pager_hot != 0 || st.nt_tool_hot != 0 || st.nt_toast_hot {
+            if st.nt_pager_hot != 0 || st.nt_tool_hot != 0 || st.nt_toast_hot || st.nt_search_hot {
                 st.nt_pager_hot = 0;
                 st.nt_tool_hot = 0;
                 st.nt_toast_hot = false;
+                // 自动化探针合成 WM_MOUSEMOVE 时真实光标不在窗口里，
+                // TrackMouseEvent 会立刻补一条 LEAVE；沙箱里保留 hover 用于断言
+                if std::env::var_os("PIPIE_KEEP_HOVER").is_none() {
+                    st.nt_search_hot = false;
+                }
                 note_present(st);
             }
             LRESULT(0)
@@ -24172,24 +24882,47 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     return LRESULT(0);
                 }
             }
+            // 搜索图标 / 展开后的输入框：进入搜索
+            if in_rect(nt_search_icon_rect(), x, y)
+                || ((st.nt_search_on || st.nt_search_hot) && in_rect(nt_search_box_rect(), x, y))
+            {
+                note_search_begin(st);
+                note_search_kick(st, hwnd);
+                note_present(st);
+                return LRESULT(0);
+            }
+            // 底栏页码器：搜索时在命中页之间翻（点页码器不算「点别处」）
+            if st.nt_search_on || st.nt_pages.len() > 1 {
+                for dir in [-1i32, 1i32] {
+                    if in_rect(nt_pager_arrow(dir), x, y) {
+                        if st.nt_search_on {
+                            if note_search_step(st, dir) {
+                                note_present(st);
+                            }
+                        } else {
+                            let next = if dir < 0 { st.nt_cur.checked_sub(1) } else { Some(st.nt_cur + 1) };
+                            if let Some(p) = next {
+                                if note_go(st, p) {
+                                    note_present(st);
+                                }
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                }
+            }
+            // 搜索开着时，点别处 = 退出搜索（恢复全部页），再按普通点击继续
+            if st.nt_search_on {
+                note_search_end(st);
+                note_search_kick(st, hwnd);
+                note_present(st);
+            }
             if st.nt_pages.len() > 1 {
                 // 标题条右端：删除本页
                 if in_rect(nt_del_rect(), x, y) {
                     note_delete_page(st, hwnd);
                     note_present(st);
                     return LRESULT(0);
-                }
-                // 底栏页码器左右箭头
-                for dir in [-1i32, 1i32] {
-                    if in_rect(nt_pager_arrow(dir), x, y) {
-                        let next = if dir < 0 { st.nt_cur.checked_sub(1) } else { Some(st.nt_cur + 1) };
-                        if let Some(p) = next {
-                            if note_go(st, p) {
-                                note_present(st);
-                            }
-                        }
-                        return LRESULT(0);
-                    }
                 }
             }
             // 底栏工具：待办 / 粗体 / 列表 / 分割线 / 图片 / ＋新页
@@ -24201,10 +24934,10 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     return LRESULT(0);
                 }
             }
-            // 点标题条 = 进去改标题（键盘/组字都进标题）
+            // 点标题条 = 进去改标题；光标落在点击处（不是永远跑末尾）
             if in_rect(nt_title_rect(), x, y) {
                 st.nt_edit_title = true;
-                st.nt_tcaret = note_title(st).len();
+                st.nt_tcaret = note_title_caret_at(st, x);
                 st.nt_blink = true;
                 note_present(st);
                 return LRESULT(0);
@@ -24288,7 +25021,9 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                 }
             }
-            let moved = if d > 0 {
+            let moved = if st.nt_search_on {
+                note_search_step(st, if d > 0 { -1 } else { 1 })
+            } else if d > 0 {
                 st.nt_cur > 0 && note_go(st, st.nt_cur - 1)
             } else {
                 note_go(st, st.nt_cur + 1)
@@ -24316,14 +25051,34 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     let _ = KillTimer(hwnd, TIMER_NOTE_SAVE);
                     note_save(st);
                 }
+                TIMER_NOTE_ANIM => {
+                    // 280ms 的「弹出」：easeOutBack + 微过冲，像有阻尼
+                    let p = (((now_s() - st.nt_anim_t0) / 0.28) as f32).clamp(0.0, 1.0);
+                    st.nt_search_anim = st.nt_anim_from
+                        + (st.nt_anim_to - st.nt_anim_from) * nt_ease_back(p);
+                    if p >= 1.0 {
+                        st.nt_search_anim = st.nt_anim_to;
+                        let _ = KillTimer(hwnd, TIMER_NOTE_ANIM);
+                    }
+                    note_present(st);
+                }
                 TIMER_CARD_FG => {
                     // 失焦看门狗：前台不是自己（而是别的程序）就收。
                     // ⚠️ 只靠 `WM_ACTIVATE` 不够 —— 常驻轮盘是 NOACTIVATE，
                     //    点它/桌面/任务栏都不会让卡片失活（用户 2026-11-01 报）。
-                    if st.nt_shown && !st.nt_picking && now_s() - st.nt_fg0 > CARD_FG_GRACE {
+                    // 例外同剪贴板卡片：0.9s 内再抢前台；光标在卡上不收。
+                    if std::env::var_os("PIPIE_KEEP_CARDS").is_some() {
+                        // 测试沙箱专用
+                    } else if st.nt_shown && !st.nt_picking && now_s() - st.nt_fg0 > CARD_FG_GRACE {
                         let fg = GetForegroundWindow();
                         if !fg.is_invalid() && fg != hwnd {
-                            close_note(st);
+                            let age = now_s() - st.nt_fg0;
+                            if age < CARD_FG_KEEP {
+                                focus_window(hwnd);
+                            } else if !cursor_on_window(hwnd) {
+                                clip_log(&format!("note close fg={:x} age={:.2}", fg.0 as usize, age));
+                                close_note(st);
+                            }
                         }
                     }
                 }
@@ -24334,6 +25089,40 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_CHAR => {
             let st = state_of(hwnd);
             let c = w.0 as u32;
+            // 搜索输入：实时过滤，清空 / Esc 退出
+            if st.nt_search_on {
+                match c {
+                    0x08 => {
+                        note_search_backspace(st);
+                        st.nt_scomp.clear();
+                        if st.nt_search.is_empty() {
+                            note_search_end(st);
+                            note_search_kick(st, hwnd);
+                        } else {
+                            note_search_apply(st);
+                        }
+                    }
+                    0x1B => {
+                        note_search_end(st);
+                        note_search_kick(st, hwnd);
+                    }
+                    0x0D | 0x09 => {}
+                    _ => {
+                        if let Some(ch) = char::from_u32(c) {
+                            if !ch.is_control() {
+                                let mut b = [0u8; 4];
+                                let s = ch.encode_utf8(&mut b).to_string();
+                                note_search_insert(st, &s);
+                                note_search_apply(st);
+                            }
+                        }
+                    }
+                }
+                st.nt_lay = None;
+                st.nt_blink = true;
+                note_present(st);
+                return LRESULT(0);
+            }
             // 标题编辑态：字符 / 退格 / 回车 / Esc 全给标题
             if st.nt_edit_title {
                 match c {
@@ -24392,6 +25181,50 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_KEYDOWN => {
             let st = state_of(hwnd);
             let mut vk = w.0 as u32;
+            // 搜索态：↑/↓ 翻命中页，←/→/Home/End/Del 编辑搜索词，其余不碰正文
+            if st.nt_search_on {
+                match vk {
+                    0x26 => {
+                        if note_search_step(st, -1) {
+                            note_present(st);
+                        }
+                    }
+                    0x28 => {
+                        if note_search_step(st, 1) {
+                            note_present(st);
+                        }
+                    }
+                    0x25 => {
+                        st.nt_scaret = note_search_prev_boundary(st);
+                        st.nt_blink = true;
+                        note_present(st);
+                    }
+                    0x27 => {
+                        st.nt_scaret = note_search_next_boundary(st);
+                        st.nt_blink = true;
+                        note_present(st);
+                    }
+                    0x24 => {
+                        st.nt_scaret = 0;
+                        st.nt_blink = true;
+                        note_present(st);
+                    }
+                    0x23 => {
+                        st.nt_scaret = st.nt_search.len();
+                        st.nt_blink = true;
+                        note_present(st);
+                    }
+                    0x2E => {
+                        if note_search_delete(st) {
+                            note_search_apply(st);
+                            st.nt_blink = true;
+                            note_present(st);
+                        }
+                    }
+                    _ => {}
+                }
+                return LRESULT(0);
+            }
             // 中文输入法开着时，WM_KEYDOWN 的 vk 会被换成 VK_PROCESSKEY(0xE5)，
             // 真实键值由 IME 另存 —— 不翻译回来，Ctrl+C / Ctrl+V 在中文模式下全是死键
             // （用户 2026-11-02 报「选区后复制不了 / 图片粘贴不进去」）。
@@ -24596,6 +25429,16 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             if !himc.0.is_null() {
                 if flags & GCS_RESULTSTR.0 != 0 {
                     let s = imm_string(himc, GCS_RESULTSTR);
+                    if st.nt_search_on {
+                        st.nt_scomp.clear();
+                        if !s.is_empty() {
+                            note_search_insert(st, &s);
+                            note_search_apply(st);
+                        }
+                        let _ = ImmReleaseContext(hwnd, himc);
+                        note_present(st);
+                        return LRESULT(0);
+                    }
                     if st.nt_edit_title {
                         if !s.is_empty() {
                             note_title_insert(st, &s);
@@ -24610,8 +25453,12 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         note_type(st, hwnd, &s);
                     }
                 } else if flags & GCS_COMPSTR.0 != 0 {
-                    st.nt_comp = imm_string(himc, GCS_COMPSTR);
-                    st.nt_lay = None;
+                    if st.nt_search_on {
+                        st.nt_scomp = imm_string(himc, GCS_COMPSTR);
+                    } else {
+                        st.nt_comp = imm_string(himc, GCS_COMPSTR);
+                        st.nt_lay = None;
+                    }
                 }
                 let _ = ImmReleaseContext(hwnd, himc);
             }
@@ -24621,6 +25468,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_IME_ENDCOMPOSITION => {
             let st = state_of(hwnd);
             st.nt_comp.clear();
+            st.nt_scomp.clear();
             st.nt_lay = None;
             note_present(st);
             LRESULT(0)
@@ -24630,8 +25478,19 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             // 例外：系统文件对话框开着 —— 它一定让便签失活，这时收掉卡片，
             // 用户选完图回来就只剩桌面了。
             let st = state_of(hwnd);
-            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE && !st.nt_picking {
-                close_note(st);
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE
+                && !st.nt_picking
+                && std::env::var_os("PIPIE_KEEP_CARDS").is_none()
+            {
+                if st.nt_shown {
+                    let age = now_s() - st.nt_fg0;
+                    if age < CARD_FG_KEEP {
+                        focus_window(hwnd);
+                    } else {
+                        clip_log("note close reason=inactive");
+                        close_note(st);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -24666,6 +25525,15 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 11 => st.nt_scroll,
                 // 12 = 加粗模式是否开着（工具栏 B 的开关状态）
                 12 => st.nt_bold_want as usize,
+                // 13 = 当前排版视觉行数
+                13 => {
+                    if let (false, _) = (st.c_lo_dc.0.is_null(), 0) {
+                        let ta = nt_text_rect();
+                        let text = note_text(st).to_string();
+                        note_layout(st, st.c_lo_dc, &text, ta.right - ta.left);
+                    }
+                    st.nt_lay.as_ref().map(|(_, _, l)| l.len()).unwrap_or(0)
+                }
                 8 => note_title(st).chars().count(),
                 9 => note_title(st).chars().next().map(|c| c as usize).unwrap_or(0),
                 7 => match nt_task(note_text(st)) {
@@ -24673,6 +25541,18 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     Some((false, _)) => 2,
                     None => 0,
                 },
+                // 22 = 搜索框开着；23 = 命中页数；24 = 当前页在命中里的位次（1 起，0 = 不在）
+                // 25 = 搜索词字符数（回归断言用）
+                22 => st.nt_search_on as usize,
+                23 => st.nt_hits.len(),
+                24 => st.nt_hits.iter().position(|&p| p == st.nt_cur).map(|i| i + 1).unwrap_or(0),
+                25 => st.nt_search.chars().count(),
+                30 => st.nt_search[..st.nt_scaret.min(st.nt_search.len())].chars().count(),
+                // 31 = 标题光标字符位置（点哪写哪）
+                31 => note_title(st)[..st.nt_tcaret.min(note_title(st).len())].chars().count(),
+                // 26 = 搜索图标/输入框悬停；27 = 展开进度 0~100（阻尼动画断言）
+                26 => st.nt_search_hot as usize,
+                27 => (st.nt_search_anim.clamp(0.0, 1.0) * 100.0) as usize,
                 _ => 0,
             };
             LRESULT(v as isize)
@@ -25032,6 +25912,14 @@ fn main() {
             println!("注册表现值    = {}", cur.as_deref().unwrap_or("<无>"));
             println!("当前 exe      = {mine}");
             println!("沙箱实例      = {}（沙箱一律不动用户注册表）", autostart_sandbox());
+            println!(
+                "任务管理器禁用 = {}",
+                match autostart_approved_disabled() {
+                    Some(true) => "是（StartupApproved 有禁用记录）",
+                    Some(false) => "否（启用）",
+                    None => "无记录",
+                }
+            );
             println!("判定          = {plan}");
             if apply {
                 autostart_sync(st.autostart);
@@ -25418,7 +26306,7 @@ fn main() {
             diag_line(&path,
                 "--- 日志怎么读（出问题时按这个顺序看）---");
             diag_line(&path,
-                "  SNAPSHOT 每 5 秒一条：列出**所有跨线程开关的当前值**。");
+                "  SNAPSHOT 每 60 秒一条：列出**所有跨线程开关的当前值**（5s 太吵，已降频）。");
             diag_line(&path,
                 "    · 「全清」= 正常。若某个开关该清没清（MENU_OPEN 尤其），就是它卡住了。");
             diag_line(&path,
@@ -25532,7 +26420,9 @@ fn main() {
                 // 绕法：原子量的部分在本线程直接读，UI 私有状态（hiding/entering 等）
                 // 由 UI 线程自己每帧推一份到 SNAP_STATE 原子量。
                 hb_ticks += 1;
-                if hb_ticks % 5 == 0 {
+                // 原来是 5s 一条（用户早期要求「尽可能多打印」），一天就上万行。
+                // 平时只留 60s 心跳；出错时看门狗/钩子那些事件仍然逐条落盘。
+                if hb_ticks % 60 == 0 {
                     let bits = state_bits(
                             SNAP_HIDING.load(Ordering::Relaxed),
                             SNAP_ENTERING.load(Ordering::Relaxed),
