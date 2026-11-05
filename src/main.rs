@@ -20988,6 +20988,9 @@ unsafe fn clip_snap_bg(st: &mut State, x: i32, y: i32) {
     if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
         return;
     }
+    // ⚠️ 必须先等一帧合成：上一张卡 / 轮盘刚刚 SW_HIDE，DWM 还没撤下去的话
+    //    会被抓进毛玻璃底，连续打开时颜色就会忽深忽浅。
+    let _ = windows::Win32::Graphics::Dwm::DwmFlush();
     let n = (CL_WW * CL_HH * 4) as usize;
     let mut raw = Vec::new();
     let sdc = GetDC(None);
@@ -21480,6 +21483,9 @@ unsafe fn open_clip(st: &mut State) {
     // 记住呼出前的前台窗口：写回后要把焦点还回去（保守版的整个意义就在这）
     CLIP_PREV_FG.store(GetForegroundWindow().0 as isize, Ordering::SeqCst);
     st.cl_shown = true;
+    // ⚠️ 必须在 ShowWindow 之前设：ShowWindow 会同步送 WM_ACTIVATE(WA_INACTIVE)，
+    //    若此时 cl_fg0 还是**上一次**的时间，age 立刻 > CARD_FG_KEEP → 新卡刚显示就被收掉。
+    st.cl_fg0 = now_s();
     st.cl_tab = 0;
     st.cl_q.clear();
     st.cl_page = 0;
@@ -21511,7 +21517,6 @@ unsafe fn open_clip(st: &mut State) {
     //    拿不到焦点的代价是键盘整条废（搜索框收不到 `WM_CHAR`、Esc/1~6/Enter 全无反应）。
     focus_window(hwnd);
     CLIP_LIVE.store(true, Ordering::SeqCst);
-    st.cl_fg0 = now_s();
     let _ = SetTimer(hwnd, TIMER_CLIP_BLINK, 500, None);
     let _ = SetTimer(hwnd, TIMER_CARD_FG, 250, None);
     clip_present(st);
@@ -22221,8 +22226,9 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let st = state_of(hwnd);
                 if st.cl_shown {
                     let age = now_s() - st.cl_fg0;
-                    if age < CARD_FG_KEEP {
-                        // 刚弹出就被原程序抢回前台（从 NOACTIVATE 轮盘弹出时很常见）→ 再抢
+                    if age < CARD_FG_KEEP || cursor_on_window(hwnd) {
+                        // 刚弹出就被原程序抢回前台（从 NOACTIVATE 轮盘弹出时很常见）→ 再抢；
+                        // 鼠标还在卡上时也别收（IDE/Qoder 这类程序会自己抢回前台）
                         focus_window(hwnd);
                     } else {
                         clip_log("clip close reason=inactive");
@@ -24689,6 +24695,8 @@ unsafe fn open_note(st: &mut State) {
     close_clip(st); // 两张卡互斥：同一个画布、同一把焦点
     let hwnd = HWND(h as *mut c_void);
     st.nt_shown = true;
+    // ⚠️ 同上：ShowWindow 同步送 WM_ACTIVATE，时间戳必须在这之前就更新
+    st.nt_fg0 = now_s();
     st.nt_blink = true;
     st.nt_comp.clear();
     st.nt_pager_hot = 0;
@@ -24728,7 +24736,6 @@ unsafe fn open_note(st: &mut State) {
         GetFocus() == hwnd
     ));
     NOTE_LIVE.store(true, Ordering::SeqCst);
-    st.nt_fg0 = now_s();
     let _ = SetTimer(hwnd, TIMER_NOTE_BLINK, 500, None);
     let _ = SetTimer(hwnd, TIMER_CARD_FG, 250, None);
     note_present(st);
@@ -25484,7 +25491,8 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             {
                 if st.nt_shown {
                     let age = now_s() - st.nt_fg0;
-                    if age < CARD_FG_KEEP {
+                    if age < CARD_FG_KEEP || cursor_on_window(hwnd) {
+                        // 同上：鼠标还在便签上就先抢回前台，别让原程序把卡抢走后立刻收掉
                         focus_window(hwnd);
                     } else {
                         clip_log("note close reason=inactive");
