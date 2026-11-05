@@ -19130,6 +19130,11 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
 /// GitHub 最新 release API（Public 仓库可匿名读）。可用 `PIPIE_UPDATE_URL` 覆盖以便本地演练
 /// （旧名 `PIGO_UPDATE_URL` 仍作兜底，本地演练脚本不用改）。
 const UPDATE_API: &str = "https://api.github.com/repos/lifeFxxker/pipie/releases/latest";
+/// 备用源：公开的纯发布仓库（只放 exe/zip/SHA256SUMS/version.txt，不放源码）
+const GITEE_REPO_RAW: &str = "https://gitee.com/yangshengzhe/pipie-releases/raw/master";
+fn gitee_raw(name: &str) -> String {
+    format!("{GITEE_REPO_RAW}/{name}")
+}
 /// 自动检查的最小间隔（秒）：防 GitHub 匿名 API 限流（60 次/时/IP）。
 const UPDATE_MIN_INTERVAL: f64 = 6.0 * 3600.0;
 
@@ -19196,8 +19201,10 @@ fn http_get_raw_cb(
     use windows::core::PCWSTR;
     use windows::Win32::Networking::WinInet::{
         HttpQueryInfoW, InternetCloseHandle, InternetOpenUrlW, InternetOpenW, InternetReadFile,
-        HTTP_QUERY_CONTENT_LENGTH, HTTP_QUERY_FLAG_NUMBER, HTTP_QUERY_STATUS_CODE,
-        INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_OPEN_TYPE_PRECONFIG,
+        InternetSetOptionW, HTTP_QUERY_CONTENT_LENGTH, HTTP_QUERY_FLAG_NUMBER,
+        HTTP_QUERY_STATUS_CODE, INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD,
+        INTERNET_OPEN_TYPE_PRECONFIG, INTERNET_OPTION_CONNECT_TIMEOUT,
+        INTERNET_OPTION_RECEIVE_TIMEOUT, INTERNET_OPTION_SEND_TIMEOUT,
     };
     let agent = wide("PiPie-updater");
     let target = wide(url);
@@ -19211,6 +19218,15 @@ fn http_get_raw_cb(
         );
         if h.is_null() {
             return Err("InternetOpen 失败".into());
+        }
+        // 超时：GitHub 在国内可能长时间连不上；不设的话「主源失败→Gitee 备用」要干等。
+        for (opt, ms) in [
+            (INTERNET_OPTION_CONNECT_TIMEOUT, 3000u32),
+            (INTERNET_OPTION_SEND_TIMEOUT, 6000u32),
+            (INTERNET_OPTION_RECEIVE_TIMEOUT, 8000u32),
+        ] {
+            let pms = &ms as *const u32 as *const core::ffi::c_void;
+            let _ = InternetSetOptionW(Some(h as *const c_void), opt, Some(pms), 4);
         }
         let flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE;
         let req = InternetOpenUrlW(h, PCWSTR(target.as_ptr()), None, flags, 0);
@@ -19389,20 +19405,46 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
 }
 
 /// 同步检查更新（网络阻塞，**不要**在 UI 线程直接调；UI 走后台线程）。
+/// 备用源：Gitee 公开发布仓的 `version.txt` + 固定文件名
+fn check_gitee_update() -> UpdateOutcome {
+    // raw 文件有 CDN 缓存：版本号加时间戳、二进制加版本号，避免升级后还拿到旧文件
+    let vu = format!("{}?t={}", gitee_raw("version.txt"), unix_now() as i64);
+    match http_get(&vu) {
+        Ok((200, body)) => {
+            let latest = body.trim().trim_start_matches('v').to_string();
+            if latest.is_empty() {
+                return UpdateOutcome::Failed("Gitee version.txt 为空".into());
+            }
+            if version_gt(&latest, cur_version()) {
+                UpdateOutcome::Available {
+                    latest: latest.clone(),
+                    // 每个版本一个目录：raw CDN 对同名文件的缓存不会串版本
+                    exe_url: gitee_raw(&format!("v{latest}/PiPie.exe")),
+                    sums_url: gitee_raw(&format!("v{latest}/SHA256SUMS")),
+                }
+            } else {
+                UpdateOutcome::UpToDate { latest }
+            }
+        }
+        Ok((s, _)) => UpdateOutcome::Failed(format!("Gitee 备用源 HTTP {s}")),
+        Err(e) => UpdateOutcome::Failed(format!("Gitee 备用源：{e}")),
+    }
+}
+
 fn check_update_sync() -> UpdateOutcome {
-    match http_get(&update_api_url()) {
+    // 诊断：强制走备用源（不联网 GitHub），用于验证 Gitee 仓
+    if std::env::var_os("PIPIE_UPDATE_FORCE_GITEE").is_some() {
+        return check_gitee_update();
+    }
+    let api = update_api_url();
+    let mut primary_err: Option<String>;
+    match http_get(&api) {
         Ok((status, body)) => {
-            if status == 403 || status == 429 {
-                return UpdateOutcome::Failed(format!("请求受限（HTTP {status}）"));
-            }
-            if status != 200 {
-                return UpdateOutcome::Failed(format!("HTTP {status}"));
-            }
-            match json_str_field(&body, "tag_name") {
-                Some(tag) => {
+            if status == 200 {
+                if let Some(tag) = json_str_field(&body, "tag_name") {
                     let latest = tag.trim_start_matches('v').to_string();
                     if version_gt(&latest, cur_version()) {
-                        match (
+                        return match (
                             find_asset_url(&body, "PiPie.exe"),
                             find_asset_url(&body, "SHA256SUMS"),
                         ) {
@@ -19414,15 +19456,30 @@ fn check_update_sync() -> UpdateOutcome {
                             _ => UpdateOutcome::Failed(
                                 "release 里缺 PiPie.exe 或 SHA256SUMS asset".into(),
                             ),
-                        }
-                    } else {
-                        UpdateOutcome::UpToDate { latest }
+                        };
                     }
+                    return UpdateOutcome::UpToDate { latest };
                 }
-                None => UpdateOutcome::Failed("响应里没有 tag_name".into()),
+                primary_err = Some("GitHub 响应里没有 tag_name".into());
+            } else if status == 403 || status == 429 {
+                primary_err = Some(format!("请求受限（HTTP {status}）"));
+            } else {
+                primary_err = Some(format!("HTTP {status}"));
             }
         }
-        Err(e) => UpdateOutcome::Failed(e),
+        Err(e) => primary_err = Some(e),
+    }
+    // 只在默认 GitHub 源失败时回退；测试用 PIPIE_UPDATE_URL 指向别处时不串源
+    if api == UPDATE_API {
+        match check_gitee_update() {
+            UpdateOutcome::Failed(e) => UpdateOutcome::Failed(format!(
+                "{}；Gitee：{e}",
+                primary_err.unwrap_or_else(|| "主源失败".into())
+            )),
+            ok => ok,
+        }
+    } else {
+        UpdateOutcome::Failed(primary_err.unwrap_or_else(|| "检查失败".into()))
     }
 }
 
@@ -26257,9 +26314,32 @@ fn start_download(st: &mut State) {
     st.update_msg.clear();
     UPDATE_PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
     let new_path = format!("{}\\.pipie-update.new", exe_dir());
+    let latest = st.update_latest.clone();
     unsafe { save_settings(st) };
     std::thread::spawn(move || {
-        let result = download_and_verify(&exe_url, &sums_url, &new_path);
+        let mut result = download_and_verify(&exe_url, &sums_url, &new_path);
+        if result.is_err() {
+            // 主源下载失败/超时 → 换另一侧（GitHub 与 Gitee 互备）
+            let (alt_exe, alt_sums) = if exe_url.contains("gitee.com") {
+                (
+                    format!("https://github.com/lifeFxxker/pipie/releases/download/v{latest}/PiPie.exe"),
+                    format!("https://github.com/lifeFxxker/pipie/releases/download/v{latest}/SHA256SUMS"),
+                )
+            } else if !latest.is_empty() {
+                (
+                    gitee_raw(&format!("v{latest}/PiPie.exe")),
+                    gitee_raw(&format!("v{latest}/SHA256SUMS")),
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            if !alt_exe.is_empty() {
+                UPDATE_PROGRESS.store(0, Ordering::Relaxed);
+                let first = result.err().unwrap_or_default();
+                result = download_and_verify(&alt_exe, &alt_sums, &new_path)
+                    .map_err(|e| format!("{first}；备用源：{e}"));
+            }
+        }
         let (s, msg) = match result {
             Ok(()) => (5u8, String::new()),
             Err(e) => (4u8, e),
@@ -27304,7 +27384,7 @@ fn main() {
         // 没有/查不动 → 照旧短暂亮个相。最多等 4 秒，网络慢也不把人晾着。
         if st.update_auto && !autostart_sandbox() {
             st.upd_startup_wait = true;
-            st.upd_startup_deadline = now_s() + 4.0;
+            st.upd_startup_deadline = now_s() + 5.0;
             start_update_check(&mut st, true);
         } else if upd_offer(&st) {
             // 测试 `--upd-sim`：已有伪造的「发现新版本」→ 直接走更新窗口，不亮环
