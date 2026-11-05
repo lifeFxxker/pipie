@@ -216,6 +216,8 @@ const WM_APP_LAUNCHED: u32 = WM_APP + 30;
 
 /// 在线升级：后台查版本完成（结果放在 `UPDATE_RESULT`，UI 线程取走后刷新关于页）。
 const WM_APP_UPDATE_DONE: u32 = WM_APP + 31;
+/// 仅测试：更新提示的状态（0 弹窗开着 / 1 本轮已稍后 / 2 update_st / 3 upd_hover / 4 locked）
+const WM_APP_UPDINFO: u32 = WM_APP + 47;
 /// 后台检查结果：(状态 2=已最新 / 3=有新版本 / 4=失败, latest 版本号, 提示/原因)
 static UPDATE_RESULT: std::sync::Mutex<Option<(u8, String, String)>> =
     std::sync::Mutex::new(None);
@@ -1149,8 +1151,19 @@ struct State {
     /// 后台检查发现「确实有更新」的那个版本号（ini `update_avail_ver`，空 = 没有）。
     /// ⚠️ 必须落盘：提醒是在**下一次呼出轮盘**时才发生的，中间可能已经重启过。
     update_avail_ver: String,
-    /// 已经用头像气泡提醒过的最新版本（ini `update_bub_ver`）—— 每个版本最多提醒一次就靠它
-    update_bub_ver: String,
+    /// 已经用**更新弹窗**提醒过的版本（ini `update_modal_ver`）—— 每版本只弹一次
+    update_modal_ver: String,
+    /// 本次运行里用户点了「稍后」：更新条 + 弹窗都不再出现（重启后恢复）
+    upd_dismissed: bool,
+    /// 更新弹窗是否正开着
+    upd_modal: bool,
+    /// 更新 UI 的悬停项：0 无 / 1 更新按钮 / 2 更新条本体 / 3 关闭 / 4 稍后 / 5 立即
+    upd_hover: u8,
+    /// 启动时「只显示更新窗口」模式：不画轮盘，只画小卡，且不自动收起
+    upd_only: bool,
+    /// 启动流程在等第一次版本检查出结果（决定亮环还是亮更新窗口）
+    upd_startup_wait: bool,
+    upd_startup_deadline: f64,
 
     // ── 拖入引导（onboarding）四步阶梯（用户 2026-10-14 定稿）──
     // ①② 由「**真的做了那个动作**」置位 → 槽位是 self-clearing 的，不需要任何"已读"状态；
@@ -1552,7 +1565,13 @@ impl State {
             update_latest: String::new(),
             update_msg: String::new(),
             update_avail_ver: String::new(),
-            update_bub_ver: String::new(),
+            update_modal_ver: String::new(),
+            upd_dismissed: false,
+            upd_modal: false,
+            upd_hover: 0,
+            upd_only: false,
+            upd_startup_wait: false,
+            upd_startup_deadline: 0.0,
             onb_drag: false,
             onb_customized: false,
             onb_move: false,
@@ -3542,10 +3561,317 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     }
 }
 
+
+// ───────────────────── 更新提示：环形更新条 + 每版本一次的小卡 ─────────────────────
+// 设计稿：tools/_upddemo/。要点：只要轮盘被呼出，更新入口就一直在眼前；
+// 「稍后」只压本轮（会话），下次启动还会提示；弹窗每版本最多一次（ini 记账）。
+
+const UPD_PAPER: (u8, u8, u8) = (247, 247, 249);
+const UPD_INK: (u8, u8, u8) = (28, 28, 30);
+const UPD_MUTED: (u8, u8, u8) = (108, 108, 114);
+const UPD_EDGE: (u8, u8, u8) = (180, 180, 186);
+
+fn upd_offer(st: &State) -> bool {
+    !st.update_latest.is_empty() && matches!(st.update_st, 3 | 4 | 5 | 6)
+}
+
+fn upd_pill_box() -> (f32, f32, f32, f32) {
+    (CC - 161.0, 391.0, CC + 161.0, 437.0)
+}
+
+fn upd_pill_btn_box() -> (f32, f32, f32, f32) {
+    let x1 = CC + 161.0;
+    (x1 - 68.0, 399.0, x1 - 10.0, 429.0)
+}
+
+fn upd_card_box() -> (f32, f32, f32, f32) {
+    (CC - 186.0, CC - 110.0, CC + 186.0, CC + 110.0)
+}
+
+fn upd_card_btn_box(primary: bool) -> (f32, f32, f32, f32) {
+    let (_, _, x1, y1) = upd_card_box();
+    let by = y1 - 50.0;
+    if primary {
+        (x1 - 138.0, by, x1 - 20.0, by + 32.0)
+    } else {
+        let px = x1 - 138.0;
+        (px - 86.0, by, px - 10.0, by + 32.0)
+    }
+}
+
+fn upd_close_box() -> (f32, f32, f32, f32) {
+    let (_, y0, x1, _) = upd_card_box();
+    (x1 - 40.0, y0 + 10.0, x1 - 12.0, y0 + 38.0)
+}
+
+fn in_box(b: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+    x >= b.0 && x < b.2 && y >= b.1 && y < b.3
+}
+
+/// 更新 UI 命中：0 无 / 1 更新按钮 / 2 更新条本体 / 3 关闭 / 4 稍后 / 5 立即
+fn upd_hit(st: &State, x: f32, y: f32) -> u8 {
+    if st.upd_modal {
+        if in_box(upd_close_box(), x, y) {
+            return 3;
+        }
+        if in_box(upd_card_btn_box(false), x, y) {
+            return 4;
+        }
+        if in_box(upd_card_btn_box(true), x, y) {
+            return 5;
+        }
+        return 0;
+    }
+    if st.upd_dismissed || !upd_offer(st) {
+        return 0;
+    }
+    if in_box(upd_pill_btn_box(), x, y) {
+        return 1;
+    }
+    if in_box(upd_pill_box(), x, y) {
+        return 2;
+    }
+    0
+}
+
+fn upd_open_modal(st: &mut State) {
+    st.upd_modal = true;
+    st.locked = true;
+    LOCKED.store(true, Ordering::SeqCst);
+}
+
+/// 每版本第一次真实呼出时弹一次（记账落盘；新版本会重新弹）
+unsafe fn upd_maybe_modal(st: &mut State) {
+    if st.upd_modal
+        || st.upd_dismissed
+        || !upd_offer(st)
+        || !matches!(st.update_st, 3 | 5)
+        || st.update_modal_ver == st.update_latest
+    {
+        return;
+    }
+    upd_open_modal(st);
+    st.update_modal_ver = st.update_latest.clone();
+    save_settings(st);
+}
+
+/// 启动时的短暂「亮个相」
+unsafe fn startup_reveal(st: &mut State) {
+    if st.apps.is_empty() {
+        return;
+    }
+    let mut cp = POINT::default();
+    let _ = GetCursorPos(&mut cp);
+    st.upd_only = false;
+    show_menu(st, cp.x, cp.y);
+    say(st, REVEAL_MSG, "", REVEAL_SECS);
+    st.hide_at = now_s() + REVEAL_SECS;
+}
+
+/// 启动时发现有新版本：不亮环，只弹更新窗口（方形画布 + 纯纸卡），不自动收
+unsafe fn open_update_window(st: &mut State) {
+    let mut cp = POINT::default();
+    let _ = GetCursorPos(&mut cp);
+    st.upd_only = true;
+    show_menu(st, cp.x, cp.y);
+    st.upd_only = true;
+    st.upd_modal = true;
+    st.upd_dismissed = false;
+    st.locked = true;
+    LOCKED.store(true, Ordering::SeqCst);
+    st.hide_at = 0.0;
+    st.upd_startup_wait = false;
+    st.update_modal_ver = st.update_latest.clone();
+    save_settings(st);
+    frame(st, 255);
+}
+
+/// 点更新 UI（调用前应先 update_hover 刷新 `upd_hover`）
+unsafe fn upd_click(st: &mut State) -> bool {
+    match st.upd_hover {
+        1 => {
+            if st.update_st == 5 {
+                apply_update(st);
+            } else if st.update_st == 3 || st.update_st == 4 {
+                start_download(st);
+            }
+            true
+        }
+        2 => {
+            if st.update_st != 6 {
+                upd_open_modal(st);
+            }
+            true
+        }
+        3 | 4 => {
+            st.upd_dismissed = true;
+            if st.upd_only {
+                close_menu_now(st);
+            } else {
+                st.upd_modal = false;
+            }
+            true
+        }
+        5 => {
+            if !st.upd_only {
+                st.upd_modal = false;
+            }
+            if st.update_st == 5 {
+                apply_update(st);
+            } else if st.update_st == 3 || st.update_st == 4 {
+                start_download(st);
+            }
+            true
+        }
+        _ => st.upd_modal, // 弹窗开着时点空白也只吞掉，不穿透到下面的应用
+    }
+}
+
+/// 下载图标：黑/纸色圆 + 白色 ↓
+unsafe fn upd_icon(st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, bg: (u8, u8, u8), fg: (u8, u8, u8)) {
+    rot_rrect(buf, cx, cy, r, r, r, 0.0, bg, 1.0);
+    draw_text(
+        st, buf, cx as i32, cy as i32, "↓", 20, 700,
+        fg.0, fg.1, fg.2, 255, 0, 0,
+    );
+}
+
+unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
+    if st.hiding {
+        return;
+    }
+    if st.upd_modal {
+        // 不要整块压暗：环窗口只有 475²，压暗会把投影外的透明区也涂成灰方块。
+        // 卡片自身有纸色 + 投影，已经压得住盘面，这里不再画遮罩。
+        let (x0, y0, x1, _y1) = upd_card_box();
+        rot_rrect_ex(
+            buf, CC, CC, 186.0, 110.0, 20.0, 0.0,
+            UPD_PAPER, 0.0, UPD_INK, 0.0, 6.0, 0.35, 10.0, 1.0,
+        );
+        upd_icon(st, buf, x0 + 36.0, y0 + 38.0, 17.0, UPD_INK, UPD_PAPER);
+
+        draw_text(st, buf, (x0 + 64.0) as i32, (y0 + 34.0) as i32,
+                  "发现新版本", 20, 700, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 280, 0);
+        let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
+        let sub = match st.update_st {
+            5 => format!("v{} · 已下载并校验完成", st.update_latest),
+            6 => format!("v{} · 正在下载 {pct}%", st.update_latest),
+            4 if !st.update_msg.is_empty() => format!("v{} · {}", st.update_latest, st.update_msg),
+            _ => format!("v{} · 建议尽快更新", st.update_latest),
+        };
+        draw_text(st, buf, (x0 + 64.0) as i32, (y0 + 58.0) as i32,
+                  &sub, 13, 500, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 280, 0);
+        if st.update_st == 6 {
+            let (bx0, bx1, by) = (x0 + 64.0, x1 - 26.0, y0 + 74.0);
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
+            let fw = (bx1 - bx0) * (pct.min(100) as f32 / 100.0);
+            if fw > 1.0 {
+                rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+            }
+        }
+        for (i, t) in [
+            "· 修复已知问题，体验更稳定",
+            "· 重启后自动使用新版本",
+        ]
+        .iter()
+        .enumerate()
+        {
+            draw_text(st, buf, (x0 + 26.0) as i32, (y0 + 92.0 + i as f32 * 22.0) as i32,
+                      t, 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 320, 0);
+        }
+        draw_text(st, buf, (x1 - 26.0) as i32, (y0 + 24.0) as i32,
+                  "×", 20, 700, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+
+        let (gx0, gy0, gx1, gy1) = upd_card_btn_box(false);
+        rot_rrect_ex(
+            buf, (gx0 + gx1) * 0.5, (gy0 + gy1) * 0.5,
+            (gx1 - gx0) * 0.5, (gy1 - gy0) * 0.5, 16.0, 0.0,
+            UPD_PAPER, 1.0, UPD_EDGE, 1.0, 0.0, 0.0, 0.0, 1.0,
+        );
+        draw_text(st, buf, ((gx0 + gx1) * 0.5) as i32, ((gy0 + gy1) * 0.5) as i32,
+                  "稍后", 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 0, 0);
+
+        let (px0, py0, px1, py1) = upd_card_btn_box(true);
+        let pf = if st.upd_hover == 5 { (52, 52, 58) } else { UPD_INK };
+        rot_rrect_ex(
+            buf, (px0 + px1) * 0.5, (py0 + py1) * 0.5,
+            (px1 - px0) * 0.5, (py1 - py0) * 0.5, 16.0, 0.0,
+            pf, 0.0, UPD_INK, 0.0, 0.0, 0.0, 0.0, 1.0,
+        );
+        let ptext = match st.update_st {
+            5 => "立即重启更新",
+            6 => "更新中…",
+            4 => "重试",
+            _ => "立即更新",
+        };
+        draw_text(st, buf, ((px0 + px1) * 0.5) as i32, ((py0 + py1) * 0.5) as i32,
+                  ptext, 13, 700, UPD_PAPER.0, UPD_PAPER.1, UPD_PAPER.2, 255, 0, 0);
+        return;
+    }
+    if st.upd_dismissed || !upd_offer(st) {
+        return;
+    }
+
+    let (x0, y0, x1, y1) = upd_pill_box();
+    rot_rrect_ex(
+        buf, CC, (y0 + y1) * 0.5, 161.0, 23.0, 23.0, 0.0,
+        UPD_PAPER, 0.0, UPD_INK, 0.0, 5.0, 0.28, 10.0, 1.0,
+    );
+    upd_icon(st, buf, x0 + 27.0, (y0 + y1) * 0.5, 15.0, UPD_INK, UPD_PAPER);
+
+    let tx = (x0 + 52.0) as i32;
+    let cy = ((y0 + y1) * 0.5) as i32;
+    match st.update_st {
+        6 => {
+            draw_text(st, buf, tx, cy - 5, "正在下载", 14, 700,
+                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 100, 0);
+            let vs = format!("v{}", st.update_latest);
+            draw_text(st, buf, tx + 62, cy - 5, &vs, 13, 500,
+                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 70, 0);
+            let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
+            let ps = format!("{pct}%");
+            draw_text(st, buf, (x1 - 16.0) as i32, cy - 5, &ps, 13, 500,
+                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+            let (bx0, bx1, by) = (x0 + 52.0, x1 - 16.0, y1 - 9.0);
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
+            let fw = (bx1 - bx0) * (pct.min(100) as f32 / 100.0);
+            if fw > 1.0 {
+                rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+            }
+        }
+        _ => {
+            let (title, btn) = match st.update_st {
+                5 => ("已下载，重启生效", "重启"),
+                4 => ("更新失败", "重试"),
+                _ => ("发现新版本", "更新"),
+            };
+            draw_text(st, buf, tx, cy, title, 14, 700,
+                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 170, 0);
+            let tw = (title.chars().count() as f32 * 14.0) as i32;
+            if st.update_st != 5 {
+                let vs = format!("v{}", st.update_latest);
+                draw_text(st, buf, tx + tw + 6, cy, &vs, 13, 500,
+                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 60, 0);
+            }
+            let (bx0, by0, bx1, by1) = upd_pill_btn_box();
+            let bf = if st.upd_hover == 1 { (52, 52, 58) } else { UPD_INK };
+            rot_rrect(buf, (bx0 + bx1) * 0.5, (by0 + by1) * 0.5,
+                      (bx1 - bx0) * 0.5, (by1 - by0) * 0.5, 15.0, 0.0, bf, 1.0);
+            draw_text(st, buf, ((bx0 + bx1) * 0.5) as i32, ((by0 + by1) * 0.5) as i32,
+                      btn, 13, 700, UPD_PAPER.0, UPD_PAPER.1, UPD_PAPER.2, 255, 0, 0);
+        }
+    }
+}
+
 unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     let w = CANVAS as usize;
     let now = now_s() as f64;
     buf.fill(0);
+    // 启动更新窗口：方画布上只留那张纸卡（其余全透明），不画轮盘/盘面
+    if st.upd_only {
+        draw_upd_ui(st, buf);
+        return;
+    }
     // 有幽灵时按 `n+1` 排布：幽灵占一个真实槽位、整环让位（用户 2026-10-12 要求）
     let n_ap = st.apps.len();
     // 虚线教学槽位已取消（用户 2026-10-18：它常驻、且位置与真实图标重叠）。
@@ -4133,6 +4459,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
 
     // ── 5. 头像气泡：最后画，压在所有内容之上 ──
     draw_bubble(st, buf, &pal);
+    draw_upd_ui(st, buf);
 }
 
 // ───────────────────── 图标位图（面积采样缩放） ─────────────────────
@@ -5482,24 +5809,6 @@ fn onb_say(st: &mut State) {
 
 /// 后台检查发现新版本 → 下一次呼出轮盘时用头像气泡提醒**一次**。
 ///
-/// 「每个版本最多提醒一次」靠 ini 的 `update_bub_ver` 记账：**说出口那一刻就落盘**，
-/// 所以哪怕这次没点、之后重启了，同一个版本也不会再提醒第二遍。
-/// ⚠️ 只在 `WM_APP_SHOW` 真实呼出后调（排在 `show_menu` 里的 `onb_say` 之后，
-///    教学气泡占着气泡位时不抢话）；放进 `show_menu` 会被启动「亮个相」那声 `say` 顶掉。
-fn update_say(st: &mut State) {
-    let v = st.update_avail_ver.clone();
-    if v.is_empty() || v == st.update_bub_ver || st.bub_until > now_s() {
-        return;
-    }
-    // 只报版本号，不带「去哪更新」那行小字（用户 2026-10-27：一行就够，别啰嗦）
-    say(st, &format!("发现新版本 v{v}"), "", UPD_BUB_SECS);
-    st.update_bub_ver = v.clone();
-    unsafe { save_settings(st) };
-    // 一行日志 = 这条提醒**真的说出口了**（回归靠它数次数：每个版本只能有一条）
-    println!("[upd] 头像气泡提醒 · 新版本 v{v}");
-}
-
-
 /// 把 `name=target` 插入 [app.<app>] 段（无段则建段）。成功返回 true。
 fn ini_insert_item(path: &str, app: &str, key: &str, value: &str) -> bool {
     let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -8723,6 +9032,34 @@ unsafe fn dump_all(dir: &str) {
     save_bmp(&format!("{}\\dump_dark.bmp", dir), &buf, CANVAS, CANVAS);
     st.glass_liquid = false;
 
+    // 3.85) 更新提示：环形更新条 / 下载进度 / 每版本一次的小卡
+    {
+        st.glass_liquid = true;
+        st.active_app = None;
+        st.hover_chip = None;
+        st.update_latest = "1.0.17".to_string();
+        st.update_st = 3;
+        st.upd_dismissed = false;
+        st.upd_modal = false;
+        let buf = draw_to_buf(&mut st);
+        save_bmp(&format!("{}{}dump_update_pill.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+
+        st.update_st = 6;
+        UPDATE_PROGRESS.store(62, Ordering::Relaxed);
+        let buf = draw_to_buf(&mut st);
+        save_bmp(&format!("{}{}dump_update_progress.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+
+        UPDATE_PROGRESS.store(0, Ordering::Relaxed);
+        st.update_st = 3;
+        st.upd_modal = true;
+        let buf = draw_to_buf(&mut st);
+        save_bmp(&format!("{}{}dump_update_modal.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+        st.upd_modal = false;
+        st.update_st = 0;
+        st.update_latest.clear();
+        st.glass_liquid = false;
+    }
+
     // 3.9) 深色 + **改名态**：编辑段是「墨底（暗色下=近白）+ 对比色文字」，
     //      文字必须取 pal.paper，暗色下才看得清（用户 2026-10-12 报「双击编辑看不清」）。
     let saved_theme = st.theme;
@@ -9238,8 +9575,8 @@ unsafe fn read_persistent(st: &mut State) {
                 st.update_last_check = v.parse::<f64>().unwrap_or(0.0);
             } else if let Some(v) = get("update_avail_ver=") {
                 st.update_avail_ver = v;
-            } else if let Some(v) = get("update_bub_ver=") {
-                st.update_bub_ver = v;
+            } else if let Some(v) = get("update_modal_ver=") {
+                st.update_modal_ver = v;
             }
         }
     }
@@ -10256,7 +10593,7 @@ unsafe fn init_fonts(st: &mut State) {
     st.font_name = CreateFontW(-(15.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_label = CreateFontW(-(11.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_row = CreateFontW(-(13.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_chip = CreateFontW(-(15.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip = CreateFontW(-(14.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_hint = CreateFontW(-(10.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_head = CreateFontW(-(16.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_cnt = CreateFontW(-(12.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
@@ -10268,7 +10605,7 @@ unsafe fn init_fonts(st: &mut State) {
     st.font_name3 = CreateFontW(-(45.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_label3 = CreateFontW(-(33.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_row3 = CreateFontW(-(39.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_chip3 = CreateFontW(-(45.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip3 = CreateFontW(-(42.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_hint3 = CreateFontW(-(30.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_head3 = CreateFontW(-(48.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_cnt3 = CreateFontW(-(36.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
@@ -10764,7 +11101,7 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
     rot_rrect(buf, ppx, ppy, arm, lt, lt, pang.to_radians(), col, 0.95 * alpha);
     rot_rrect(buf, ppx, ppy, lt, arm, lt, pang.to_radians(), col, 0.95 * alpha);
 
-    let (cjk, lat) = (15.0 * K * KC, 8.0 * K * KC);
+    let (cjk, lat) = (14.0 * K * KC, 7.5 * K * KC);
     let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
     let label = fit_chip_label(name, avail, cjk, lat);
     if !label.is_empty() {
@@ -10807,7 +11144,7 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
         (x, y, norm_rot(ang))
     };
     let half = ((a2 - a1).to_radians() * 0.5 * r_mid).max(6.0);
-    let (cjk, lat) = (15.0 * K * KC, 8.0 * K * KC);
+    let (cjk, lat) = (14.0 * K * KC, 7.5 * K * KC);
     // `+1.0` 是余量：段宽本来就是按同一个 `est_text_w` 算出来的，不给余量会出现
     // 「刚好相等 → 判成放不下 → 截成空串」的浮点毛刺（名称「66」就这样消失过）。
     let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
@@ -11303,7 +11640,7 @@ fn jitter(t_ms: f64, speed: f64, amp: f32) -> f32 {
 /// ⚠️ 名称宽度封顶 `RING_NAME_MAX_W`；`draw_ring_content` 里截断用的也是它。
 fn chip_half_w(name: &str) -> f32 {
     (CHIP_PAD_L + CHIP_ICON + CHIP_GAP
-        + est_text_w(name, 15.0 * K * KC, 8.0 * K * KC).min(RING_NAME_MAX_W)
+        + est_text_w(name, 14.0 * K * KC, 7.5 * K * KC).min(RING_NAME_MAX_W)
         + CHIP_PAD_R)
         / 2.0
 }
@@ -12143,7 +12480,9 @@ unsafe extern "system" fn key_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LRES
                     let _ = GetCursorPos(&mut p);
                     CURSOR_X.store(p.x, Ordering::Relaxed);
                     CURSOR_Y.store(p.y, Ordering::Relaxed);
-                    post(WM_APP_SHOW, 0, 0);
+                    // w=1 = 键盘触发：键盘没有「松开触发键」这一拍，
+                    // 呼出后必须直接进入锁定态，否则左键只会走 CANCEL（点了没反应）
+                    post(WM_APP_SHOW, 1, 0);
                     return LRESULT(1); // 吞掉组合键，不传给前台程序
                 }
             }
@@ -12566,6 +12905,15 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     }
     let px = sx - st.win_x;
     let py = sy - st.win_y;
+    // 更新条 / 弹窗优先级最高：命中它们时不要再高亮/启动下面的应用
+    st.upd_hover = upd_hit(st, px as f32, py as f32);
+    if st.upd_modal || st.upd_hover != 0 {
+        st.hit_app = None;
+        st.hover_now = None;
+        st.active_app = None;
+        st.hover_chip = None;
+        return;
+    }
     let dx = px as f32 - CC;
     let dy = py as f32 - CC;
     let n_ap = st.apps.len();
@@ -12782,7 +13130,7 @@ unsafe fn on_timer(st: &mut State) {
     // 我们的钩子判断一遍，用户感觉像「鼠标被什么吸住了」。
     // 超过 IDLE_CLOSE_AFTER 没有任何输入就自己收起。
     // 常驻模式（persistent）**不自动收** —— 那是用户明确要的常驻行为。
-    if !st.hiding && !st.persistent && now - st.last_input >= IDLE_CLOSE_AFTER {
+    if !st.hiding && !st.persistent && !st.upd_only && now - st.last_input >= IDLE_CLOSE_AFTER {
         // 倒计时移除 / OLE 拖放进行中 / 窗口捕获中都不动：那几种状态下自动收起会丢东西
         if st.pending_rms.is_empty()
             && !DRAG_ACTIVE.load(Ordering::Relaxed)
@@ -13305,7 +13653,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     // ⚠️ `DwmFlush()` 不能省：`ShowWindow(SW_HIDE)` 只是改窗口状态，
     //    真正从屏幕上撤下去要等 DWM 下一次合成 —— 不等就会抓到自己的残影，
     //    玻璃里套着一圈盘（这种 bug 很难从截图上看出来）。
-    if st.glass {
+    if st.glass && !st.upd_only {
         let _ = windows::Win32::Graphics::Dwm::DwmFlush();
         snap_glass(st, st.win_x, st.win_y);
     } else if !st.glass_bg.is_empty() {
@@ -13353,6 +13701,9 @@ unsafe fn trim_working_set() {
 
 unsafe fn close_menu_now(st: &mut State) {
     MENU_OPEN.store(false, Ordering::SeqCst);
+    st.upd_only = false;
+    st.upd_modal = false;
+    st.upd_hover = 0;
     // 实时玻璃：先停后台抓屏，再撤掉「排除抓屏」—— 用户之后的录屏/截图里
     // 不能因为我们开过菜单就少了这个窗口
     let rh = RING_HWND.load(Ordering::Relaxed);
@@ -13558,10 +13909,14 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     y = p.y;
                 }
                 show_menu(st, x, y);
-                // 有新版本 → 借这一次**真实呼出**提醒一次（每个版本最多一次）。
-                // ⚠️ 不放进 `show_menu`：启动那次「亮个相」也走 `show_menu`，
-                //    它紧接着的 `say(REVEAL_MSG)` 会把提醒顶掉，可账已经记了 —— 白丢一次。
-                update_say(st);
+                // ⚠️ 键盘自定义触发没有 keyup：不锁定的话左键点击只会收起菜单，
+                //    表现就是「点了应用没反应」（用户 2026-11-05 报）。
+                if w.0 == 1 && MENU_OPEN.load(Ordering::Relaxed) {
+                    st.locked = true;
+                    LOCKED.store(true, Ordering::SeqCst);
+                }
+                // 有新版本 → 每个版本第一次真实呼出弹一张小卡（比头像气泡强）
+                unsafe { upd_maybe_modal(st) };
             }
             LRESULT(0)
         }
@@ -13592,6 +13947,28 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             let st = state_of(hwnd);
             if MENU_OPEN.load(Ordering::Relaxed) {
+                // 弹窗开着时松手不执行任何应用，保持锁定让用户点按钮
+                if st.upd_modal {
+                    st.locked = true;
+                    LOCKED.store(true, Ordering::SeqCst);
+                    return LRESULT(0);
+                }
+                if upd_offer(st) {
+                    let (mut x, mut y) = (CURSOR_X.load(Ordering::Relaxed), CURSOR_Y.load(Ordering::Relaxed));
+                    if x == 0 && y == 0 {
+                        let mut p = POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        x = p.x;
+                        y = p.y;
+                    }
+                    update_hover(st, x, y);
+                    if st.upd_hover != 0 {
+                        if upd_click(st) {
+                            frame(st, 255);
+                        }
+                        return LRESULT(0);
+                    }
+                }
                 if st.persistent {
                     // 常驻模式：松开触发键后保持显示，改由点击/回车确认
                     st.locked = true;
@@ -13908,6 +14285,33 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_APP_KEY => {
             let st = state_of(hwnd);
             if MENU_OPEN.load(Ordering::Relaxed) {
+                if st.upd_modal {
+                    match w.0 {
+                        KA_CLOSE => {
+                            st.upd_dismissed = true;
+                            if st.upd_only {
+                                close_menu_now(st);
+                            } else {
+                                st.upd_modal = false;
+                            }
+                            frame(st, 255);
+                            return LRESULT(0);
+                        }
+                        KA_CONFIRM => {
+                            if !st.upd_only {
+                                st.upd_modal = false;
+                            }
+                            if st.update_st == 5 {
+                                apply_update(st);
+                            } else {
+                                start_download(st);
+                            }
+                            frame(st, 255);
+                            return LRESULT(0);
+                        }
+                        _ => return LRESULT(0),
+                    }
+                }
                 // 改名模式优先：编辑键的语义与全局快捷键不同
                 if st.editing.is_some() {
                     match w.0 {
@@ -13970,6 +14374,33 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             let st = state_of(hwnd);
             if MENU_OPEN.load(Ordering::Relaxed) {
+                // 更新条 / 弹窗：点击只作用于它们，不启动下面的应用
+                if st.upd_modal || upd_offer(st) {
+                    let (mut x, mut y) = (CURSOR_X.load(Ordering::Relaxed), CURSOR_Y.load(Ordering::Relaxed));
+                    if x == 0 && y == 0 {
+                        let mut p = POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        x = p.x;
+                        y = p.y;
+                    }
+                    update_hover(st, x, y);
+                    if st.upd_modal || st.upd_hover != 0 {
+                        // 弹窗开着时点空白 = 关闭弹窗（不启动下面的应用）
+                        if st.upd_modal && st.upd_hover == 0 {
+                            if st.upd_only {
+                                close_menu_now(st);
+                            } else {
+                                st.upd_modal = false;
+                            }
+                            frame(st, 255);
+                            return LRESULT(0);
+                        }
+                        if upd_click(st) {
+                            frame(st, 255);
+                        }
+                        return LRESULT(0);
+                    }
+                }
                 let x = CURSOR_X.load(Ordering::Relaxed);
                 let y = CURSOR_Y.load(Ordering::Relaxed);
                 note_input(st, x, y);
@@ -14094,19 +14525,49 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             finish_loading(st);
             LRESULT(0)
         }
+        WM_APP_UPDINFO => {
+            let st = state_of(hwnd);
+            let v = match w.0 as u32 {
+                0 => st.upd_modal as usize,
+                1 => st.upd_dismissed as usize,
+                2 => st.update_st as usize,
+                3 => st.upd_hover as usize,
+                4 => st.locked as usize,
+                5 => st.upd_only as usize,
+                6 => MENU_OPEN.load(Ordering::Relaxed) as usize,
+                _ => 0,
+            };
+            LRESULT(v as isize)
+        }
         WM_APP_UPDATE_DONE => {
             // 后台查完版本 → 取结果刷关于页（异步改 State 后必须 kick_setup_frame）
             let st = state_of(hwnd);
             let got = UPDATE_RESULT.lock().ok().and_then(|mut q| q.take());
             if let Some((s, latest, msg)) = got {
                 st.update_st = s;
-                st.update_latest = latest;
+                // ⚠️ 下载完成（s=5）后台回的 latest 是空串：不能把已经知道的版本号抹掉
+                if !latest.is_empty() {
+                    if latest != st.update_latest {
+                        st.upd_dismissed = false; // 换了新版本：本轮「稍后」作废，重新提示
+                    }
+                    st.update_latest = latest;
+                }
                 st.update_msg = msg;
                 // s=3「有新版本」→ 把版本号记到 ini：提醒要等**下一次呼出**才发生，
                 // 中间进程可能已经重启过，不落盘这条提醒就会丢。
                 if s == 3 && st.update_avail_ver != st.update_latest {
                     st.update_avail_ver = st.update_latest.clone();
                     unsafe { save_settings(st) };
+                }
+                if st.upd_startup_wait {
+                    st.upd_startup_wait = false;
+                    if s == 3 && !st.update_latest.is_empty() {
+                        unsafe { open_update_window(st) };
+                    } else {
+                        unsafe { startup_reveal(st) };
+                    }
+                } else if MENU_OPEN.load(Ordering::Relaxed) {
+                    unsafe { upd_maybe_modal(st) };
                 }
             }
             unsafe { kick_setup_frame(st) };
@@ -14358,6 +14819,10 @@ WM_APP_DISMISS_FG => {
                 // 判据要齐：`MENU_OPEN` 管可见性、`hiding` 管淡出动画、`locked` 管
                 // 常驻锁定、`bub_a` 管气泡淡入、`DRAG_ACTIVE` 管 OLE 拖放 ——
                 // 少一条就会在正画的时候裁剪、当前帧的页被丢回去 → 反而卡顿。
+                if st.upd_startup_wait && now_s() >= st.upd_startup_deadline {
+                    st.upd_startup_wait = false;
+                    startup_reveal(st);
+                }
                 if st.trim_at > 0.0 && now_s() >= st.trim_at {
                     st.trim_at = 0.0;
                     if !MENU_OPEN.load(Ordering::Relaxed)
@@ -16635,6 +17100,7 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
         format!("单文件 {} KB · 无外部依赖 · 空闲内存约 1 MB", sz / 1024),
         format!("已收录 {} 个应用 · 共 {} 条外环条目", st.apps.len(), items),
         format!("更新：{}", update_status_text(st)),
+        format!("程序：{}", exe_path()),
         format!("配置：{}（每次改动自动备份为 .bak）", st.ini_path),
     ];
     s_about_section(st, dc, pal, &mut cy, "运行信息", &info);
@@ -17832,7 +18298,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
-    out.push_str(&format!("update_bub_ver={}\r\n", st.update_bub_ver));
+    out.push_str(&format!("update_modal_ver={}\r\n", st.update_modal_ver));
     out.push_str(&format!("onb_drag={}\r\n", b(st.onb_drag)));
     out.push_str(&format!("onb_move={}\r\n", b(st.onb_move)));
     out.push_str(&format!("onb_edit={}\r\n", b(st.onb_edit)));
@@ -26619,6 +27085,14 @@ fn main() {
         // ⚠️ 用 `autostart_sync`（只补差集）而不是 `autostart_set`：后者会把值
         // 无脑改写成**当前进程的 exe 路径**，沙箱/测试一跑就把用户自启项劫持走。
         autostart_sync(st.autostart);
+        // 仅测试：伪造「发现新版本」，不联网、不依赖真实发版
+        if let Some(i) = args.iter().position(|a| a == "--upd-sim") {
+            if let Some(v) = args.get(i + 1) {
+                st.update_auto = false; // 别让真实检查把伪造状态覆盖成「已是最新」
+                st.update_latest = v.clone();
+                st.update_st = 3;
+            }
+        }
 
         // 渲染资源
         init_surfaces(&mut st);
@@ -26826,15 +27300,17 @@ fn main() {
         let listen_on = st.listening;
         set_running(&mut st, listen_on);
 
-        // 启动「亮个相」：在光标处把环亮出来 + 头像说一句，2 秒后自己收起。
-        // ⚠️ 环上没东西就不展露：`draw_scene` 在 n==0 时直接 return，
-        //    硬弹只会亮一个空盘 + 气泡根本画不出来。
-        if !st.apps.is_empty() {
-            let mut cp = POINT::default();
-            let _ = GetCursorPos(&mut cp);
-            show_menu(&mut st, cp.x, cp.y);
-            say(&mut st, REVEAL_MSG, "", REVEAL_SECS);
-            st.hide_at = now_s() + REVEAL_SECS;
+        // 启动亮相：先查一次更新。有新版本 → 不亮环，直接弹更新窗口（不自动收）；
+        // 没有/查不动 → 照旧短暂亮个相。最多等 4 秒，网络慢也不把人晾着。
+        if st.update_auto && !autostart_sandbox() {
+            st.upd_startup_wait = true;
+            st.upd_startup_deadline = now_s() + 4.0;
+            start_update_check(&mut st, true);
+        } else if upd_offer(&st) {
+            // 测试 `--upd-sim`：已有伪造的「发现新版本」→ 直接走更新窗口，不亮环
+            open_update_window(&mut st);
+        } else if !st.apps.is_empty() {
+            startup_reveal(&mut st);
         }
 
         println!("[*] PiPie 已就绪：{} · 托盘菜单 / Ctrl+Alt+R 开关监听", about_hotkeys(&st));
