@@ -1078,6 +1078,8 @@ struct State {
     font_name: HFONT,  // 17px 600 中心名称
     font_label: HFONT, // 11px 500 小标签
     font_row: HFONT,   // 13px 500 chip 文字
+    /// 外环胶囊名称专用（稍大字号：11.5px 的中文旋转后笔画会断）
+    font_chip: HFONT,
     font_hint: HFONT,  // 10px 400
     font_head: HFONT,  // 14px 600
     font_cnt: HFONT,   // 12px 400 项目数
@@ -1091,6 +1093,7 @@ struct State {
     font_name3: HFONT, // 以下为 3 倍超采样字体（draw_text_rot 旋转文字用）
     font_label3: HFONT,
     font_row3: HFONT,
+    font_chip3: HFONT,
     font_hint3: HFONT,
     font_head3: HFONT,
     font_cnt3: HFONT,
@@ -1500,6 +1503,7 @@ impl State {
             font_name: HFONT(ptr::null_mut()),
             font_label: HFONT(ptr::null_mut()),
             font_row: HFONT(ptr::null_mut()),
+            font_chip: HFONT(ptr::null_mut()),
             font_hint: HFONT(ptr::null_mut()),
             font_head: HFONT(ptr::null_mut()),
             font_cnt: HFONT(ptr::null_mut()),
@@ -1509,6 +1513,7 @@ impl State {
             font_name3: HFONT(ptr::null_mut()),
             font_label3: HFONT(ptr::null_mut()),
             font_row3: HFONT(ptr::null_mut()),
+            font_chip3: HFONT(ptr::null_mut()),
             font_hint3: HFONT(ptr::null_mut()),
             font_head3: HFONT(ptr::null_mut()),
             font_cnt3: HFONT(ptr::null_mut()),
@@ -2430,6 +2435,7 @@ unsafe fn text_w(st: &State, text: &str, px: i32) -> i32 {
         11 => st.font_label,
         12 => st.font_cnt,
         13 => st.font_row,
+        15 => st.font_chip,
         14 => st.font_head,
         21 => st.font_bub,
         22 => st.font_bub_s,
@@ -4579,6 +4585,7 @@ unsafe fn draw_text_rot(
         11 => st.font_label3,
         12 => st.font_cnt3,
         13 => st.font_row3,
+        15 => st.font_chip3,
         14 => st.font_head3,
         _ => st.font_name3,
     };
@@ -10249,6 +10256,7 @@ unsafe fn init_fonts(st: &mut State) {
     st.font_name = CreateFontW(-(15.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_label = CreateFontW(-(11.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_row = CreateFontW(-(13.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip = CreateFontW(-(15.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_hint = CreateFontW(-(10.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_head = CreateFontW(-(16.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_cnt = CreateFontW(-(12.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
@@ -10260,6 +10268,7 @@ unsafe fn init_fonts(st: &mut State) {
     st.font_name3 = CreateFontW(-(45.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_label3 = CreateFontW(-(33.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_row3 = CreateFontW(-(39.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip3 = CreateFontW(-(45.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_hint3 = CreateFontW(-(30.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_head3 = CreateFontW(-(48.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     st.font_cnt3 = CreateFontW(-(36.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
@@ -10486,7 +10495,7 @@ const RING_LIFT_K: f32 = 2.0;
 /// 否则「段宽 / 文字宽 / 命中框」三者会对不上。
 const RING_NAME_MAX_W: f32 = 90.0;
 /// 段内名称字号（传给 `draw_text_rot`：13 → `font_row`，13*K*KC ≈ 11.5px）
-const RING_NAME_PX: i32 = 13;
+const RING_NAME_PX: i32 = 15;
 
 /// 外环的内外半径（跟着自适应的盘面半径走）
 fn ring_radii(n: usize) -> (f32, f32) {
@@ -10755,7 +10764,7 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
     rot_rrect(buf, ppx, ppy, arm, lt, lt, pang.to_radians(), col, 0.95 * alpha);
     rot_rrect(buf, ppx, ppy, lt, arm, lt, pang.to_radians(), col, 0.95 * alpha);
 
-    let (cjk, lat) = (13.0 * K * KC, 7.0 * K * KC);
+    let (cjk, lat) = (15.0 * K * KC, 8.0 * K * KC);
     let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
     let label = fit_chip_label(name, avail, cjk, lat);
     if !label.is_empty() {
@@ -10798,7 +10807,7 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
         (x, y, norm_rot(ang))
     };
     let half = ((a2 - a1).to_radians() * 0.5 * r_mid).max(6.0);
-    let (cjk, lat) = (13.0 * K * KC, 7.0 * K * KC);
+    let (cjk, lat) = (15.0 * K * KC, 8.0 * K * KC);
     // `+1.0` 是余量：段宽本来就是按同一个 `est_text_w` 算出来的，不给余量会出现
     // 「刚好相等 → 判成放不下 → 截成空串」的浮点毛刺（名称「66」就这样消失过）。
     let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
@@ -11294,7 +11303,7 @@ fn jitter(t_ms: f64, speed: f64, amp: f32) -> f32 {
 /// ⚠️ 名称宽度封顶 `RING_NAME_MAX_W`；`draw_ring_content` 里截断用的也是它。
 fn chip_half_w(name: &str) -> f32 {
     (CHIP_PAD_L + CHIP_ICON + CHIP_GAP
-        + est_text_w(name, 13.0 * K * KC, 7.0 * K * KC).min(RING_NAME_MAX_W)
+        + est_text_w(name, 15.0 * K * KC, 8.0 * K * KC).min(RING_NAME_MAX_W)
         + CHIP_PAD_R)
         / 2.0
 }
