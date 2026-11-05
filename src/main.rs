@@ -15059,16 +15059,19 @@ thread_local! {
     /// 圆角形状的覆盖率蒙版缓存：同一个尺寸/圆角每帧要画很多次（tab、toast、搜索框），
     /// 每次重做 4× 超采样会把滚动帧拖到 30ms+（2026-11-04 实测）。缓存后每帧只做一次
     /// 颜色填充 + AlphaBlend。
-    static RR_MASK_CACHE: RefCell<HashMap<(i32, i32, i32, i32), Rc<Vec<u8>>>> =
+    static RR_MASK_CACHE: RefCell<HashMap<(i32, i32, i32, i32, i32), Rc<Vec<u8>>>> =
         RefCell::new(HashMap::new());
 }
 
 /// 生成一张 `tw×th` 的 0..255 覆盖率蒙版（内部 4× 超采样）
-unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32) -> Vec<u8> {
+unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32, pad: i32) -> Vec<u8> {
     const K: i32 = 4;
     let ss = SS;
-    let (sw, sh) = (tw * K, th * K);
-    let mut out = vec![0u8; (tw * th) as usize];
+    let pad_px = pad * ss;
+    let (sw, sh) = ((tw + pad_px * 2) * K, (th + pad_px * 2) * K);
+    let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
+    let mut out = vec![0u8; (ow * oh) as usize];
+    let (x0, y0) = (pad_px * K, pad_px * K);
     let (sbits, sdc, sbmp) = make_dib(sw, sh);
     if sbits.is_null() || sdc.is_invalid() || sbmp.is_invalid() {
         return out;
@@ -15078,7 +15081,7 @@ unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32) -> Vec<u8> {
         let pen = CreatePen(PS_SOLID, (ring_ew * ss * K).max(1), white);
         let op = SelectObject(sdc, HGDIOBJ(pen.0));
         let ob = SelectObject(sdc, GetStockObject(NULL_BRUSH));
-        let _ = RoundRect(sdc, 0, 0, sw, sh, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad * 2 * ss * K, rad * 2 * ss * K);
         let _ = SelectObject(sdc, op);
         let _ = SelectObject(sdc, ob);
         let _ = DeleteObject(HGDIOBJ(pen.0));
@@ -15087,15 +15090,15 @@ unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32) -> Vec<u8> {
         let pen = CreatePen(PS_NULL, 0, white);
         let ob = SelectObject(sdc, HGDIOBJ(br.0));
         let op = SelectObject(sdc, HGDIOBJ(pen.0));
-        let _ = RoundRect(sdc, 0, 0, sw, sh, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad * 2 * ss * K, rad * 2 * ss * K);
         let _ = SelectObject(sdc, ob);
         let _ = SelectObject(sdc, op);
         let _ = DeleteObject(HGDIOBJ(br.0));
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }
     let samples = (K * K) as u32;
-    for y in 0..th {
-        for x in 0..tw {
+    for y in 0..oh {
+        for x in 0..ow {
             let mut cov = 0u32;
             for dy in 0..K {
                 let row = ((y * K + dy) * sw + x * K) * 4;
@@ -15103,12 +15106,101 @@ unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32) -> Vec<u8> {
                     cov += *sbits.add((row + dx * 4) as usize) as u32;
                 }
             }
-            out[(y * tw + x) as usize] = (cov / samples) as u8;
+            out[(y * ow + x) as usize] = (cov / samples) as u8;
         }
     }
     let _ = DeleteObject(HGDIOBJ(sbmp.0));
     let _ = DeleteDC(sdc);
     out
+}
+
+fn rr_get_mask(tw: i32, th: i32, rad: i32, ring_ew: i32, pad: i32) -> Rc<Vec<u8>> {
+    let key = (tw, th, rad, ring_ew, pad);
+    RR_MASK_CACHE.with(|cache| {
+        if let Some(v) = cache.borrow().get(&key) {
+            return v.clone();
+        }
+        let v = Rc::new(unsafe { rr_aa_mask(tw, th, rad, ring_ew, pad) });
+        cache.borrow_mut().insert(key, v.clone());
+        v
+    })
+}
+
+/// 填充 + 描边**一次合成**再 AlphaBlend。
+/// ⚠️ 不能先填一次再描一次：两次预乘 alpha 会在边上叠加，边框看起来又粗又发虚
+///    （用户 2026-11-05 报「设置页按钮边框变得很奇怪」）。
+unsafe fn rr_aa_blit_fill_edge(
+    dc: HDC,
+    r: RECT,
+    rad: i32,
+    fill: (u8, u8, u8),
+    edge: (u8, u8, u8),
+    ew: i32,
+    a: u8,
+) {
+    if a == 0 || ew <= 0 {
+        return;
+    }
+    let ss = SS;
+    let tw = (r.right - r.left) * ss;
+    let th = (r.bottom - r.top) * ss;
+    if tw <= 0 || th <= 0 {
+        return;
+    }
+    // 笔宽是以路径为中心画的：画布向外扩 pad，否则描边的外半边会被裁掉，
+    // 2px 边框会变成 1px（用户 2026-11-05 截图里那种「细得发虚」的边）。
+    let pad = (ew + 1) / 2 + 1;
+    let pad_px = pad * ss;
+    let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
+    let cf = rr_get_mask(tw, th, rad, 0, pad);
+    let cs = rr_get_mask(tw, th, rad, ew, pad);
+    let (dbits, ddc, dbmp) = make_dib(ow, oh);
+    if dbits.is_null() || ddc.is_invalid() || dbmp.is_invalid() {
+        return;
+    }
+    for i in 0..(ow * oh) as usize {
+        let f = cf[i] as u32;
+        let e = cs[i] as u32;
+        let cov = f.max(e);
+        if cov == 0 {
+            continue;
+        }
+        // 描边覆盖的比例决定颜色；alpha 只取一次，避免两层叠加
+        let t = (e as f32 / cov as f32).clamp(0.0, 1.0);
+        let col = (
+            (fill.0 as f32 + (edge.0 as f32 - fill.0 as f32) * t) as u8,
+            (fill.1 as f32 + (edge.1 as f32 - fill.1 as f32) * t) as u8,
+            (fill.2 as f32 + (edge.2 as f32 - fill.2 as f32) * t) as u8,
+        );
+        let aa = (cov * a as u32 / 255).min(255) as u32;
+        let o = i * 4;
+        let prem = |v: u8| (v as u32 * aa / 255) as u8;
+        *dbits.add(o) = prem(col.2);
+        *dbits.add(o + 1) = prem(col.1);
+        *dbits.add(o + 2) = prem(col.0);
+        *dbits.add(o + 3) = aa as u8;
+    }
+    let bf = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA
+    };
+    let _ = AlphaBlend(
+        dc,
+        sxv(r.left) - pad_px,
+        sxv(r.top) - pad_px,
+        ow,
+        oh,
+        ddc,
+        0,
+        0,
+        ow,
+        oh,
+        bf,
+    );
+    let _ = DeleteObject(HGDIOBJ(dbmp.0));
+    let _ = DeleteDC(ddc);
 }
 
 /// 把一个圆角形状画成 alpha 蒙版，再 AlphaBlend 到 `dc`（目标坐标已带 SS/S_M）。
@@ -15123,20 +15215,15 @@ unsafe fn rr_aa_blit(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8, ring_ew
     if tw <= 0 || th <= 0 {
         return;
     }
-    let key = (tw, th, rad, ring_ew);
-    let cov = RR_MASK_CACHE.with(|cache| {
-        if let Some(v) = cache.borrow().get(&key) {
-            return v.clone();
-        }
-        let v = Rc::new(rr_aa_mask(tw, th, rad, ring_ew));
-        cache.borrow_mut().insert(key, v.clone());
-        v
-    });
-    let (dbits, ddc, dbmp) = make_dib(tw, th);
+    let pad = if ring_ew > 0 { (ring_ew + 1) / 2 + 1 } else { 0 };
+    let pad_px = pad * ss;
+    let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
+    let cov = rr_get_mask(tw, th, rad, ring_ew, pad);
+    let (dbits, ddc, dbmp) = make_dib(ow, oh);
     if dbits.is_null() || ddc.is_invalid() || dbmp.is_invalid() {
         return;
     }
-    for i in 0..(tw * th) as usize {
+    for i in 0..(ow * oh) as usize {
         let aa = (cov[i] as u32 * a as u32 / 255).min(255) as u32;
         let o = i * 4;
         let prem = |v: u8| (v as u32 * aa / 255) as u8;
@@ -15151,7 +15238,19 @@ unsafe fn rr_aa_blit(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8, ring_ew
         SourceConstantAlpha: 255,
         AlphaFormat: 1, // AC_SRC_ALPHA
     };
-    let _ = AlphaBlend(dc, sxv(r.left), sxv(r.top), tw, th, ddc, 0, 0, tw, th, bf);
+    let _ = AlphaBlend(
+        dc,
+        sxv(r.left) - pad_px,
+        sxv(r.top) - pad_px,
+        ow,
+        oh,
+        ddc,
+        0,
+        0,
+        ow,
+        oh,
+        bf,
+    );
     let _ = DeleteObject(HGDIOBJ(dbmp.0));
     let _ = DeleteDC(ddc);
 }
@@ -15161,12 +15260,13 @@ unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(
         return;
     }
     if rr_small(r, rad) {
-        rr_aa_blit(dc, r, rad, fill, 255, 0);
         if let Some(e) = edge {
             if ew > 0 {
-                rr_aa_blit(dc, r, rad, e, 255, ew);
+                rr_aa_blit_fill_edge(dc, r, rad, fill, e, ew, 255);
+                return;
             }
         }
+        rr_aa_blit(dc, r, rad, fill, 255, 0);
         return;
     }
     let br = CreateSolidBrush(rgb(fill));
