@@ -6810,6 +6810,83 @@ struct WinSearch<'a> {
     want: &'a str,  // 小写
     bare: bool,     // want 不含路径分隔符 → 只比文件名
     found: Option<HWND>,
+    /// 同一程序目录树下的同名 exe（Qoder 的 `.qoder-versions\<ver>\qoder.exe` 这种）
+    found_near: Option<HWND>,
+}
+
+fn path_base(s: &str) -> &str {
+    s.rsplit(['\\', '/']).next().unwrap_or(s)
+}
+
+fn path_parent(s: &str) -> &str {
+    match s.rfind(['\\', '/']) {
+        Some(i) => &s[..i],
+        None => "",
+    }
+}
+
+/// 窗口进程的 exe 是否就是 `target`：
+/// 完整路径相等；或**同一目录树下的同名 exe**。
+///
+/// ⚠️ Qoder 是「`d:\qoder\qoder.exe` 启动器 + `d:\qoder\.qoder-versions\<ver>\qoder.exe`
+///    实体」两段式：只比全路径会把「已经开着」判成「没开」，点图标就变成一次静默的
+///    重复启动（单实例直接退出），用户看到的就是「点了没反应」（2026-11-09 报）。
+unsafe fn exe_matches_target(hw: HWND, target: &str) -> bool {
+    let Some(p) = window_exe(hw) else { return false };
+    let t = target.trim().to_ascii_lowercase();
+    if p == t {
+        return true;
+    }
+    if path_base(&p) != path_base(&t) {
+        return false;
+    }
+    let dir = path_parent(&t);
+    if dir.is_empty() || !p.starts_with(dir) {
+        return false;
+    }
+    matches!(p.as_bytes().get(dir.len()), Some(b'\\') | Some(b'/'))
+}
+
+/// 能当「应用主窗口」的顶层窗口：可见、有标题、不在别的虚拟桌面、不是外壳/工具窗口。
+unsafe fn is_app_window(hwnd: HWND) -> bool {
+    if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+        return false;
+    }
+    // DWM cloaked = 被挂起 / 在别的虚拟桌面 / UWP 的后台壳窗口：
+    // IsWindowVisible 仍为 true，但置前只会「闪一下」或完全没反应。
+    let mut cloaked = 0u32;
+    let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+        hwnd,
+        windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(14), // DWMWA_CLOAKED
+        &mut cloaked as *mut _ as *mut c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
+    if cloaked != 0 {
+        return false;
+    }
+    // 桌面 / 任务栏这些外壳窗口也是 explorer.exe 的，别当成「应用窗口」
+    let c = window_class(hwnd);
+    if matches!(
+        c.as_str(),
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Windows.UI.Core.CoreWindow"
+            | "RLHost"
+            | "RLRing"
+            | "RLClip"
+    ) {
+        return false;
+    }
+    // 工具窗口 / 无主窗口的浮窗：跳过
+    let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
+    if ex.0 & WS_EX_TOOLWINDOW.0 != 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    pid != 0 && pid != std::process::id()
 }
 
 /// 找「同一个程序的已开顶层窗口」。
@@ -6819,66 +6896,66 @@ unsafe fn find_window_of_exe(exe: &str) -> Option<HWND> {
         if s.found.is_some() {
             return BOOL(0);
         }
-        if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+        if !is_app_window(hwnd) {
             return BOOL(1);
         }
-        // DWM cloaked = 被挂起 / 在别的虚拟桌面 / UWP 的后台壳窗口：
-        // IsWindowVisible 仍为 true，但置前只会「闪一下」或完全没反应。
-        let mut cloaked = 0u32;
-        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(14), // DWMWA_CLOAKED
-            &mut cloaked as *mut _ as *mut c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-        if cloaked != 0 {
-            return BOOL(1);
+        let Some(p) = window_exe(hwnd) else { return BOOL(1) };
+        let hit = if s.bare {
+            path_base(&p) == s.want
+        } else {
+            p == s.want
+        };
+        if hit {
+            s.found = Some(hwnd);
+            return BOOL(0);
         }
-        // 桌面 / 任务栏这些外壳窗口也是 explorer.exe 的，别当成「应用窗口」
-        let mut cls = [0u16; 64];
-        let n = GetClassNameW(hwnd, &mut cls).max(0) as usize;
-        let c = String::from_utf16_lossy(&cls[..n.min(cls.len())]);
-        if matches!(
-            c.as_str(),
-            "Progman"
-                | "WorkerW"
-                | "Shell_TrayWnd"
-                | "Shell_SecondaryTrayWnd"
-                | "Windows.UI.Core.CoreWindow"
-                | "RLHost"
-                | "RLRing"
-                | "RLClip"
-        ) {
-            return BOOL(1);
-        }
-        // 工具窗口 / 无主窗口的浮窗：跳过
-        let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
-        if ex.0 & WS_EX_TOOLWINDOW.0 != 0 {
-            return BOOL(1);
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 || pid == std::process::id() {
-            return BOOL(1);
-        }
-        if let Some(p) = process_image(pid) {
-            let hit = if s.bare {
-                p.rsplit(['\\', '/']).next().unwrap_or(&p) == s.want
-            } else {
-                p == s.want
-            };
-            if hit {
-                s.found = Some(hwnd);
-                return BOOL(0);
-            }
+        if !s.bare && s.found_near.is_none() && exe_matches_target(hwnd, s.want) {
+            s.found_near = Some(hwnd);
         }
         BOOL(1)
     }
     let want = exe.trim().to_ascii_lowercase();
     let bare = !want.contains('\\') && !want.contains('/');
-    let mut s = WinSearch { want: want.as_str(), bare, found: None };
+    let mut s = WinSearch { want: want.as_str(), bare, found: None, found_near: None };
     let _ = EnumWindows(Some(cb), LPARAM(&mut s as *mut _ as isize));
-    s.found
+    s.found.or(s.found_near)
+}
+
+/// 窗口条目（`kind==1`）只记着标题，`live_hwnd` 跨重启一定失效 ——
+/// 此时在该程序的当前窗口里按条目名找回那个窗口；标题对不上就退回它任意一个主窗口。
+/// 不这么做就只能盲跑 `relaunch`（窗口条目抓到的命令行常常没有项目/文档参数，
+/// 单实例应用会静默退出 = 用户眼里「点了没反应」）。
+unsafe fn find_item_window(exe: &str, name: &str) -> Option<HWND> {
+    struct Find<'a> {
+        exe: &'a str,
+        name: &'a str,
+        best: Option<HWND>,
+        score: i32,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let s = &mut *(lp.0 as *mut Find);
+        if !is_app_window(hwnd) || !exe_matches_target(hwnd, s.exe) {
+            return BOOL(1);
+        }
+        let t = window_title(hwnd).to_ascii_lowercase();
+        let n = s.name.to_ascii_lowercase();
+        // 3 = 标题包含条目名（条目名是截断过的标题）；2 = 反过来包含；1 = 同程序任意窗口
+        let sc = if !n.is_empty() && t.contains(&n) {
+            3
+        } else if !t.is_empty() && n.contains(&t) {
+            2
+        } else {
+            1
+        };
+        if sc > s.score {
+            s.score = sc;
+            s.best = Some(hwnd);
+        }
+        BOOL(1)
+    }
+    let mut s = Find { exe, name, best: None, score: 0 };
+    let _ = EnumWindows(Some(cb), LPARAM(&mut s as *mut _ as isize));
+    s.best
 }
 
 /// 把窗口还原 + 置前。
@@ -6905,6 +6982,25 @@ unsafe fn focus_window(hwnd: HWND) {
     if attached {
         let _ = AttachThreadInput(my_tid, fg_tid, false);
     }
+}
+
+/// 置前并**复核结果**：被 UIPI / 虚拟桌面 / 挂起窗口挡住时 `focus_window` 会静默失败。
+/// 返回 false = 调用方应该考虑真正启动，而不是当成「已经切过去了」。
+unsafe fn focus_verified(hw: HWND) -> bool {
+    focus_window(hw);
+    let mut hw_pid = 0u32;
+    GetWindowThreadProcessId(hw, Some(&mut hw_pid));
+    for _ in 0..3 {
+        let fg = GetForegroundWindow();
+        let mut fg_pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+        // 有的应用会把**自己的另一个窗口**提到前台，pid 相同也算成功
+        if fg == hw || (fg_pid != 0 && fg_pid == hw_pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
 }
 
 // ─────────────── 网址：已打开就切到那个标签 ───────────────
@@ -7818,19 +7914,9 @@ fn open_target(target: &str) {
         //    直接 return 就是用户报的「点了打不开」。失败就走真正的启动。
         if let Some(exe) = resolve_target_exe(target) {
             if let Some(hw) = find_window_of_exe(&exe) {
-                focus_window(hw);
-                let mut hw_pid = 0u32;
-                GetWindowThreadProcessId(hw, Some(&mut hw_pid));
-                for _ in 0..3 {
-                    let fg = GetForegroundWindow();
-                    let mut fg_pid = 0u32;
-                    GetWindowThreadProcessId(fg, Some(&mut fg_pid));
-                    // 有的应用会把**自己的另一个窗口**提到前台，pid 相同也算成功
-                    if fg == hw || (fg_pid != 0 && fg_pid == hw_pid) {
-                        println!("[*] 聚焦已开窗口 · {target}");
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                if focus_verified(hw) {
+                    println!("[*] 聚焦已开窗口 · {target}");
+                    return;
                 }
                 diag_line(&format!("{}\radial_log.txt", log_dir()), &format!("LAUNCH focus failed → start · {target}"));
             }
@@ -7950,10 +8036,17 @@ unsafe fn activate_window_action(it: &ItemEntry) -> &'static str {
         && IsWindow(hw).as_bool()
         && IsWindowVisible(hw).as_bool()
         && window_matches_item(hw, &it.target, &it.name);
-    if alive {
-        focus_window(hw);
-        "focus"
-    } else if relaunch_score(&it.relaunch) > 0 {
+    if alive && focus_verified(hw) {
+        return "focus";
+    }
+    // 跨重启后 `live_hwnd` 一定失效：先按「同程序 + 条目标题」找回那个窗口，
+    // 再考虑重开。窗口条目抓到的命令行经常没有项目/文档参数，单实例应用会静默退出。
+    if let Some(found) = find_item_window(&it.target, &it.name) {
+        if focus_verified(found) {
+            return "focus-found";
+        }
+    }
+    if relaunch_score(&it.relaunch) > 0 {
         spawn_cmd(&it.relaunch);
         "respawn"
     } else {
@@ -8178,9 +8271,9 @@ fn commit(st: &mut State) {
 ///    也可能指向捕获时误拿的伪窗口（explorer 一个文件夹窗口有多个 hwnd）。
 ///    只判 IsWindow 就会「聚焦一个不相干的窗口」——用户眼里就是点了没反应。
 unsafe fn window_matches_item(hw: HWND, target: &str, name: &str) -> bool {
-    match window_exe(hw) {
-        Some(e) if e.eq_ignore_ascii_case(target) => {}
-        _ => return false,
+    // 同 `exe_matches_target`：Qoder 这类「启动器 + 版本目录实体」也能对上
+    if !exe_matches_target(hw, target) {
+        return false;
     }
     let t = window_title(hw).to_ascii_lowercase();
     let n = name.to_ascii_lowercase();
@@ -26616,6 +26709,7 @@ fn main() {
                 windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
             );
             let t = args.get(2).cloned().unwrap_or_default();
+            let want_name = args.get(3).cloned().unwrap_or_default();
             println!("target = {t}");
             match resolve_target_exe(&t) {
                 Some(exe) => {
@@ -26628,6 +26722,18 @@ fn main() {
                                 String::from_utf16_lossy(&b[..n.min(b.len())]));
                         }
                         None => println!("found  = <无>"),
+                    }
+                    // 第二参数（条目标题）给了就顺带演练外环窗口条目的找回逻辑
+                    if !want_name.is_empty() {
+                        match find_item_window(&exe, &want_name) {
+                            Some(hw) => {
+                                let mut b = [0u16; 256];
+                                let n = GetWindowTextW(hw, &mut b).max(0) as usize;
+                                println!("item   = HWND({:?}) title={:?}", hw.0,
+                                    String::from_utf16_lossy(&b[..n.min(b.len())]));
+                            }
+                            None => println!("item   = <无>"),
+                        }
                     }
                 }
                 None => println!("exe    = <目标不是可执行文件>"),
