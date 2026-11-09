@@ -4995,8 +4995,9 @@ unsafe fn draw_text_rot(
 
 // ───────────────────── 双击胶囊改名 ─────────────────────
 //
-// 交互链：双击外环胶囊 → 就地编辑（不弹任何浮层）→ Enter 落盘 / Esc 取消 /
-// 空提交时**删掉这个条目**（和设置页的 ✕ 一致，但有二次确认的机会：Esc 随时可撤）。
+// 交互链：双击外环胶囊 → 就地编辑（不弹任何浮层）→ Enter 落盘 / Esc 取消。
+// ⚠️ 空提交**不改任何东西**（保留原名）：删条目只能走设置页的 ✕，
+// 否则手快把字删光再回车就会把胶囊弄丢（2026-11-07 用户报过）。
 //
 // 为什么不用右键菜单：菜单要多一套命中/焦点/键盘可达性，而改名是唯一高频操作，
 // 双击两下直达更短。代价是**不能只靠键盘**（键盘用户走设置页的「编辑」）。
@@ -5094,9 +5095,9 @@ unsafe fn edit_finish(st: &mut State, commit: bool) {
         return;
     }
     if newname.is_empty() {
-        // 空提交 = 删除这个条目（与设置页 ✕ 同义）
-        st.apps[ai].items.remove(j);
-        println!("[rename] 空提交 → 删除条目 (app={} j={})", ai, j);
+        // 空提交 = 啥也不改（保留原名）。删条目只走设置页 ✕
+        println!("[rename] 空提交 → 保持原名 (app={} j={})", ai, j);
+        return;
     } else if newname != st.apps[ai].items[j].name {
         let old = st.apps[ai].items[j].name.clone();
         st.apps[ai].items[j].name = newname.to_string();
@@ -17326,6 +17327,10 @@ unsafe fn open_settings(st: &mut State) {
     st.set_edit_buf.clear();
     // 确认卡同理：卡存的是**下标**，重开时列表可能已经变了（拖放/热重载都会动它）
     st.set_confirm = Ctl::None;
+    // 开关的动画量不随 ini 走（`State::new` 里是一组缺省值）。第一次打开设置页时
+    // 帧定时器还没跑过，直接画会显示**错的开关位**（录屏模式明明开着却显示关着）——
+    // 打开时先按真值对齐，第一帧就是对的，不依赖鼠标移动去踢定时器。
+    st.sw_a = sw_targets(st);
     // 首启引导：**只在没看过时自动播一次**（`guide_seen` 落 ini，跳过了也不再弹）；
     // 想重看就点标题栏的「查看引导」。
     // `guide_start` 内部会切到交互页 —— 4 步高亮的都是交互页的控件。
@@ -17929,6 +17934,23 @@ unsafe fn kick_setup_frame(st: &mut State) {
     }
 }
 
+/// 设置页 8 个开关的「真值」（下标与 `State::sw_a` 一一对应）。
+/// ⚠️ 映射只写这一份：`setup_tick` 拿它当动画目标，`open_settings` 打开时也直接
+///    用它把 `sw_a` 对齐 —— 否则第一次打开会先画一帧 `State::new` 的初值
+///    （用户 2026-11-07：录屏模式明明是开着的，设置页却显示关着）。
+fn sw_targets(st: &State) -> [f32; 8] {
+    [
+        if st.persistent { 1.0 } else { 0.0 },
+        if st.running { 1.0 } else { 0.0 },
+        if st.autostart { 1.0 } else { 0.0 },
+        if st.exc_fs { 1.0 } else { 0.0 },
+        if st.hover_name { 1.0 } else { 0.0 },
+        look_live_val(st),
+        if st.cl_on { 1.0 } else { 0.0 },
+        if st.note_on { 1.0 } else { 0.0 },
+    ]
+}
+
 unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
     let now = Instant::now();
     let dt = (now - st.set_last).as_secs_f32().clamp(0.001, 0.10);
@@ -17953,28 +17975,7 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
             busy = true;
         }
     }
-    let mut targets = [
-        if st.persistent { 1.0f32 } else { 0.0 },
-        if st.running { 1.0 } else { 0.0 },
-        st.sw_a[2],
-        st.sw_a[3],
-        st.sw_a[4],
-        // 录屏模式（外观页）：不按页门禁 → 第一次画之前就已经收敛到真值，不会「先亮后滑」
-        // ⚠️ 取 `look_live_val`：这条开关是 `glass_live` 的**反面**
-        look_live_val(st),
-        // 剪贴板总开关（应用页）：同理不按页门禁，第一次画就对得上 `cl_on`
-        if st.cl_on { 1.0 } else { 0.0 },
-        // 便签总开关：同上
-        if st.note_on { 1.0 } else { 0.0 },
-    ];
-    // 开机自启开关现画在**交互页**（第 1 页），高级页的旧位置也留着这条动画
-    if st.set_page == 1 || st.set_page == 3 {
-        targets[2] = if st.autostart { 1.0 } else { 0.0 };
-    }
-    if st.set_page == 1 {
-        targets[3] = if st.exc_fs { 1.0 } else { 0.0 };
-        targets[4] = if st.hover_name { 1.0 } else { 0.0 };
-    }
+    let targets = sw_targets(st);
     for i in 0..8 {
         let d = targets[i] - st.sw_a[i];
         if d.abs() > 0.003 {
