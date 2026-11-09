@@ -318,11 +318,14 @@ const TRIM_AFTER: f64 = 3.0;
 /// 松手后「被拖的那个」从光标滑进槽位的时长（秒）。
 /// ⚠️ 只给它做动画：其余图标在拖动期间已按预览排序让位就位了，松手后**不能再动**。
 const LAND_SECS: f64 = 0.22;
-/// 启动时「亮个相」：头像说这句、环亮这么久（秒）后自动收起。
+/// 启动时「亮个相」：头像说这句话、环亮这么久（秒）后自动收起。
 /// ⚠️ 每次启动都播（用户 2026-10-14 要求）—— 这是「我在这儿」的存在感提示，
 ///    不是一次性引导；一次性引导在设置页的 coach marks。
-const REVEAL_MSG: &str = "需要就快捷键叫我哦";
-const REVEAL_SECS: f64 = 2.0;
+/// ⚠️ 时长从 2s 提到 6s（用户 2026-11-09）：下载后新用户来不及看清「怎么呼出」。
+const REVEAL_SECS: f64 = 6.0;
+/// 启动气泡只讲一件事：怎么叫我出来。副行点明默认键（用户 2026-11-09 定稿）。
+const REVEAL_MSG: &str = "快捷键可以呼出我";
+const REVEAL_SUB: &str = "默认鼠标侧键";
 
 /// onboarding 教学气泡的停留时长。
 /// ⚠️ 必须是**定时收**而不是"等下个气泡顶掉"：教学气泡会压住右上角那一块图标，
@@ -3664,7 +3667,7 @@ unsafe fn startup_reveal(st: &mut State) {
     let _ = GetCursorPos(&mut cp);
     st.upd_only = false;
     show_menu(st, cp.x, cp.y);
-    say(st, REVEAL_MSG, "", REVEAL_SECS);
+    say(st, REVEAL_MSG, REVEAL_SUB, REVEAL_SECS);
     st.hide_at = now_s() + REVEAL_SECS;
 }
 
@@ -8815,6 +8818,11 @@ unsafe fn dump_all(dir: &str) {
         say(&mut st, "已移除：终端", "", 99.0);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_bub_short.bmp", dir), &buf, CANVAS, CANVAS);
+        // 2e-2) 启动引导气泡：主行必须整句可读（不能被 BUB_W_MAX 截掉）
+        say(&mut st, REVEAL_MSG, REVEAL_SUB, 99.0);
+        let buf = draw_to_buf(&mut st);
+        save_bmp(&format!("{}\\dump_bub_reveal.bmp", dir), &buf, CANVAS, CANVAS);
+        println!("[dump] dump_bub_reveal 启动气泡 {:?} / {:?}", REVEAL_MSG, REVEAL_SUB);
         // 2f) 深色主题下的气泡 —— 用户用的是深色，必须确认对比度没反
         //     （块色/字色在深浅下是同一套 token，搞反了就是白底白字）
         st.glass_liquid = true;
