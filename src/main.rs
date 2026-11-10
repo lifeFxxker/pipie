@@ -156,6 +156,9 @@ const CHIP_MIN_GAP: f32 = 12.0 * K * KC; // 相邻 chip 最小切向间隙(px)
 /// （用户 2026-10-17 定稿：「外环不应该是均匀分布的，而是以默认间距在对应内环附近分布」）。
 /// 这个常量只表示**扇面允许的最大跨度** —— 留 24° 缺口，首尾别贴脸。
 const CHIP_FAN_MAX: f32 = 336.0;
+/// 外环分页时**一页**允许铺开的角度。
+/// 用户 2026-11-10：220° 太早就换页，要「至少铺满一圈再换页」→ 直接用满圈上限 336°。
+const CHIP_PAGE_FAN: f32 = 336.0;
 /// 压缝时的最小缝（px）：比 `CHIP_MIN_GAP` 小，但别真贴到一起（圆角会咬）。
 const CHIP_GAP_MIN: f32 = 2.0 * K * KC;
 
@@ -220,6 +223,8 @@ const WM_APP_UPDATE_DONE: u32 = WM_APP + 31;
 const WM_APP_UPDINFO: u32 = WM_APP + 47;
 /// 仅测试：装饰轮盘状态。w=0 模式+页 / 1 已穿戴数 / 2 悬停槽+1 / 3 穿戴位图
 const WM_APP_DECORINFO: u32 = WM_APP + 48;
+/// 仅测试：外环分页状态。w=0 当前页 / 1 单页容量 / 2 总页数
+const WM_APP_CHIPINFO: u32 = WM_APP + 49;
 /// 后台检查结果：(状态 2=已最新 / 3=有新版本 / 4=失败, latest 版本号, 提示/原因)
 static UPDATE_RESULT: std::sync::Mutex<Option<(u8, String, String)>> =
     std::sync::Mutex::new(None);
@@ -1100,6 +1105,8 @@ struct State {
     chip_seg_a: [(f32, f32); MAX_ITEMS],
     /// 上面那组角度属于哪个应用 —— 换应用就整组重置（不同应用的条目下标没有可比性）
     chip_seg_app: usize,
+    /// 每个应用外环当前页（条目铺不下时滚轮翻页；布局里会 clamp）
+    chip_page: [u16; MAX_APPS],
     /// dump 模式：把合成壁纸铺在盘面下方，便于离线核对观感
     dump_bg: bool,
     commit_pulse: f32,
@@ -1545,6 +1552,7 @@ impl State {
             chip_hot: [0.0; MAX_ITEMS],
             chip_seg_a: [(f32::NAN, f32::NAN); MAX_ITEMS],
             chip_seg_app: usize::MAX,
+            chip_page: [0; MAX_APPS],
             dump_bg: false,
             commit_pulse: 0.0,
             commit_app: usize::MAX,
@@ -4837,6 +4845,10 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             let m = st.apps[ai].items.len();
             let (ring_in, ring_out) = ring_radii(n);
             for j in 0..m {
+                // 不在外环当前页 → 不画（分页后其余条目给的是 NaN）
+                if !segs[j].0.is_finite() {
+                    continue;
+                }
                 let appear = {
                     let t0 = st.switch0 + j as f64 * 0.026;
                     clamp01(((now - t0) / 0.20) as f32)
@@ -4918,6 +4930,31 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             if let Some(gs) = chip_ghost_seg(st, ai) {
                 let gname = drop_ghost_chip_name(st, ai, m).unwrap_or_default();
                 draw_ghost_chip(st, buf, &pal, gs, &gname, st.chip_ghost_a);
+            }
+
+            // 外环分页点：条目铺不下时，在环外沿画几个小点（当前页是墨色）
+            {
+                let (names_all, ghost) = chip_layout_names(st, ai);
+                let (cap, page, _start) = chip_page_window(st, ai, &names_all, ghost.is_some());
+                let pages = (names_all.len() + cap - 1) / cap;
+                if pages > 1 {
+                    let a0 = slot_angle(slot_of(st, ai), n);
+                    let (_, r_out) = ring_radii(n);
+                    let spread = 5.0;
+                    for p in 0..pages {
+                        let a = a0 + (p as f32 - (pages - 1) as f32 * 0.5) * spread;
+                        let (x, y) = polar(r_out + 10.0, a);
+                        let col = if p == page {
+                            pal.ink
+                        } else {
+                            mixc(pal.paper, pal.ink, 0.25)
+                        };
+                        flat_circle(
+                            buf, x, y, if p == page { 2.4 } else { 1.8 }, col,
+                            0.0, col, 0.0, 0.0, 0.0, 0.0, 1.0,
+                        );
+                    }
+                }
             }
         }
     }
@@ -6143,6 +6180,8 @@ fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> usize 
 /// 返回新增条数。入库即回写 ini 并全量热重载。
 fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) -> usize {
     let mut added = 0usize;
+    // 落了新条目的应用 → 落完把它外环翻到**最后一页**，让用户看见刚加的东西
+    let mut dests: Vec<usize> = Vec::new();
     // 内环**数据**上限撞到了（一屏装不下的部分靠滚轮看，但总数不能再加）
     let mut full = false;
     for it in items {
@@ -6187,6 +6226,7 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
                 let app_name = app.name.clone();
                 if ini_insert_item(&st.ini_path, &app_name, &it.name, &it.target) {
                     added += 1;
+                    dests.push(ai);
                 }
             }
             None => {
@@ -6209,6 +6249,14 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
     if added > 0 {
         // ini 已更新，全量热重载（重新解析 + 重新解码图标）
         unsafe { load_ini(st) };
+        for ai in dests {
+            if ai < st.apps.len() {
+                st.chip_page[ai] = u16::MAX; // 布局里 clamp 到最后一页
+            }
+        }
+        // 换页/新增后别复用旧的段角平滑值（否则会从上一页的位置滑过来、叠一下）
+        st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
+        st.chip_hot = [0.0; MAX_ITEMS];
         // onboarding：只要真加进去了，① 「拖入」就算学过；
         // 落点命中某个已有应用（进它的外环）→ ②「拖外环条目」也算学过
         // （不管是不是 force 的：命中即说明用户已经会往环里丢了）。
@@ -8514,6 +8562,14 @@ fn cancel_loading(st: &mut State) {
     }
 }
 
+/// 窗口条目的 relaunch 里如果带着网址（浏览器窗口拖进来的条目就是这样），
+/// 取出来：窗口找不回来时要**导航到那个页面**，不能只把浏览器拎到前台。
+fn relaunch_url(s: &str) -> Option<&str> {
+    s.split_whitespace()
+        .map(|t| t.trim_matches(|c: char| c == '"' || c == '\''))
+        .find(|t| is_url(t))
+}
+
 /// 窗口条目的**动作**部分（不碰 State，可在任意线程跑）。
 /// 返回值只用于日志：`focus` / `respawn` / `fallback`。
 unsafe fn activate_window_action(it: &ItemEntry) -> &'static str {
@@ -8525,8 +8581,17 @@ unsafe fn activate_window_action(it: &ItemEntry) -> &'static str {
     if alive && focus_verified(hw) {
         return "focus";
     }
-    // 跨重启后 `live_hwnd` 一定失效：先按「同程序 + 条目标题」找回那个窗口，
-    // 再考虑重开。窗口条目抓到的命令行经常没有项目/文档参数，单实例应用会静默退出。
+    // 浏览器网页条目（relaunch 里带 URL）：只接受**标题真的对上**的窗口；
+    // 找不到就按网址重新导航（会先试切换已开标签，再新开）。
+    // ⚠️ 以前这里会退回「同程序任意窗口」→ 只把浏览器拎到前台、页面没打开
+    //    （用户 2026-11-10 报的正是这条）。
+    let page = relaunch_url(&it.relaunch);
+    if page.is_some() {
+        // 浏览器网页条目：**别按标题去抓一个同程序窗口**（抓到的可能停在任何标签）。
+        // launch 会先按地址栏/标题切到真正开着的标签，找不到才新开这个网址。
+        launch(page.unwrap());
+        return "url";
+    }
     if let Some(found) = find_item_window(&it.target, &it.name) {
         if focus_verified(found) {
             return "focus-found";
@@ -9431,6 +9496,7 @@ unsafe fn dump_all(dir: &str) {
         {
             let saved_liq = st.glass_liquid;
             let saved_theme = st.theme;
+            let saved_glass = st.glass;
             st.glass_liquid = false;
             st.theme = 0;
             st.glass = true;
@@ -9452,7 +9518,46 @@ unsafe fn dump_all(dir: &str) {
             st.decor.clear();
             st.glass_liquid = saved_liq;
             st.theme = saved_theme;
+            st.glass = saved_glass;
             apply_theme(&mut st);
+        }
+
+        // ── 2h2d) 外环分页：条目最多的应用，第 1 页 / 最后一页 ──
+        {
+            if let Some(hi) = st
+                .apps
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, a)| a.items.len())
+                .map(|(i, _)| i)
+            {
+                if !st.apps[hi].items.is_empty() {
+                    st.active_app = Some(hi);
+                    st.chip_anim = [1.0; MAX_ITEMS];
+                    st.chip_hot = [0.0; MAX_ITEMS];
+                    st.chip_seg_app = hi;
+                    st.chip_page[hi] = 0;
+                    let segs = chip_layout(&st, hi).0;
+                    for k in 0..st.apps[hi].items.len().min(MAX_ITEMS) {
+                        st.chip_seg_a[k] = segs[k];
+                    }
+                    let buf = draw_to_buf(&mut st);
+                    save_bmp(&format!("{}\\dump_chip_page0.bmp", dir), &buf, CANVAS, CANVAS);
+                    st.chip_page[hi] = u16::MAX;
+                    st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
+                    let segs = chip_layout(&st, hi).0;
+                    for k in 0..st.apps[hi].items.len().min(MAX_ITEMS) {
+                        st.chip_seg_a[k] = segs[k];
+                    }
+                    let buf = draw_to_buf(&mut st);
+                    save_bmp(&format!("{}\\dump_chip_page_last.bmp", dir), &buf, CANVAS, CANVAS);
+                    println!("[dump] dump_chip_page0 / dump_chip_page_last 外环分页");
+                    st.chip_page[hi] = 0;
+                    st.active_app = None;
+                    st.chip_seg_app = usize::MAX;
+                    st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
+                }
+            }
         }
 
         // ── 2h3) loading：内环应用本体（图标淡出 + 三个跳动的点）──
@@ -9937,6 +10042,30 @@ fn exe_dir() -> String {
         Some(i) => p[..i].to_string(),
         None => ".".into(),
     }
+}
+
+/// 设置页 UI 缩放：系统 DPI/96（夹 1.0..2.0）。
+/// 之前只声明了 DPI 感知却不缩放 → 高分屏上 824×714 的窗口只有正常大小的 2/3。
+unsafe fn init_ui_scale() {
+    if let Ok(s) = std::env::var("PIPIE_UI_SCALE") {
+        if let Ok(v) = s.trim().parse::<f32>() {
+            set_ui_scale(v);
+            return;
+        }
+    }
+    let dc = GetDC(None);
+    let dpi = if dc.is_invalid() {
+        96
+    } else {
+        let d = GetDeviceCaps(dc, windows::Win32::Graphics::Gdi::LOGPIXELSX);
+        let _ = ReleaseDC(None, dc);
+        d.max(96)
+    };
+    // 还要保证窗口放得下：1920×1080@150% 时 1.5× 的高度只比屏幕少 9px，再大就出界了。
+    let sw = GetSystemMetrics(SM_CXSCREEN) as f32;
+    let sh = GetSystemMetrics(SM_CYSCREEN) as f32;
+    let fit = ((sw - 40.0) / S_WW as f32).min((sh - 80.0) / S_HH as f32);
+    set_ui_scale((dpi as f32 / 96.0).min(fit.max(1.0)).clamp(1.0, 2.0));
 }
 
 /// 配置目录：`%APPDATA%\PiPie`（**Roaming**）。
@@ -12481,7 +12610,56 @@ fn chip_ghost_seg(st: &State, ai: usize) -> Option<(f32, f32)> {
     let m = st.apps.get(ai).map(|a| a.items.len()).unwrap_or(0);
     let (names, ghost) = chip_layout_names(st, ai);
     ghost?;
-    chip_segs_of(st, ai, &names).get(m).copied()
+    let total = names.len();
+    let (cap, _page, start) = chip_page_window(st, ai, &names, true);
+    let end = (start + cap).min(total);
+    if m < start || m >= end {
+        return None;
+    }
+    chip_segs_of(st, ai, &names[start..end]).get(m - start).copied()
+}
+
+fn chip_page_cap(st: &State, ai: usize, names: &[String]) -> usize {
+    if names.is_empty() {
+        return 0;
+    }
+    let (r_in, r_out) = ring_radii(st.apps.len());
+    let r = (r_in + r_out) * 0.5;
+    let deg_per_px = 180.0 / (std::f32::consts::PI * r);
+    let gap = CHIP_MIN_GAP * deg_per_px;
+    let mut used = 0.0f32;
+    let mut cap = 0usize;
+    for name in names {
+        let w = 2.0 * chip_half_w(name) * deg_per_px;
+        let add = if cap == 0 { w } else { gap + w };
+        if cap > 0 && used + add > CHIP_PAGE_FAN {
+            break;
+        }
+        used += add;
+        cap += 1;
+    }
+    cap.max(1)
+}
+
+/// (一页容量, 当前页, 起始下标)。幽灵在时强制最后一页 —— 拖入落点必须可见。
+fn chip_page_window(
+    st: &State, ai: usize, names_all: &[String], has_ghost: bool,
+) -> (usize, usize, usize) {
+    let total = names_all.len();
+    // 拖动重排时不分页：让位预览需要所有槽位参与
+    let paging = st.drag_chip.is_none() && st.drag_over_chip.is_none();
+    let cap = if paging {
+        chip_page_cap(st, ai, names_all).max(1)
+    } else {
+        total.max(1)
+    };
+    let pages = (total + cap - 1) / cap;
+    let mut page = st.chip_page.get(ai).copied().unwrap_or(0) as usize;
+    if has_ghost {
+        page = pages.saturating_sub(1);
+    }
+    page = page.min(pages.saturating_sub(1));
+    (cap, page, page * cap)
 }
 
 fn chip_layout(st: &State, ai: usize) -> (Vec<(f32, f32)>, Vec<f32>, Vec<f32>) {
@@ -12493,11 +12671,22 @@ fn chip_layout(st: &State, ai: usize) -> (Vec<(f32, f32)>, Vec<f32>, Vec<f32>) {
     if m == 0 {
         return (Vec::new(), Vec::new(), Vec::new());
     }
-    // ⚠️ 名字列表里**带幽灵**（若有）→ 真实胶囊自动让位一格。
-    //    这就是「拖窗口进来时外环腾出位置」的全部实现，命中测试/平滑段角共用同一份布局。
-    let (names, _ghost) = chip_layout_names(st, ai);
-    let segs: Vec<(f32, f32)> = chip_segs_of(st, ai, &names).into_iter().take(m).collect();
-    let rots: Vec<f32> = segs.iter().map(|(a1, a2)| norm_rot((a1 + a2) * 0.5)).collect();
+    let (names_all, ghost) = chip_layout_names(st, ai);
+    let total = names_all.len();
+    let (cap, _page, start) = chip_page_window(st, ai, &names_all, ghost.is_some());
+    let end = (start + cap).min(total);
+    let page_segs = chip_segs_of(st, ai, &names_all[start..end]);
+    // 不在当前页的条目给 NaN：绘制/命中都会跳过（列表下标仍是**真实条目下标**）
+    let mut segs = vec![(f32::NAN, f32::NAN); m];
+    for idx in start..end.min(m) {
+        if let Some(s) = page_segs.get(idx - start) {
+            segs[idx] = *s;
+        }
+    }
+    let rots: Vec<f32> = segs
+        .iter()
+        .map(|(a1, a2)| if a1.is_finite() { norm_rot((a1 + a2) * 0.5) } else { f32::NAN })
+        .collect();
     let (r_in, r_out) = ring_radii(n);
     (segs, rots, vec![(r_in + r_out) * 0.5; m])
 }
@@ -14298,6 +14487,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
 
     st.active_app = None;
     st.hover_chip = None;
+    st.chip_page = [0; MAX_APPS];
     st.app_anim = [0.0; MAX_APPS];
     st.app_hot = [0.0; MAX_APPS];
     // 槽位重新落位（NAN = 首帧直接赋值，不做「从旧槽位滑过来」的动画）
@@ -15346,6 +15536,26 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             };
             LRESULT(v as isize)
         }
+        WM_APP_CHIPINFO => {
+            let st = state_of(hwnd);
+            let v = match st.active_app {
+                Some(ai) if ai < st.apps.len() => {
+                    let (names, ghost) = chip_layout_names(st, ai);
+                    let (cap, page, _start) = chip_page_window(st, ai, &names, ghost.is_some());
+                    let pages = (names.len() + cap - 1) / cap;
+                    match w.0 as u32 {
+                        0 => page,
+                        1 => cap,
+                        2 => pages,
+                        3 => st.apps[ai].items.len(),
+                        4 => ai,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            LRESULT(v as isize)
+        }
         WM_APP_UPDATE_DONE => {
             // 后台查完版本 → 取结果刷关于页（异步改 State 后必须 kick_setup_frame）
             let st = state_of(hwnd);
@@ -15503,6 +15713,28 @@ WM_APP_DISMISS_FG => {
                     frame(st, 255);
                 }
                 return LRESULT(0);
+            }
+            // 悬停在外环胶囊上 + 该应用条目铺不下 → 滚轮翻**外环页**
+            if st.hover_chip.is_some() {
+                if let Some(ai) = st.active_app {
+                    let (names, ghost) = chip_layout_names(st, ai);
+                    let (cap, _page, _start) = chip_page_window(st, ai, &names, ghost.is_some());
+                    let pages = (names.len() + cap - 1) / cap;
+                    if pages > 1 {
+                        // 原始 delta：上滚为正 → 上一页
+                        let step = if d > 0 { -1i32 } else { 1 };
+                        let next = ((st.chip_page[ai] as i32 + step)
+                            .rem_euclid(pages as i32)) as u16;
+                        if next != st.chip_page[ai] {
+                            st.chip_page[ai] = next;
+                            st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
+                            st.chip_hot = [0.0; MAX_ITEMS];
+                            st.last_input = now_s();
+                            frame(st, 255);
+                        }
+                        return LRESULT(0);
+                    }
+                }
             }
             // 一格 = `WHEEL_DELTA`(120) = 正好转一个图标；触摸板的小增量自然变成连续滚。
             ring_scroll(st, -(d as f32 / 120.0));
@@ -15818,10 +16050,49 @@ const CARD_RAD: i32 = 18;
 /// 所以这里显式给个自带名字的常量，别依赖导入。
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
-/// 逻辑坐标（卡片左上为 0,0）→ hi DIB 的设备坐标
-#[inline]
+/// 设置页的 UI 缩放（系统 DPI/96）。0 = 还没初始化（按 1.0）。
+/// `PIPIE_UI_SCALE` 可强制指定（离屏核对 125%/150%/200% 用）。
+static SET_SCALE_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn set_scale() -> f32 {
+    let b = SET_SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if b == 0 {
+        1.0
+    } else {
+        f32::from_bits(b)
+    }
+}
+
+fn set_ui_scale(v: f32) {
+    SET_SCALE_BITS.store(v.clamp(0.8, 2.5).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 设置窗口的 lo（上屏）尺寸：逻辑尺寸 × 缩放，取整。
+fn set_lo_w() -> i32 {
+    (S_WW as f32 * set_scale()).round() as i32
+}
+fn set_lo_h() -> i32 {
+    (S_HH as f32 * set_scale()).round() as i32
+}
+/// 逻辑 → lo 像素的实际倍率（取整后反推，保证绘制与窗口像素严格对齐）。
+fn set_k() -> f32 {
+    set_lo_w() as f32 / S_WW as f32
+}
+/// 逻辑 → hi 画布倍率（lo 再 ×SS）。
+fn ssx() -> f32 {
+    SS as f32 * set_k()
+}
+/// 逻辑尺寸 → hi 像素（笔宽/圆角等整数参数）。
+fn ss_px(v: f32) -> i32 {
+    (v * ssx()).round().max(1.0) as i32
+}
+/// 逻辑坐标（整数）→ hi 画布设备像素。
 fn sxv(v: i32) -> i32 {
-    (v + S_M) * SS
+    ((v + S_M) as f32 * ssx() + 0.5) as i32
+}
+/// 窗口客户像素 → 设置页逻辑坐标（`sxv` 的逆变换）。
+fn set_lx(v: i32) -> i32 {
+    (v as f32 / set_k() + 0.5) as i32 - S_M
 }
 
 /// 呼出键开关。钩子跑在**另一个线程**上，读不到 State，所以用原子量。
@@ -16254,8 +16525,8 @@ unsafe fn conf_dim(st: &State) {
     for v in 0..256usize {
         lut[v] = (v * 45 / 100) as u8;
     }
-    let w = (S_WW * SS) as usize;
-    let h = (S_HH * SS) as usize;
+    let w = (set_lo_w() * SS) as usize;
+    let h = (set_lo_h() * SS) as usize;
     let bits = st.s_hi_bits;
     for y in 0..h {
         let row = y * w;
@@ -16361,8 +16632,8 @@ thread_local! {
 /// 生成一张 `tw×th` 的 0..255 覆盖率蒙版（内部 4× 超采样）
 unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32, pad: i32) -> Vec<u8> {
     const K: i32 = 4;
-    let ss = SS;
-    let pad_px = pad * ss;
+    let ss = ssx();
+    let pad_px = (pad as f32 * ss).round() as i32;
     let (sw, sh) = ((tw + pad_px * 2) * K, (th + pad_px * 2) * K);
     let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
     let mut out = vec![0u8; (ow * oh) as usize];
@@ -16372,11 +16643,12 @@ unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32, pad: i32) -> Vec<
         return out;
     }
     let white = rgb((255, 255, 255));
+    let rad_s = (rad as f32 * 2.0 * ss * K as f32).round() as i32;
     if ring_ew > 0 {
-        let pen = CreatePen(PS_SOLID, (ring_ew * ss * K).max(1), white);
+        let pen = CreatePen(PS_SOLID, (ring_ew as f32 * ss * K as f32).round().max(1.0) as i32, white);
         let op = SelectObject(sdc, HGDIOBJ(pen.0));
         let ob = SelectObject(sdc, GetStockObject(NULL_BRUSH));
-        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad_s, rad_s);
         let _ = SelectObject(sdc, op);
         let _ = SelectObject(sdc, ob);
         let _ = DeleteObject(HGDIOBJ(pen.0));
@@ -16385,7 +16657,7 @@ unsafe fn rr_aa_mask(tw: i32, th: i32, rad: i32, ring_ew: i32, pad: i32) -> Vec<
         let pen = CreatePen(PS_NULL, 0, white);
         let ob = SelectObject(sdc, HGDIOBJ(br.0));
         let op = SelectObject(sdc, HGDIOBJ(pen.0));
-        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad * 2 * ss * K, rad * 2 * ss * K);
+        let _ = RoundRect(sdc, x0, y0, sw - x0, sh - y0, rad_s, rad_s);
         let _ = SelectObject(sdc, ob);
         let _ = SelectObject(sdc, op);
         let _ = DeleteObject(HGDIOBJ(br.0));
@@ -16436,16 +16708,16 @@ unsafe fn rr_aa_blit_fill_edge(
     if a == 0 || ew <= 0 {
         return;
     }
-    let ss = SS;
-    let tw = (r.right - r.left) * ss;
-    let th = (r.bottom - r.top) * ss;
+    let ss = ssx();
+    let tw = ((r.right - r.left) as f32 * ss).round() as i32;
+    let th = ((r.bottom - r.top) as f32 * ss).round() as i32;
     if tw <= 0 || th <= 0 {
         return;
     }
     // 笔宽是以路径为中心画的：画布向外扩 pad，否则描边的外半边会被裁掉，
     // 2px 边框会变成 1px（用户 2026-11-05 截图里那种「细得发虚」的边）。
     let pad = (ew + 1) / 2 + 1;
-    let pad_px = pad * ss;
+    let pad_px = (pad as f32 * ss).round() as i32;
     let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
     let cf = rr_get_mask(tw, th, rad, 0, pad);
     let cs = rr_get_mask(tw, th, rad, ew, pad);
@@ -16504,14 +16776,14 @@ unsafe fn rr_aa_blit(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8, ring_ew
     if a == 0 {
         return;
     }
-    let ss = SS;
-    let tw = (r.right - r.left) * ss;
-    let th = (r.bottom - r.top) * ss;
+    let ss = ssx();
+    let tw = ((r.right - r.left) as f32 * ss).round() as i32;
+    let th = ((r.bottom - r.top) as f32 * ss).round() as i32;
     if tw <= 0 || th <= 0 {
         return;
     }
     let pad = if ring_ew > 0 { (ring_ew + 1) / 2 + 1 } else { 0 };
-    let pad_px = pad * ss;
+    let pad_px = (pad as f32 * ss).round() as i32;
     let (ow, oh) = (tw + pad_px * 2, th + pad_px * 2);
     let cov = rr_get_mask(tw, th, rad, ring_ew, pad);
     let (dbits, ddc, dbmp) = make_dib(ow, oh);
@@ -16566,7 +16838,7 @@ unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(
     }
     let br = CreateSolidBrush(rgb(fill));
     let pen = match edge {
-        Some(e) => CreatePen(PS_SOLID, ew * SS, rgb(e)),
+        Some(e) => CreatePen(PS_SOLID, ss_px(ew as f32), rgb(e)),
         None => CreatePen(PS_NULL, 0, rgb(fill)),
     };
     let ob = SelectObject(dc, HGDIOBJ(br.0));
@@ -16577,8 +16849,8 @@ unsafe fn g_rrect(dc: HDC, r: RECT, rad: i32, fill: (u8, u8, u8), edge: Option<(
         sxv(r.top),
         sxv(r.right),
         sxv(r.bottom),
-        rad * 2 * SS,
-        rad * 2 * SS,
+        ss_px(rad as f32 * 2.0),
+        ss_px(rad as f32 * 2.0),
     );
     let _ = SelectObject(dc, ob);
     let _ = SelectObject(dc, op);
@@ -16615,8 +16887,8 @@ unsafe fn g_rrect_alpha(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8) {
         sxv(r.top),
         sxv(r.right) + 1,
         sxv(r.bottom) + 1,
-        rad * 2 * SS,
-        rad * 2 * SS,
+        ss_px(rad as f32 * 2.0),
+        ss_px(rad as f32 * 2.0),
     );
     let saved = SaveDC(dc);
     let _ = SelectClipRgn(dc, rgn);
@@ -16625,8 +16897,8 @@ unsafe fn g_rrect_alpha(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), a: u8) {
         dc,
         sxv(r.left),
         sxv(r.top),
-        (r.right - r.left) * SS,
-        (r.bottom - r.top) * SS,
+        ((r.right - r.left) as f32 * ssx()).round() as i32,
+        ((r.bottom - r.top) as f32 * ssx()).round() as i32,
         mdc,
         0,
         0,
@@ -16646,7 +16918,7 @@ unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32
         rr_aa_blit(dc, r, rad, edge, 255, ew.max(1));
         return;
     }
-    let pen = CreatePen(PS_SOLID, ew * SS, rgb(edge));
+    let pen = CreatePen(PS_SOLID, ss_px(ew as f32), rgb(edge));
     let nb = GetStockObject(NULL_BRUSH);
     let op = SelectObject(dc, HGDIOBJ(pen.0));
     let ob = SelectObject(dc, nb);
@@ -16656,8 +16928,8 @@ unsafe fn g_rrect_stroke(dc: HDC, r: RECT, rad: i32, edge: (u8, u8, u8), ew: i32
         sxv(r.top),
         sxv(r.right),
         sxv(r.bottom),
-        rad * 2 * SS,
-        rad * 2 * SS,
+        ss_px(rad as f32 * 2.0),
+        ss_px(rad as f32 * 2.0),
     );
     let _ = SelectObject(dc, op);
     let _ = SelectObject(dc, ob);
@@ -16931,10 +17203,11 @@ fn guide_hit(st: &State, x: i32, y: i32) -> i32 {
 /// 圆角描边（无填充）—— 引导挖孔的白环
 unsafe fn g_ring(dc: HDC, r: RECT, rad: i32, c: (u8, u8, u8), ew: i32) {
     let br = GetStockObject(NULL_BRUSH);
-    let pen = CreatePen(PS_SOLID, ew * SS, rgb(c));
+    let pen = CreatePen(PS_SOLID, ss_px(ew as f32), rgb(c));
     let ob = SelectObject(dc, br);
     let op = SelectObject(dc, pen);
-    let _ = RoundRect(dc, sxv(r.left), sxv(r.top), sxv(r.right), sxv(r.bottom), rad * 2 * SS, rad * 2 * SS);
+    let _ = RoundRect(dc, sxv(r.left), sxv(r.top), sxv(r.right), sxv(r.bottom),
+        ss_px(rad as f32 * 2.0), ss_px(rad as f32 * 2.0));
     let _ = SelectObject(dc, ob);
     let _ = SelectObject(dc, op);
     let _ = DeleteObject(HGDIOBJ(pen.0));
@@ -16955,7 +17228,7 @@ unsafe fn g_dot(dc: HDC, cx: i32, cy: i32, rad: i32, c: (u8, u8, u8)) {
 
 /// 直线段（箭头头用）
 unsafe fn g_line(dc: HDC, x0: i32, y0: i32, x1: i32, y1: i32, wpx: i32, c: (u8, u8, u8)) {
-    let pen = CreatePen(PS_SOLID, wpx * SS, rgb(c));
+    let pen = CreatePen(PS_SOLID, ss_px(wpx as f32), rgb(c));
     let op = SelectObject(dc, HGDIOBJ(pen.0));
     let _ = MoveToEx(dc, sxv(x0), sxv(y0), None);
     let _ = LineTo(dc, sxv(x1), sxv(y1));
@@ -16983,16 +17256,16 @@ unsafe fn guide_draw(st: &mut State) {
     for v in 0..256usize {
         lut[v] = (v * 45 / 100) as u8;
     }
-    let w = (S_WW * SS) as usize;
-    let h = (S_HH * SS) as usize;
+    let w = (set_lo_w() * SS) as usize;
+    let h = (set_lo_h() * SS) as usize;
     // 挖孔在设备坐标下的范围（sxv = (v + S_M) * SS）
-    let hx0 = sxv(t.left).clamp(0, S_WW * SS) as usize;
-    let hy0 = sxv(t.top).clamp(0, S_HH * SS) as usize;
-    let hx1 = sxv(t.right).clamp(0, S_WW * SS) as usize;
-    let hy1 = sxv(t.bottom).clamp(0, S_HH * SS) as usize;
+    let hx0 = sxv(t.left).clamp(0, set_lo_w() * SS) as usize;
+    let hy0 = sxv(t.top).clamp(0, set_lo_h() * SS) as usize;
+    let hx1 = sxv(t.right).clamp(0, set_lo_w() * SS) as usize;
+    let hy1 = sxv(t.bottom).clamp(0, set_lo_h() * SS) as usize;
     let bits = st.s_hi_bits;
     // 诊断点：逻辑 (760,600) 卡片内右下空白，必是底纸
-    let dbg_o = (((600 + S_M) * SS) as usize * w + ((760 + S_M) * SS) as usize) * 4;
+    let dbg_o = (sxv(600) as usize * w + sxv(760) as usize) * 4;
     let dbg = std::env::var_os("RL_GUIDEDBG").is_some();
     if dbg {
         eprintln!(
@@ -17724,17 +17997,17 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
         for b in src.iter_mut() {
             *b = 0;
         }
-        draw_hub_face(&*st, &mut src, CC, CC, (r * SS) as f32, &pal, now);
+        draw_hub_face(&*st, &mut src, CC, CC, r as f32 * ssx(), &pal, now);
         st.hub_buf = src;
     }
 
-    let half = (r + 4) * SS; // 含投影余量（设备 px）
+    let half = ((r + 4) as f32 * ssx()).round() as i32; // 含投影余量（设备 px）
     let size = half * 2;
-    let hi_w = (S_WW * SS) as usize;
-    let hi_h = (S_HH * SS) as usize;
+    let hi_w = (set_lo_w() * SS) as usize;
+    let hi_h = (set_lo_h() * SS) as usize;
     let cw = CANVAS as usize;
-    let dx0 = (cx + S_M) * SS - half;
-    let dy0 = (cy + S_M) * SS - half;
+    let dx0 = ((cx + S_M) as f32 * ssx()).round() as i32 - half;
+    let dy0 = ((cy + S_M) as f32 * ssx()).round() as i32 - half;
     let hub = std::slice::from_raw_parts(st.hub_buf.as_ptr(), n);
     let hi = std::slice::from_raw_parts_mut(st.s_hi_bits, hi_w * hi_h * 4);
     for y in 0..size {
@@ -17784,7 +18057,7 @@ unsafe fn s_text_w(dc: HDC, text: &str, font: HFONT) -> i32 {
     let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     let _ = DrawTextW(dc, &mut t, &mut r, DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
     let _ = SelectObject(dc, op);
-    ((r.right - r.left) as f32 / SS as f32).ceil() as i32
+    ((r.right - r.left) as f32 / ssx()).ceil() as i32
 }
 
 /// 「关于」页的分段：小标题（`sf_bold`）+ 若干正文行（`sf_small`，行距 24）。
@@ -18137,9 +18410,9 @@ unsafe fn open_settings(st: &mut State) {
     }
     let hwnd = HWND(h as *mut c_void);
     let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-    st.set_x = (sw - S_WW) / 2;
-    st.set_y = (sh - S_HH) / 2;
-    let _ = SetWindowPos(hwnd, None, st.set_x, st.set_y, S_WW, S_HH, SWP_NOZORDER);
+    st.set_x = (sw - set_lo_w()) / 2;
+    st.set_y = (sh - set_lo_h()) / 2;
+    let _ = SetWindowPos(hwnd, None, st.set_x, st.set_y, set_lo_w(), set_lo_h(), SWP_NOZORDER);
     st.set_hover = Ctl::None;
     st.set_hover_prev = Ctl::None;
     // 关窗时没收回的输入框：重开不该停在「打字打到一半」的脏状态
@@ -18834,8 +19107,8 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
     }
     // 鼠标坐标是**窗口**坐标（卡片外还有一圈 S_M 的投影留白），
     // 布局用的是卡片内的逻辑坐标，所以先减掉 S_M
-    let lx = || ((l.0 & 0xFFFF) as i16 as i32) - S_M;
-    let ly = || (((l.0 >> 16) & 0xFFFF) as i16 as i32) - S_M;
+    let lx = || set_lx((l.0 & 0xFFFF) as i16 as i32);
+    let ly = || set_lx(((l.0 >> 16) & 0xFFFF) as i16 as i32);
     match msg {
         WM_ERASEBKGND => LRESULT(1),
         WM_SETCURSOR => {
@@ -18850,8 +19123,9 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             // 所以设置页「一直拖不动」（2026-10-11 用户报）。先换算成窗口坐标再判。
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
-            let x = ((l.0 & 0xFFFF) as i16 as i32) - wr.left;
-            let y = (((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top;
+            // 客户区像素 → 设置页逻辑坐标（窗口按 DPI 放大了多少，这里就要除回去）
+            let x = set_lx(((l.0 & 0xFFFF) as i16 as i32) - wr.left);
+            let y = set_lx((((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top);
             // 标题条拖动（排除关闭按钮那一段，**以及「查看引导」入口** ——
             // ⚠️ 入口也落在标题条里，不排除的话点它会被判成「拖动标题栏」，
             // 窗口跟着鼠标跑，于是「点了没反应」（用户 2026-10-13 报）。
@@ -19544,24 +19818,24 @@ unsafe fn ensure_setup_fonts(st: &mut State) {
         return;
     }
     let face: Vec<u16> = wide("Microsoft YaHei UI");
-    st.sf_title = CreateFontW(-(16 * SS), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.sf_h1 = CreateFontW(-(20 * SS), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.sf_nav = CreateFontW(-(14 * SS), 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.sf_body = CreateFontW(-(13 * SS), 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.sf_small = CreateFontW(-(12 * SS), 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.sf_bold = CreateFontW(-(14 * SS), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_title = CreateFontW(-ss_px(16.0), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_h1 = CreateFontW(-ss_px(20.0), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_nav = CreateFontW(-ss_px(14.0), 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_body = CreateFontW(-ss_px(13.0), 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_small = CreateFontW(-ss_px(12.0), 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.sf_bold = CreateFontW(-ss_px(14.0), 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
 }
 
 unsafe fn ensure_setup_surfaces(st: &mut State) {
     ensure_setup_fonts(st);
     if st.s_hi_dc.0.is_null() {
-        let (b, d, m) = make_dib(S_WW * SS, S_HH * SS);
+        let (b, d, m) = make_dib(set_lo_w() * SS, set_lo_h() * SS);
         st.s_hi_bits = b;
         st.s_hi_dc = d;
         st.s_hi_bmp = m;
     }
     if st.s_lo_dc.0.is_null() {
-        let (b, d, m) = make_dib(S_WW, S_HH);
+        let (b, d, m) = make_dib(set_lo_w(), set_lo_h());
         st.s_lo_bits = b;
         st.s_lo_dc = d;
         st.s_lo_bmp = m;
@@ -19576,10 +19850,10 @@ unsafe fn setup_render(st: &mut State) {
         return;
     }
     let pal = pal_of(st.glass_liquid);
-    let hi_w = (S_WW * SS) as usize;
-    let hi_h = (S_HH * SS) as usize;
-    let lo_w = S_WW as usize;
-    let lo_h = S_HH as usize;
+    let hi_w = (set_lo_w() * SS) as usize;
+    let hi_h = (set_lo_h() * SS) as usize;
+    let lo_w = set_lo_w() as usize;
+    let lo_h = set_lo_h() as usize;
 
     // 1) hi 画布整体铺卡片色。**不能留黑** —— 降采样时边缘会把黑混进来，
     //    卡片边上就会出现一圈脏灰。
@@ -19619,20 +19893,23 @@ unsafe fn setup_render(st: &mut State) {
     // 4) alpha：GDI 不写 alpha 通道，所以形状的透明区在这里**解析式**补上。
     //    卡片 = 圆角矩形（外扩 1px，让 2px 描边的外半边不被切掉）；
     //    卡片之外按「向下偏移 + 收紧模糊」铺一层投影。
-    let hw = S_W as f32 / 2.0;
-    let hh = S_H as f32 / 2.0;
-    let ccx = (S_M + S_W / 2) as f32;
-    let ccy = (S_M + S_H / 2) as f32;
+    // 全部按 lo 像素算（缩放后卡片、圆角、影子一起放大）
+    let sk = set_k();
+    let hw = S_W as f32 / 2.0 * sk;
+    let hh = S_H as f32 / 2.0 * sk;
+    let ccx = (S_M + S_W / 2) as f32 * sk;
+    let ccy = (S_M + S_H / 2) as f32 * sk;
+    let card_rad = CARD_RAD as f32 * sk;
     // 投影：向下偏移 + **同时向内收**，否则四周会糊出一圈对称光晕（就是「大黑边」）。
     // 收进去之后：下方只有 4px 实带 + 渐变，左右各剩一点点，上方几乎没有。
-    let (sh_dy, sh_blur, sh_a) = (8.0f32, 14.0f32, 0.26f32);
+    let (sh_dy, sh_blur, sh_a) = (8.0f32 * sk, 14.0f32 * sk, 0.26f32);
     let shc = [SHADOW.2 as f32, SHADOW.1 as f32, SHADOW.0 as f32]; // 缓冲是 BGRA
     for y in 0..lo_h {
         for x in 0..lo_w {
             let fx = x as f32 + 0.5;
             let fy = y as f32 + 0.5;
             let o = (y * lo_w + x) * 4;
-            let ac = cov1(-sdf_rounded_rect(fx - ccx, fy - ccy, hw + 1.0, hh + 1.0, CARD_RAD as f32));
+            let ac = cov1(-sdf_rounded_rect(fx - ccx, fy - ccy, hw + sk, hh + sk, card_rad));
             if ac >= 0.999 {
                 lo[o + 3] = 255;
                 continue;
@@ -19640,9 +19917,9 @@ unsafe fn setup_render(st: &mut State) {
             let ds = -sdf_rounded_rect(
                 fx - ccx,
                 fy - ccy - sh_dy,
-                (hw - 6.0).max(2.0),
-                (hh - 4.0).max(2.0),
-                CARD_RAD as f32,
+                (hw - 6.0 * sk).max(2.0),
+                (hh - 4.0 * sk).max(2.0),
+                card_rad,
             );
             let ash = if ds > 0.0 {
                 let t = 1.0 - (ds / sh_blur).clamp(0.0, 1.0);
@@ -19680,7 +19957,7 @@ unsafe fn setup_present(st: &mut State) {
         return;
     }
     {
-        let buf = std::slice::from_raw_parts_mut(st.s_lo_bits, (S_WW * S_HH * 4) as usize);
+        let buf = std::slice::from_raw_parts_mut(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize);
         premultiply(buf);
     }
     // ⚠️ `pptDst` 必须传 `None`：让分层窗口**保留当前位置**。
@@ -19689,7 +19966,7 @@ unsafe fn setup_present(st: &mut State) {
     // 初始居中由 `open_settings` 的 `SetWindowPos` 负责，拖动由 `WM_NCHITTEST→HTCAPTION`
     // 让系统移动窗口，这里不再覆盖位置。
     let src = POINT::default();
-    let size = SIZE { cx: S_WW, cy: S_HH };
+    let size = SIZE { cx: set_lo_w(), cy: set_lo_h() };
     let blend = BLENDFUNCTION {
         BlendOp: 0u8,
         BlendFlags: 0,
@@ -19715,7 +19992,7 @@ unsafe fn setup_present(st: &mut State) {
 /// 看不出投影浓淡和透明边界 —— 所以每次出图都要过这一步。
 unsafe fn s_dump_save(st: &State, dir: &str, name: &str) {
     let bg = (205u8, 205u8, 208u8);
-    let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+    let mut px = std::slice::from_raw_parts(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize).to_vec();
     for p in px.chunks_mut(4) {
         let a = p[3] as f32 / 255.0;
         let ia = 1.0 - a;
@@ -19724,7 +20001,7 @@ unsafe fn s_dump_save(st: &State, dir: &str, name: &str) {
         p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
         p[3] = 255;
     }
-    let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, S_WW, S_HH);
+    let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, set_lo_w(), set_lo_h());
     println!("[setup] {name} {}", if ok { "OK" } else { "FAIL" });
 }
 
@@ -19760,7 +20037,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         // 合成到中灰底上再看 —— BMP 不带 alpha，直接存的话圆角外和投影区
         // 显示的是原始 RGB，完全看不出投影浓淡和透明边界
         let bg = (205u8, 205u8, 208u8);
-        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize).to_vec();
         for p in px.chunks_mut(4) {
             let a = p[3] as f32 / 255.0;
             let ia = 1.0 - a;
@@ -19777,7 +20054,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
             format!("setup_tip{}", tip)
         };
         let p = format!("{}\\{}.bmp", dir, name);
-        let ok = save_bmp(&p, &px, S_WW, S_HH);
+        let ok = save_bmp(&p, &px, set_lo_w(), set_lo_h());
         println!("[setup] {} page={} tip={} guide={} {}", name, page, tip, guide, if ok { "OK" } else { "FAIL" });
     }
 
@@ -19837,7 +20114,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         st.set_page_a = 1.0; // 出图不等切页淡入
         setup_render(st);
         let bg = (205u8, 205u8, 208u8);
-        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize).to_vec();
         for p in px.chunks_mut(4) {
             let a = p[3] as f32 / 255.0;
             let ia = 1.0 - a;
@@ -19846,7 +20123,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
             p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
             p[3] = 255;
         }
-        let ok = save_bmp(&format!("{}\\setup_first.bmp", dir), &px, S_WW, S_HH);
+        let ok = save_bmp(&format!("{}\\setup_first.bmp", dir), &px, set_lo_w(), set_lo_h());
         println!(
             "[setup] setup_first page={} guide={} {}（期望 page=1 交互页）",
             st.set_page,
@@ -19865,7 +20142,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         st.set_hover = Ctl::None;
         setup_render(st);
         let bg = (205u8, 205u8, 208u8);
-        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize).to_vec();
         for p in px.chunks_mut(4) {
             let a = p[3] as f32 / 255.0;
             let ia = 1.0 - a;
@@ -19874,7 +20151,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
             p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
             p[3] = 255;
         }
-        let ok = save_bmp(&format!("{}\\setup_trigcap.bmp", dir), &px, S_WW, S_HH);
+        let ok = save_bmp(&format!("{}\\setup_trigcap.bmp", dir), &px, set_lo_w(), set_lo_h());
         println!("[setup] setup_trigcap capturing=true {}", if ok { "OK" } else { "FAIL" });
         st.trig_capturing = false;
     }
@@ -19896,7 +20173,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         setup_render(st);
         std::thread::sleep(std::time::Duration::from_millis(280));
         let bg = (205u8, 205u8, 208u8);
-        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (S_WW * S_HH * 4) as usize).to_vec();
+        let mut px = std::slice::from_raw_parts(st.s_lo_bits, (set_lo_w() * set_lo_h() * 4) as usize).to_vec();
         for p in px.chunks_mut(4) {
             let a = p[3] as f32 / 255.0;
             let ia = 1.0 - a;
@@ -19905,7 +20182,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
             p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
             p[3] = 255;
         }
-        let ok = save_bmp(&format!("{}\\setup_addurl_{}.bmp", dir, tag), &px, S_WW, S_HH);
+        let ok = save_bmp(&format!("{}\\setup_addurl_{}.bmp", dir, tag), &px, set_lo_w(), set_lo_h());
         println!("[setup] setup_addurl_{} {}", tag, if ok { "OK" } else { "FAIL" });
     }
     st.set_edit_ai = usize::MAX;
@@ -27487,6 +27764,16 @@ fn main() {
         return;
     }
     if args.len() >= 2 && args[1] == "--dump" {
+        // 离屏图默认 1.0 比例（像素回归口径不变）；可用 PIPIE_UI_SCALE 强制其它档
+        if let Ok(v) = std::env::var("PIPIE_UI_SCALE") {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                set_ui_scale(f);
+            } else {
+                set_ui_scale(1.0);
+            }
+        } else {
+            set_ui_scale(1.0);
+        }
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -27777,6 +28064,16 @@ fn main() {
 
     // 诊断：把设置窗口的四个页面离屏渲染成 BMP（配 bmp2png.py 核对排版）
     if args.len() >= 2 && args[1] == "--settings-dump" {
+        // 离屏默认 1.0；PIPIE_UI_SCALE 可指定 1.25/1.5/2.0 核对缩放
+        if let Ok(f) = std::env::var("PIPIE_UI_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .ok_or(())
+        {
+            set_ui_scale(f);
+        } else {
+            set_ui_scale(1.0);
+        }
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -28042,6 +28339,8 @@ fn main() {
 
     unsafe {
         let _ = SetProcessDPIAware();
+        // 设置页按系统 DPI 缩放：高分屏（150%/200%）上不再是一小块。
+        unsafe { init_ui_scale(); }
         let hinst = HINSTANCE(GetModuleHandleW(None).unwrap_or(HMODULE(ptr::null_mut())).0);
         let mut st = State::new();
         let p: *mut State = &mut st;
@@ -28173,8 +28472,8 @@ fn main() {
             WS_POPUP,
             0,
             0,
-            S_WW,
-            S_HH,
+            set_lo_w(),
+            set_lo_h(),
             HWND(ptr::null_mut()),
             HMENU(ptr::null_mut()),
             hinst,
