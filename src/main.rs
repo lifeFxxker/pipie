@@ -218,6 +218,8 @@ const WM_APP_LAUNCHED: u32 = WM_APP + 30;
 const WM_APP_UPDATE_DONE: u32 = WM_APP + 31;
 /// 仅测试：更新提示的状态（0 弹窗开着 / 1 本轮已稍后 / 2 update_st / 3 upd_hover / 4 locked）
 const WM_APP_UPDINFO: u32 = WM_APP + 47;
+/// 仅测试：装饰轮盘状态。w=0 模式+页 / 1 已穿戴数 / 2 悬停槽+1 / 3 穿戴位图
+const WM_APP_DECORINFO: u32 = WM_APP + 48;
 /// 后台检查结果：(状态 2=已最新 / 3=有新版本 / 4=失败, latest 版本号, 提示/原因)
 static UPDATE_RESULT: std::sync::Mutex<Option<(u8, String, String)>> =
     std::sync::Mutex::new(None);
@@ -326,6 +328,36 @@ const REVEAL_SECS: f64 = 6.0;
 /// 启动气泡只讲一件事：怎么叫我出来。副行点明默认键（用户 2026-11-09 定稿）。
 const REVEAL_MSG: &str = "快捷键可以呼出我";
 const REVEAL_SUB: &str = "默认鼠标侧键";
+
+struct DecorDef { id: &'static str, name: &'static str, behind: bool, png: &'static [u8] }
+
+const DECORS: &[DecorDef] = &[
+    DecorDef { id: "blush", name: "腮红", behind: false, png: include_bytes!("../assets/decor/blush.png") },
+    DecorDef { id: "hands", name: "手", behind: false, png: include_bytes!("../assets/decor/hands.png") },
+    DecorDef { id: "ears", name: "猫耳", behind: false, png: include_bytes!("../assets/decor/ears.png") },
+    DecorDef { id: "beanie", name: "小红帽", behind: false, png: include_bytes!("../assets/decor/beanie.png") },
+    DecorDef { id: "cowboy", name: "牛仔帽", behind: false, png: include_bytes!("../assets/decor/cowboy.png") },
+    DecorDef { id: "crown", name: "皇冠", behind: false, png: include_bytes!("../assets/decor/crown.png") },
+    DecorDef { id: "flower", name: "小花", behind: false, png: include_bytes!("../assets/decor/flower.png") },
+    DecorDef { id: "bowtie", name: "蝴蝶结·下巴", behind: false, png: include_bytes!("../assets/decor/bowtie.png") },
+    DecorDef { id: "necktie", name: "领带", behind: false, png: include_bytes!("../assets/decor/necktie.png") },
+    DecorDef { id: "scarf", name: "围巾", behind: false, png: include_bytes!("../assets/decor/scarf.png") },
+    DecorDef { id: "necklace", name: "项链", behind: false, png: include_bytes!("../assets/decor/necklace.png") },
+    DecorDef { id: "shades", name: "大墨镜", behind: false, png: include_bytes!("../assets/decor/shades.png") },
+    DecorDef { id: "clown", name: "小丑鼻", behind: false, png: include_bytes!("../assets/decor/clown.png") },
+    DecorDef { id: "bandage", name: "创可贴", behind: false, png: include_bytes!("../assets/decor/bandage.png") },
+    DecorDef { id: "halo", name: "光环", behind: false, png: include_bytes!("../assets/decor/halo.png") },
+    DecorDef { id: "devil", name: "恶魔角", behind: false, png: include_bytes!("../assets/decor/devil.png") },
+    DecorDef { id: "antler", name: "鹿角", behind: false, png: include_bytes!("../assets/decor/antler.png") },
+    DecorDef { id: "bunny", name: "垂耳兔", behind: false, png: include_bytes!("../assets/decor/bunny.png") },
+    DecorDef { id: "grad", name: "学士帽", behind: false, png: include_bytes!("../assets/decor/grad.png") },
+    DecorDef { id: "conical", name: "斗笠", behind: false, png: include_bytes!("../assets/decor/conical.png") },
+    DecorDef { id: "witch", name: "女巫帽", behind: false, png: include_bytes!("../assets/decor/witch.png") },
+    DecorDef { id: "sprout", name: "小芽", behind: false, png: include_bytes!("../assets/decor/sprout.png") },
+    DecorDef { id: "antenna", name: "触角", behind: false, png: include_bytes!("../assets/decor/antenna.png") },
+    DecorDef { id: "afro", name: "爆炸头", behind: true, png: include_bytes!("../assets/decor/afro.png") },
+    DecorDef { id: "tail", name: "恶魔尾", behind: false, png: include_bytes!("../assets/decor/tail.png") },
+];
 
 /// onboarding 教学气泡的停留时长。
 /// ⚠️ 必须是**定时收**而不是"等下个气泡顶掉"：教学气泡会压住右上角那一块图标，
@@ -910,6 +942,14 @@ struct State {
     drop_ghost: Option<GhostApp>,
     /// 拖窗口进环：当前正被拖动、等待落盘的窗口（None = 没有窗口在拖）
     window_capture: Option<WindowCapture>,
+    /// 已穿上的装饰（`DECORS` 的 id；存 ini `decor=`，可多件叠加）
+    decor: Vec<String>,
+    /// 点中心头像进入的「装饰轮盘」模式（内环图标换成装饰素材）
+    decor_mode: bool,
+    /// 装饰轮盘当前页（8 个/页）
+    decor_page: usize,
+    /// 当前页里被悬停的槽（0..本页数量）
+    decor_hover: Option<usize>,
     /// 光标当前正悬停的磁贴（高亮严格跟随：移出即灭，与粘性的 active_app 解耦）
     hover_now: Option<usize>,
 
@@ -1432,6 +1472,10 @@ impl State {
             chip_ghost_a: 0.0,
             drop_ghost: None,
             window_capture: None,
+            decor: Vec::new(),
+            decor_mode: false,
+            decor_page: 0,
+            decor_hover: None,
             hover_now: None,
             active_app: None,
             hover_chip: None,
@@ -2717,6 +2761,388 @@ unsafe fn draw_hub_face(st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, pa
     }
 }
 
+// ═════════════════════ 装饰（中心头像的帽子 / 眼镜 / 腮红…） ═════════════════════
+//
+// 素材**不是用 GDI 重画**的：直接从 my-pet 的配饰原型（`docs/皮皮配饰-原型v2`）
+// 导出成 256² 透明 PNG（球心 128,128、球半径 100），运行期用 WIC 解码一次、
+// 缩到 128² 缓存。这样两边几何/配色逐像素同源；那边加配饰只要重跑导出脚本。
+//
+// 交互（用户 2026-11-10）：点中心头像 → 轮盘展示装饰素材，点一下穿/脱，可多件叠加。
+// 装饰槽带一块浅色底 + 细边（纯素材在盘面上会「看不见」），已穿戴的边变墨色 + 右下角一个点。
+
+const DECOR_PER_PAGE: usize = 8;
+
+struct DecorTex {
+    w: u32,
+    h: u32,
+    /// 素材内容（alpha>6）包围盒：槽位里按它居中/缩放，不然帽子会贴着格子上沿
+    bx: f32,
+    by: f32,
+    bw: f32,
+    bh: f32,
+    /// 直通 alpha 的 BGRA（与 buffer 的绘制约定一致）
+    px: Vec<u8>,
+}
+
+static DECOR_TEX: std::sync::OnceLock<Vec<Option<DecorTex>>> = std::sync::OnceLock::new();
+
+unsafe fn decode_decor_png(png: &[u8]) -> Option<DecorTex> {
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, IWICImagingFactory, WICBitmapInterpolationModeHighQualityCubic,
+        WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    let dbg = std::env::var_os("RL_DECORDBG").is_some();
+    let factory: IWICImagingFactory = match CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) {
+        Ok(f) => f,
+        Err(e) => { if dbg { eprintln!("[decor] factory {e:?}"); } return None; }
+    };
+    // WIC 自己 CreateStream 出来的内存流在本机 Write 恒失败 → 用 SHCreateMemStream
+    let Some(stream) = windows::Win32::UI::Shell::SHCreateMemStream(Some(png)) else {
+        if dbg { eprintln!("[decor] memstream null"); }
+        return None;
+    };
+    let decoder = match factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand) {
+        Ok(d) => d,
+        Err(e) => { if dbg { eprintln!("[decor] decoder {e:?}"); } return None; }
+    };
+    let frame = match decoder.GetFrame(0) {
+        Ok(f) => f,
+        Err(e) => { if dbg { eprintln!("[decor] frame {e:?}"); } return None; }
+    };
+    // 统一缩到 128²：画到 43px 的球上最大也就 ~112px 宽，够用；34 张常驻只有 ~2MB。
+    let scaler = match factory.CreateBitmapScaler() {
+        Ok(s) => s,
+        Err(e) => { if dbg { eprintln!("[decor] scaler {e:?}"); } return None; }
+    };
+    if let Err(e) = scaler.Initialize(&frame, 128, 128, WICBitmapInterpolationModeHighQualityCubic) {
+        if dbg { eprintln!("[decor] scaler init {e:?}"); }
+        return None;
+    }
+    let mut px = vec![0u8; 128 * 128 * 4];
+    if let Err(e) = scaler.CopyPixels(std::ptr::null(), 128 * 4, &mut px) {
+        if dbg { eprintln!("[decor] copy {e:?}"); }
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (128u32, 128u32, 0u32, 0u32);
+    for y in 0..128u32 {
+        for x in 0..128u32 {
+            if px[(y as usize * 128 + x as usize) * 4 + 3] > 6 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    Some(DecorTex {
+        w: 128,
+        h: 128,
+        bx: x0 as f32,
+        by: y0 as f32,
+        bw: (x1 - x0 + 1) as f32,
+        bh: (y1 - y0 + 1) as f32,
+        px,
+    })
+}
+
+/// 首次进入装饰轮盘时解码一次（34 张，~20ms），之后常驻。
+fn decor_tex() -> &'static Vec<Option<DecorTex>> {
+    DECOR_TEX.get_or_init(|| unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+        DECORS.iter().map(|d| decode_decor_png(d.png)).collect()
+    })
+}
+
+fn decor_equipped(st: &State, id: &str) -> bool {
+    st.decor.iter().any(|d| d == id)
+}
+
+/// 当前页的全局装饰下标。
+/// **已穿戴的排最前面**（用户 2026-11-10）：进装饰轮盘第一页先看到自己身上的，
+/// 不用翻页去找；脱下来就自动回到未穿戴段。
+fn decor_page_items(st: &State) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::with_capacity(DECORS.len());
+    for (i, d) in DECORS.iter().enumerate() {
+        if decor_equipped(st, d.id) {
+            order.push(i);
+        }
+    }
+    for (i, d) in DECORS.iter().enumerate() {
+        if !decor_equipped(st, d.id) {
+            order.push(i);
+        }
+    }
+    let start = (st.decor_page * DECOR_PER_PAGE).min(order.len());
+    order[start..(start + DECOR_PER_PAGE).min(order.len())].to_vec()
+}
+
+/// 装饰槽中心：**与内环应用图标同半径、同起始角**，从正上方开始等分一圈。
+fn decor_slot_center(i: usize, n: usize, r: f32) -> (f32, f32) {
+    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n.max(1) as f32;
+    (CC + r * a.cos(), CC + r * a.sin())
+}
+
+/// 光标命中当前页的哪个装饰槽。
+fn decor_slot_at(st: &State, px: f32, py: f32) -> Option<usize> {
+    let n = decor_page_items(st).len();
+    let (r_icon, icon) = ring_layout(st.apps.len());
+    for i in 0..n {
+        let (cx, cy) = decor_slot_center(i, n, r_icon);
+        let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+        if d <= icon * 0.5 + 5.0 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn decor_hub_hit(px: f32, py: f32) -> bool {
+    ((px - CC).powi(2) + (py - CC).powi(2)).sqrt() <= HUB_R * 1.05
+}
+
+/// 把一张直通 alpha 的 BGRA 素材双线性缩放着画到缓冲（预乘采样，透明边不发黑）。
+fn blend_decor_sprite_tinted(
+    buf: &mut [u8], tex: &DecorTex, cx: f32, cy: f32, target_w: f32, alpha: f32,
+    tint: Option<(f32, f32, f32)>,
+) {
+    if alpha <= 0.004 || tex.w == 0 || tex.h == 0 {
+        return;
+    }
+    let scale = target_w / tex.w as f32;
+    let dw = (tex.w as f32 * scale).round() as i32;
+    let dh = (tex.h as f32 * scale).round() as i32;
+    if dw <= 0 || dh <= 0 {
+        return;
+    }
+    let x0 = cx - dw as f32 * 0.5;
+    let y0 = cy - dh as f32 * 0.5;
+    let w = CANVAS as i32;
+    let tw = tex.w as i32;
+    let th = tex.h as i32;
+    let texel = |tx: i32, ty: i32| -> (f32, f32, f32, f32) {
+        let tx = tx.clamp(0, tw - 1) as usize;
+        let ty = ty.clamp(0, th - 1) as usize;
+        let o = (ty * tex.w as usize + tx) * 4;
+        (tex.px[o] as f32, tex.px[o + 1] as f32, tex.px[o + 2] as f32, tex.px[o + 3] as f32 / 255.0)
+    };
+    for dy in 0..dh {
+        let yy = y0.round() as i32 + dy;
+        if yy < 0 || yy >= w {
+            continue;
+        }
+        let fy = ((dy as f32 + 0.5) / scale - 0.5).max(0.0);
+        let iy = fy.floor() as i32;
+        let wy = fy - iy as f32;
+        for dx in 0..dw {
+            let xx = x0.round() as i32 + dx;
+            if xx < 0 || xx >= w {
+                continue;
+            }
+            let fx = ((dx as f32 + 0.5) / scale - 0.5).max(0.0);
+            let ix = fx.floor() as i32;
+            let wx = fx - ix as f32;
+            let (b00, g00, r00, a00) = texel(ix, iy);
+            let (b10, g10, r10, a10) = texel(ix + 1, iy);
+            let (b01, g01, r01, a01) = texel(ix, iy + 1);
+            let (b11, g11, r11, a11) = texel(ix + 1, iy + 1);
+            let w00 = (1.0 - wx) * (1.0 - wy);
+            let w10 = wx * (1.0 - wy);
+            let w01 = (1.0 - wx) * wy;
+            let w11 = wx * wy;
+            let a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
+            if a <= 0.004 {
+                continue;
+            }
+            let o = (yy as usize * w as usize + xx as usize) * 4;
+            if let Some((tr, tg, tb)) = tint {
+                // 剪影（阴影）：只取 alpha，不取颜色
+                blend_over(buf, o, tr, tg, tb, a * alpha);
+                continue;
+            }
+            let b = (b00 * a00 * w00 + b10 * a10 * w10 + b01 * a01 * w01 + b11 * a11 * w11) / a;
+            let g = (g00 * a00 * w00 + g10 * a10 * w10 + g01 * a01 * w01 + g11 * a11 * w11) / a;
+            let r = (r00 * a00 * w00 + r10 * a10 * w10 + r01 * a01 * w01 + r11 * a11 * w11) / a;
+            blend_over(buf, o, r, g, b, a * alpha);
+        }
+    }
+}
+
+fn blend_decor_sprite(buf: &mut [u8], tex: &DecorTex, cx: f32, cy: f32, target_w: f32, alpha: f32) {
+    blend_decor_sprite_tinted(buf, tex, cx, cy, target_w, alpha, None);
+}
+
+/// 在素材外缘补一圈纸色描边（膨胀 alpha 得到）。
+/// 为什么需要：PiPie 的中心球是**深色**的，而 my-pet 的眼镜/墨镜/眼罩是墨线画的白球配饰，
+/// 直接叠上去会「黑吃黑」。这圈纸色只贴素材轮廓，不是槽位底板。
+fn blend_decor_outline(
+    buf: &mut [u8], tex: &DecorTex, cx: f32, cy: f32, target_w: f32,
+    color: (u8, u8, u8), alpha: f32,
+) {
+    if alpha <= 0.004 || tex.w == 0 {
+        return;
+    }
+    let scale = target_w / tex.w as f32;
+    let dw = (tex.w as f32 * scale).round() as i32;
+    let dh = (tex.h as f32 * scale).round() as i32;
+    let x0 = cx - dw as f32 * 0.5;
+    let y0 = cy - dh as f32 * 0.5;
+    let w = CANVAS as i32;
+    let aat = |fx: f32, fy: f32| -> f32 {
+        let tx = fx.round().clamp(0.0, (tex.w - 1) as f32) as usize;
+        let ty = fy.round().clamp(0.0, (tex.h - 1) as f32) as usize;
+        tex.px[(ty * tex.w as usize + tx) * 4 + 3] as f32 / 255.0
+    };
+    for dy in 0..dh {
+        let yy = y0.round() as i32 + dy;
+        if yy < 0 || yy >= w {
+            continue;
+        }
+        let fy = ((dy as f32 + 0.5) / scale - 0.5).max(0.0);
+        for dx in 0..dw {
+            let xx = x0.round() as i32 + dx;
+            if xx < 0 || xx >= w {
+                continue;
+            }
+            let fx = ((dx as f32 + 0.5) / scale - 0.5).max(0.0);
+            if aat(fx, fy) > 0.35 {
+                continue;
+            }
+            let mut near = 0.0f32;
+            for (ox, oy) in [
+                (-1.7, 0.0), (1.7, 0.0), (0.0, -1.7), (0.0, 1.7),
+                (-1.2, -1.2), (1.2, -1.2), (-1.2, 1.2), (1.2, 1.2),
+            ] {
+                near = near.max(aat(fx + ox, fy + oy));
+            }
+            if near > 0.45 {
+                let o = (yy as usize * w as usize + xx as usize) * 4;
+                blend_over(buf, o, color.0 as f32, color.1 as f32, color.2 as f32, near * alpha);
+            }
+        }
+    }
+}
+
+/// 槽位里的素材：按**内容包围盒**居中 + 等比塞进 box_size（不是按整张画布，
+/// 否则帽子会贴着格子上沿、小的手/耳会缩成一个点）。
+fn blend_decor_bbox(buf: &mut [u8], tex: &DecorTex, cx: f32, cy: f32, box_size: f32, alpha: f32) {
+    let m = tex.bw.max(tex.bh).max(1.0);
+    let scale = box_size / m;
+    let full_w = tex.w as f32 * scale;
+    let bcx = tex.bx + tex.bw * 0.5;
+    let bcy = tex.by + tex.bh * 0.5;
+    let dcx = cx - (bcx - tex.w as f32 * 0.5) * scale;
+    let dcy = cy - (bcy - tex.h as f32 * 0.5) * scale;
+    blend_decor_sprite(buf, tex, dcx, dcy, full_w, alpha);
+}
+
+/// 已穿戴的装饰：`r` = 当前头像球半径；素材 128px 对应球半径 50px → 目标宽 = r*2.56。
+fn draw_equipped_decor(st: &State, buf: &mut [u8], behind: bool, r: f32, pal: &Pal) {
+    let texs = decor_tex();
+    for (i, d) in DECORS.iter().enumerate() {
+        if d.behind != behind || !decor_equipped(st, d.id) {
+            continue;
+        }
+        if let Some(Some(t)) = texs.get(i) {
+            blend_decor_outline(buf, t, CC, CC, r * 2.56, pal.paper, 0.92);
+            blend_decor_sprite(buf, t, CC, CC, r * 2.56, 1.0);
+        }
+    }
+}
+
+/// 装饰轮盘：一圈**纯素材**，没有底板/边框。未穿戴 42% 透明，悬停恢复实色并放大。
+unsafe fn draw_decor_ring(st: &State, buf: &mut [u8], pal: &Pal) {
+    let texs = decor_tex();
+    let items = decor_page_items(st);
+    let n = items.len();
+    // 与内环应用**同一套几何**：同样的环半径、同样的底板边长（用户 2026-11-10：
+    //「边框应该跟正常轮盘里内环应用一样大」）。
+    let (r_icon, icon_draw) = ring_layout(st.apps.len());
+    for (slot, &gi) in items.iter().enumerate() {
+        let d = &DECORS[gi];
+        let Some(Some(t)) = texs.get(gi) else { continue };
+        let hover = st.decor_hover == Some(slot);
+        let on = decor_equipped(st, d.id);
+        let (cx, cy) = decor_slot_center(slot, n, r_icon);
+        let sel = if hover {
+            1.0
+        } else if on {
+            0.35
+        } else {
+            0.0
+        };
+        let side = icon_draw * (1.0 + 0.10 * if hover { 1.0 } else { 0.0 });
+        let half = side * 0.5;
+        flat_round_rect(
+            buf,
+            cx,
+            cy,
+            half,
+            half,
+            side * TILE_RAD_K,
+            pal.paper,
+            (1.4 + 1.6 * sel) * K,
+            mixc(mixc(pal.paper, pal.ink, 0.34), pal.ink, sel),
+            1.0,
+            (3.0 + 2.0 * sel) * K,
+            0.20 + 0.10 * sel,
+            1.5 * K,
+            1.0,
+        );
+        // 素材按内容包围盒居中，占格子约 72%（留一圈内边距，和 app 图标一致）
+        blend_decor_bbox(buf, t, cx, cy, side * 0.80, 1.0);
+        if on {
+            // 已穿戴：右下角一个小墨点（状态点，不是边框）
+            flat_circle(
+                buf, cx + half * 0.58, cy + half * 0.58, 2.4,
+                pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, 1.0,
+            );
+        }
+    }
+    // 页码点：放在图标环外沿下方
+    let pages = (DECORS.len() + DECOR_PER_PAGE - 1) / DECOR_PER_PAGE;
+    if pages > 1 {
+        let gap = 8.0;
+        let total = (pages - 1) as f32 * gap;
+        let y = CC + r_icon + icon_draw * 0.5 + 18.0;
+        for p in 0..pages {
+            let x = CC - total * 0.5 + p as f32 * gap;
+            let on = p == st.decor_page.min(pages - 1);
+            let col = if on { pal.ink } else { mixc(pal.paper, pal.ink, 0.25) };
+            flat_circle(buf, x, y, if on { 2.6 } else { 2.0 }, col, 0.0, col, 0.0, 0.0, 0.0, 0.0, 1.0);
+        }
+    }
+}
+
+/// 悬停装饰时在头像下方报名字（槽位只有素材，没有文字）。
+unsafe fn draw_decor_label(st: &State, buf: &mut [u8], pal: &Pal) {
+    let Some(slot) = st.decor_hover else { return };
+    let items = decor_page_items(st);
+    let Some(&gi) = items.get(slot) else { return };
+    let d = &DECORS[gi];
+    let mark = if decor_equipped(st, d.id) { " · 已穿戴" } else { "" };
+    let txt = format!("{}{}", d.name, mark);
+    let cx = CC as i32;
+    let cy = (CC + HUB_R + 16.0) as i32;
+    // 玻璃盘上文字可能压到深色桌面 → 先描一圈纸色，再画墨字（不是底板，只提高对比）
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        draw_text(
+            st, buf, cx + dx, cy + dy, &txt, 13, 500,
+            pal.paper.0, pal.paper.1, pal.paper.2, 210, 0, 0,
+        );
+    }
+    draw_text(
+        st, buf, cx, cy, &txt, 13, 500,
+        pal.ink.0, pal.ink.1, pal.ink.2, 240, 0, 0,
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  液态玻璃（材质 = 玻璃；用户 2026-10-17 定的两件事：**淡**、**只做轮盘**）
 // ═══════════════════════════════════════════════════════════════════
@@ -3757,8 +4183,8 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                   "发现新版本", 20, 700, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 280, 0);
         let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
         let sub = match st.update_st {
-            5 => format!("v{} · 已下载并校验完成", st.update_latest),
-            6 => format!("v{} · 正在下载 {pct}%", st.update_latest),
+            5 => format!("v{} · 下载完成，重启后生效", st.update_latest),
+            6 => format!("v{} · {}", st.update_latest, update_dl_line()),
             4 if !st.update_msg.is_empty() => format!("v{} · {}", st.update_latest, st.update_msg),
             _ => format!("v{} · 建议尽快更新", st.update_latest),
         };
@@ -3767,9 +4193,19 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         if st.update_st == 6 {
             let (bx0, bx1, by) = (x0 + 64.0, x1 - 26.0, y0 + 74.0);
             rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
-            let fw = (bx1 - bx0) * (pct.min(100) as f32 / 100.0);
-            if fw > 1.0 {
-                rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+            let span = bx1 - bx0;
+            if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
+                let fw = span * (pct.min(100) as f32 / 100.0);
+                if fw > 1.0 {
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+                }
+            } else if span > 4.0 {
+                // 总大小未知（chunked）：一条游标来回走，证明「在动」，不是卡 0%
+                let ph = (now_s() * 0.9) % 2.0;
+                let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
+                let seg = span * 0.32;
+                let sx = bx0 + (span - seg) * k;
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, 1.0, 1.0, 0.0, UPD_INK, 0.75);
             }
         }
         for (i, t) in [
@@ -3826,25 +4262,36 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
     let cy = ((y0 + y1) * 0.5) as i32;
     match st.update_st {
         6 => {
-            draw_text(st, buf, tx, cy - 5, "正在下载", 14, 700,
+            let (title, val) = update_dl_short();
+            draw_text(st, buf, tx, cy - 5, title, 14, 700,
                       UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 100, 0);
             let vs = format!("v{}", st.update_latest);
-            draw_text(st, buf, tx + 62, cy - 5, &vs, 13, 500,
+            draw_text(st, buf, tx + 76, cy - 5, &vs, 13, 500,
                       UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 70, 0);
-            let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
-            let ps = format!("{pct}%");
-            draw_text(st, buf, (x1 - 16.0) as i32, cy - 5, &ps, 13, 500,
-                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+            if !val.is_empty() {
+                draw_text(st, buf, (x1 - 20.0) as i32, cy - 5, &val, 13, 500,
+                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+            }
             let (bx0, bx1, by) = (x0 + 52.0, x1 - 16.0, y1 - 9.0);
             rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
-            let fw = (bx1 - bx0) * (pct.min(100) as f32 / 100.0);
-            if fw > 1.0 {
-                rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+            let span = bx1 - bx0;
+            if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
+                let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
+                let fw = span * (pct.min(100) as f32 / 100.0);
+                if fw > 1.0 {
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+                }
+            } else if span > 4.0 {
+                let ph = (now_s() * 0.9) % 2.0;
+                let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
+                let seg = span * 0.32;
+                let sx = bx0 + (span - seg) * k;
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, 1.0, 1.0, 0.0, UPD_INK, 0.75);
             }
         }
         _ => {
             let (title, btn) = match st.update_st {
-                5 => ("已下载，重启生效", "重启"),
+                5 => ("下载完成", "重启"),
                 4 => ("更新失败", "重试"),
                 _ => ("发现新版本", "更新"),
             };
@@ -3908,7 +4355,10 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // 投影刻意收紧（dy 6 / blur 18 → 最远只到 r+30），避免在深色桌面上
     // 显出一圈「半透明色带」。真正的高级感来自干净的边界，不是大范围光晕。
     // 盘沿：纸面是墨灰细线；玻璃是**白边**（玻璃边缘就是一道反光，不是墨线）
-    let (rim_col, rim_a) = if st.glass {
+    // 盘面材质**只跟用户设置走**：装饰轮盘不再强制纸面（用户 2026-11-10：
+    //「保持样式一致，不要一会玻璃一会纸质」）。装饰槽自带底板，玻璃下也看得清。
+    let paper_disc = !st.glass;
+    let (rim_col, rim_a) = if !paper_disc {
         ((250u8, 250u8, 252u8), 0.42)
     } else {
         (mixc(pal.paper, pal.ink, 0.40), 1.0)
@@ -3930,7 +4380,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // 液态玻璃：把盘面换成"模糊桌面 + tint"。
     // ⚠️ 位置很关键 —— 必须在 `flat_circle` 之后、**任何图标之前**：
     //    早了没盘可盖，晚了会把图标/头像一起盖掉。
-    if st.glass {
+    if !paper_disc {
         glass_disc(&*st, buf, disc_r, st.glass_liquid);
     }
 
@@ -3961,7 +4411,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // ⚠️ 玻璃下**必须跳过**：这层是不透明的纸色，会把整块玻璃冲成一块灰板
     //    （第一版就是这样，盘面 191 灰、一点背景都透不出来）。玻璃的"厚度"
     //    由 `glass_px` 里的边缘高光表达，不需要纸面渐变。
-    if !st.glass {
+    if paper_disc {
         disc_gradient(
             buf,
             CC,
@@ -3976,7 +4426,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // 参考图（TheRing）用同一条带子解决对比度；带子同时给图标划出统一的轨道。
     // 玻璃下改成**极淡**的一层墨（浅色压暗 / 深色提亮 ≈6%）：轨道还在，
     // 但不再把背景糊死。
-    if st.glass {
+    if !paper_disc {
         // 玻璃下**不画环带**（用户 2026-10-17：「轮盘还分层了」）——
         // 那是一条以头像球为圆心的暗环，在近乎透明的盘面上就是一圈同心圆，
         // 看着像"盘里还有一层盘"。图标本身有圆角底板，够对比度了。
@@ -3994,7 +4444,19 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
 
     // ── 2. 中心头像：GrokBot 式表情球 ──
     //    几何/动效全部在 `draw_hub_face` 里（与「关于」页的 logo 共用）。
+    //    装饰分两层：球后的（爆炸头/翅膀）先画、球前的（帽子/眼镜…）后画。
+    draw_equipped_decor(&*st, buf, true, HUB_R * pop, &pal);
     draw_hub_face(&*st, buf, CC, CC, HUB_R * pop, &pal, now);
+    draw_equipped_decor(&*st, buf, false, HUB_R * pop, &pal);
+
+    // ── 2b. 装饰轮盘：点中心头像展开，内环位置换成装饰槽 ──
+    if st.decor_mode {
+        draw_decor_ring(&*st, buf, &pal);
+        draw_decor_label(&*st, buf, &pal);
+        draw_bubble(st, buf, &pal);
+        draw_upd_ui(st, buf);
+        return;
+    }
 
     // ── 3. 应用：真实图标直接立在盘面上；选中态 = 图标背后的柔和高亮方 ──
     let n_sel = n;
@@ -5215,6 +5677,27 @@ fn drop_slot_app(st: &State, px: f32, py: f32) -> Option<usize> {
     }
     let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
     slot_at_deg(st, deg, n)
+}
+
+/// 拖拽落点（整条扇区）：光标落在某个应用「内环图标 → 外环外沿」这段环带里，
+/// 就按角度归到它。图标本身很小，用户经常是拖到图标旁边 / 外环空白处再松手 ——
+/// 「拖到哪个内环方向，就进哪一圈外环」靠这条兜住（2026-11-09 用户要求）。
+fn drop_band_app(st: &State, px: f32, py: f32) -> Option<usize> {
+    let n = eff_apps(st);
+    if n == 0 {
+        return None;
+    }
+    let dx = px - CC;
+    let dy = py - CC;
+    let r = (dx * dx + dy * dy).sqrt();
+    let (r_icon, icon_sz) = ring_layout(n);
+    let (_r_in, r_out) = ring_radii(n);
+    if r < r_icon - icon_sz * 0.5 - 18.0 || r > r_out + 10.0 {
+        return None;
+    }
+    let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
+    let i = app_at_deg(st, deg, n)?;
+    (i < st.apps.len()).then_some(i)
 }
 
 /// 拖拽落点（外环）＝按**角度吸附**到最近的外环段（允许落在段间的缝里）。
@@ -8913,6 +9396,65 @@ unsafe fn dump_all(dir: &str) {
             st.chip_seg_app = usize::MAX;
         }
 
+        // ── 2h2b) 拖入文件夹（同样出外环幽灵，名字取载荷名）──
+        {
+            st.active_app = Some(hi);
+            st.drop_suggest = None;
+            st.drop_target_app = Some(hi);
+            if let Ok(mut q) = DROP_PAYLOAD.lock() {
+                *q = vec![DropItem {
+                    name: "新建文件夹".to_string(),
+                    target: "C:\\新建文件夹".to_string(),
+                    is_url: false,
+                    is_dir: true,
+                }];
+            }
+            st.chip_ghost_a = 1.0;
+            st.chip_seg_app = hi;
+            let segs = chip_layout(&st, hi).0;
+            for k in 0..st.apps[hi].items.len().min(MAX_ITEMS) {
+                st.chip_seg_a[k] = segs.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
+            }
+            let buf = draw_to_buf(&mut st);
+            save_bmp(&format!("{}\\dump_drop_chip_file.bmp", dir), &buf, CANVAS, CANVAS);
+            println!("[dump] dump_drop_chip_file 拖入文件夹 → 外环幽灵（跟悬停内环）");
+            st.drop_target_app = None;
+            if let Ok(mut q) = DROP_PAYLOAD.lock() {
+                q.clear();
+            }
+            st.chip_ghost_a = 0.0;
+            st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
+            st.chip_seg_app = usize::MAX;
+        }
+
+        // ── 2h2c) 装饰：头像穿戴效果 + 装饰轮盘（纯素材、无底板）──
+        {
+            let saved_liq = st.glass_liquid;
+            let saved_theme = st.theme;
+            st.glass_liquid = false;
+            st.theme = 0;
+            st.glass = true;
+            apply_theme(&mut st);
+            st.decor = vec!["cowboy".to_string(), "blush".to_string()];
+            st.decor_mode = false;
+            let ntex = decor_tex().iter().filter(|t| t.is_some()).count();
+            println!("[dump] decor tex {}/{}", ntex, DECORS.len());
+            let buf = draw_to_buf(&mut st);
+            save_bmp(&format!("{}\\dump_decor_hub.bmp", dir), &buf, CANVAS, CANVAS);
+            st.decor_mode = true;
+            st.decor_page = 0;
+            st.decor_hover = Some(2);
+            let buf = draw_to_buf(&mut st);
+            save_bmp(&format!("{}\\dump_decor_ring.bmp", dir), &buf, CANVAS, CANVAS);
+            println!("[dump] dump_decor_hub / dump_decor_ring 装饰穿戴 + 装饰轮盘");
+            st.decor_mode = false;
+            st.decor_hover = None;
+            st.decor.clear();
+            st.glass_liquid = saved_liq;
+            st.theme = saved_theme;
+            apply_theme(&mut st);
+        }
+
         // ── 2h3) loading：内环应用本体（图标淡出 + 三个跳动的点）──
         {
             st.active_app = Some(hi);
@@ -9148,10 +9690,16 @@ unsafe fn dump_all(dir: &str) {
 
         st.update_st = 6;
         UPDATE_PROGRESS.store(62, Ordering::Relaxed);
+        UPDATE_PHASE.store(2, Ordering::Relaxed);
+        UPDATE_TOTAL.store(1_205_248, Ordering::Relaxed);
+        UPDATE_BYTES.store(747_254, Ordering::Relaxed);
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}{}dump_update_progress.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
 
         UPDATE_PROGRESS.store(0, Ordering::Relaxed);
+        UPDATE_PHASE.store(0, Ordering::Relaxed);
+        UPDATE_TOTAL.store(0, Ordering::Relaxed);
+        UPDATE_BYTES.store(0, Ordering::Relaxed);
         st.update_st = 3;
         st.upd_modal = true;
         let buf = draw_to_buf(&mut st);
@@ -9657,6 +10205,14 @@ unsafe fn read_persistent(st: &mut State) {
             } else if let Some(v) = get("clip_app=") {
                 // 轮盘上的「剪贴板」条目：缺省 0 = 该有；2 = 用户自己删过，别再塞回去
                 st.clip_app = v.parse::<u8>().unwrap_or(0).min(2);
+            } else if let Some(v) = get("decor=") {
+                // 已穿戴装饰：逗号分隔的 DECORS id；未知 id 直接忽略（降级/改版安全）
+                st.decor = v
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| DECORS.iter().any(|d| d.id == *x))
+                    .map(|x| x.to_string())
+                    .collect();
             } else if let Some(v) = get("note=") {
                 // 缺省 = 开（和剪贴板同一个理由：装了就该有）
                 st.note_on = v != "0";
@@ -10271,9 +10827,15 @@ unsafe fn pe_png_icon(path: &str) -> Option<(usize, Vec<u8>)> {
     let png = d.get(off..off + best.unwrap().0)?.to_vec();
 
     // WIC 解码 PNG → BGRA 直通 alpha
-    let factory: IWICImagingFactory =
-        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
-    let stream = factory.CreateStream().ok()?;
+    let dbg = std::env::var_os("RL_DECORDBG").is_some();
+    let factory: IWICImagingFactory = match CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) {
+        Ok(f) => f,
+        Err(e) => { if dbg { eprintln!("[decor] factory {e:?}"); } return None; }
+    };
+    let stream = match factory.CreateStream() {
+        Ok(s) => s,
+        Err(e) => { if dbg { eprintln!("[decor] stream {e:?}"); } return None; }
+    };
     if stream.Write(png.as_ptr() as *const c_void, png.len() as u32, None).is_err() {
         return None;
     }
@@ -11865,23 +12427,42 @@ fn chip_preview_segs(st: &State, ai: usize, dj: usize, ins: usize) -> Vec<(f32, 
     out
 }
 
+/// 拖进来的东西会落到哪个应用的外环（幽灵胶囊画在谁身上）。
+/// 优先跟光标：拖到某个内环图标 / 它的外环胶囊上 → 那一圈；
+/// 光标不在任何目标上 → 回到按载荷类型识别出的宿主（文件夹/浏览器/已有宿主）。
+fn drop_chip_target(st: &State) -> Option<usize> {
+    if let Some(ai) = st.drop_target_app.filter(|&a| a < st.apps.len()) {
+        return Some(ai);
+    }
+    st.drop_suggest
+}
+
+/// 当前拖放载荷的第一项（文件 / 文件夹 / 网址）；拖窗口时为空。
+fn drop_payload_first() -> Option<DropItem> {
+    DROP_PAYLOAD.lock().ok()?.first().cloned()
+}
+
 /// 拖进来的东西**认得出宿主**（拖 explorer 窗口 / 浏览器标签）→ 外环末尾要新增一条。
 /// 这里给出那条的**名字**：必须与落盘时 `capture_window` 用的一致
 /// （都是 `clamp_name(window_title)`），否则预览名和真加进去的名字对不上。
 ///
-/// 认不出宿主（新应用）那条路走的是内环 `drop_ghost` 幽灵磁贴 —— 两者是同一个语义的
-/// 内外两环版本，**缺了外环这半边，用户就完全不知道松手会不会成功**（2026-10-16 用户报）。
+/// 文件/文件夹/网址也走这一份：名字取载荷名（文件夹名 / 文件 stem / 网址 host）。
+/// 目标跟着光标走（`drop_chip_target`）—— 拖到哪个内环上，占位就出现在它的外环。
 fn drop_ghost_chip_name(st: &State, ai: usize, m: usize) -> Option<String> {
-    if st.drop_suggest != Some(ai) || m >= MAX_ITEMS {
+    if drop_chip_target(st) != Some(ai) || m >= MAX_ITEMS {
         return None;
     }
-    let w = st.window_capture.as_ref()?;
-    let n = clamp_name(&w.title);
-    if n.is_empty() {
-        Some(clamp_name(&w.exe))
-    } else {
-        Some(n)
+    if let Some(w) = st.window_capture.as_ref() {
+        let n = clamp_name(&w.title);
+        return Some(if n.is_empty() { clamp_name(&w.exe) } else { n });
     }
+    let it = drop_payload_first()?;
+    // 已经在外环里 → 不预告（松手会报「已存在」，预览也别说能加）
+    if st.apps[ai].items.iter().any(|x| x.target.eq_ignore_ascii_case(&it.target)) {
+        return None;
+    }
+    let n = clamp_name(&it.name);
+    Some(if n.is_empty() { clamp_name(&it.target) } else { n })
 }
 
 /// 外环排版用的名字列表（含幽灵名 —— 它**参与排版**，所以已有胶囊会整体让位）。
@@ -13016,6 +13597,15 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
         st.hover_chip = None;
         return;
     }
+    // 装饰轮盘：只认装饰槽，别去点亮下面的应用
+    if st.decor_mode {
+        st.hit_app = None;
+        st.hover_now = None;
+        st.hover_chip = None;
+        st.active_app = None;
+        st.decor_hover = decor_slot_at(st, px as f32, py as f32);
+        return;
+    }
     let dx = px as f32 - CC;
     let dy = py as f32 - CC;
     let n_ap = st.apps.len();
@@ -13691,6 +14281,9 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
         return;
     }
     let hwnd = HWND(rh as *mut c_void);
+    // 上一次「启动亮相 / 拖入完成」排的自动收起**作废**：新的一次呼出从零计时，
+    // 否则启动 6 秒内再呼出，会被旧计时器在 1~2 秒后直接收掉（用户 2026-11-10 实测「刚开就没了」）。
+    st.hide_at = 0.0;
 
     // 画布钳位到虚拟屏幕
     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -13806,6 +14399,8 @@ unsafe fn close_menu_now(st: &mut State) {
     st.upd_only = false;
     st.upd_modal = false;
     st.upd_hover = 0;
+    st.decor_mode = false;
+    st.decor_hover = None;
     // 实时玻璃：先停后台抓屏，再撤掉「排除抓屏」—— 用户之后的录屏/截图里
     // 不能因为我们开过菜单就少了这个窗口
     let rh = RING_HWND.load(Ordering::Relaxed);
@@ -14001,25 +14596,38 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         }
         WM_APP_SHOW => {
             let st = state_of(hwnd);
-            if !MENU_OPEN.load(Ordering::Relaxed) {
-                let mut x = CURSOR_X.load(Ordering::Relaxed);
-                let mut y = CURSOR_Y.load(Ordering::Relaxed);
-                if x == 0 && y == 0 {
-                    let mut p = POINT::default();
-                    let _ = GetCursorPos(&mut p);
-                    x = p.x;
-                    y = p.y;
+            if MENU_OPEN.load(Ordering::Relaxed) {
+                // 轮盘已经开着（启动亮相还没收 / 常驻）→ 这次是**真正的呼出**：
+                // 接管亮相的 6 秒倒计时，否则用户刚呼出就被旧计时器收掉。
+                st.hide_at = 0.0;
+                st.last_input = now_s();
+                if st.bub_main == REVEAL_MSG {
+                    st.bub_until = 0.0;
                 }
-                show_menu(st, x, y);
-                // ⚠️ 键盘自定义触发没有 keyup：不锁定的话左键点击只会收起菜单，
-                //    表现就是「点了应用没反应」（用户 2026-11-05 报）。
-                if w.0 == 1 && MENU_OPEN.load(Ordering::Relaxed) {
+                if w.0 == 1 {
                     st.locked = true;
                     LOCKED.store(true, Ordering::SeqCst);
                 }
-                // 有新版本 → 每个版本第一次真实呼出弹一张小卡（比头像气泡强）
                 unsafe { upd_maybe_modal(st) };
+                return LRESULT(0);
             }
+            let mut x = CURSOR_X.load(Ordering::Relaxed);
+            let mut y = CURSOR_Y.load(Ordering::Relaxed);
+            if x == 0 && y == 0 {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                x = p.x;
+                y = p.y;
+            }
+            show_menu(st, x, y);
+            // ⚠️ 键盘自定义触发没有 keyup：不锁定的话左键点击只会收起菜单，
+            //    表现就是「点了应用没反应」（用户 2026-11-05 报）。
+            if w.0 == 1 && MENU_OPEN.load(Ordering::Relaxed) {
+                st.locked = true;
+                LOCKED.store(true, Ordering::SeqCst);
+            }
+            // 有新版本 → 每个版本第一次真实呼出弹一张小卡（比头像气泡强）
+            unsafe { upd_maybe_modal(st) };
             LRESULT(0)
         }
         WM_APP_HOVER => {
@@ -14132,7 +14740,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                     let items = DROP_PAYLOAD.lock().map(|q| q.clone()).unwrap_or_default();
                     compute_drop_preview(st, &items);
-                    st.drop_target_app = drop_force_app(st, sx, sy);
+                    // 归属：内环图标 / 它的外环胶囊 > 图标之间的缝（角度吸附）
+                    let n_ap = st.apps.len();
+                    st.drop_target_app = drop_force_app(st, sx, sy)
+                        .filter(|&a| a < n_ap)
+                        .or_else(|| drop_slot_app(st, px, py).filter(|&a| a < n_ap))
+                        .or_else(|| drop_band_app(st, px, py));
                     // 文件悬停在环上 = 收下前的「忙碌」；drag_step 在拖放开始时
                     // 可能设过「紧张」，进环就放松下来
                     set_mood(st, 0);
@@ -14159,7 +14772,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     // ⚠️ 必须在 take 幽灵**之前**算落点：幽灵在场时按 n+1 排布，
                     //    幽灵槽的索引 = apps.len()。take 之后再算就退回 n 排布、永远命中不到。
                     let n_ap = st.apps.len();
-                    let over_tile = drop_slot_app(st, px, py);
+                    let over_slot = drop_slot_app(st, px, py);
+                    // 归属优先看**光标下是谁**：内环图标 / 它的外环胶囊 / 图标缝；
+                    // 都没有才按识别结果（文件夹/浏览器宿主）落地。
+                    let over_app = drop_force_app(st, sx, sy)
+                        .filter(|&a| a < n_ap)
+                        .or_else(|| over_slot.filter(|&a| a < n_ap))
+                        .or_else(|| drop_band_app(st, px, py));
                     let ghost = st.drop_ghost.take();
                     let suggest = st.drop_suggest.take();
                     // 落点优先级：**正好压在幽灵槽上 → 建幽灵**；压在某个已有内环上 → 进它外环；
@@ -14167,24 +14786,21 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     // ⚠️ 曾经要求"必须精确丢到幽灵/高亮磁贴上"，结果用户丢到头像上 = 无操作，
                     //    体验等于坏掉（用户 2026-10-12 实测）。
                     drag_log(&format!(
-                        "drop tgt={} px={} py={} n_ap={} over_tile={:?} ghost={} suggest={:?}",
+                        "drop tgt={} px={} py={} n_ap={} over_slot={:?} over_app={:?} ghost={} suggest={:?}",
                         items.first().map(|i| i.target.clone()).unwrap_or_default(),
-                        px as i32, py as i32, n_ap, over_tile, ghost.is_some(), suggest
+                        px as i32, py as i32, n_ap, over_slot, over_app, ghost.is_some(), suggest
                     ));
                     let n = if items.is_empty() {
                         0
                     } else if let Some(g) = ghost {
-                        match over_tile {
-                            Some(idx) if idx == n_ap => create_from_ghost(st, &items, &g), // 命中幽灵槽
-                            Some(ai) => process_drop(st, &items, Some(ai)), // 压在别的内环上
-                            None => create_from_ghost(st, &items, &g),      // 盘心/空白 → 仍按幽灵建
+                        match over_app {
+                            Some(ai) if over_slot != Some(n_ap) => {
+                                process_drop(st, &items, Some(ai))
+                            }
+                            _ => create_from_ghost(st, &items, &g),
                         }
                     } else if let Some(sai) = suggest {
-                        // 认得宿主：落在别的内环上 → 归它；否则直接归**宿主应用**
-                        match over_tile {
-                            Some(ai) if ai < n_ap => process_drop(st, &items, Some(ai)),
-                            _ => process_drop(st, &items, Some(sai)),
-                        }
+                        process_drop(st, &items, Some(over_app.unwrap_or(sai)))
                     } else {
                         // 载荷本身是应用（exe/lnk）→ 经典「拖进来加个内环」；已在环里则去重跳过
                         let is_app = items
@@ -14443,6 +15059,29 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                     return LRESULT(0);
                 } else {
+                    // 装饰轮盘：Esc 退出、左右翻页（不再落到「导航应用」上）
+                    if st.decor_mode {
+                        match w.0 {
+                            KA_CLOSE => {
+                                st.decor_mode = false;
+                                st.decor_hover = None;
+                                frame(st, 255);
+                            }
+                            KA_PREV | KA_NEXT => {
+                                let pages = (DECORS.len() + DECOR_PER_PAGE - 1) / DECOR_PER_PAGE;
+                                if pages > 0 {
+                                    let d = if w.0 == KA_PREV { -1 } else { 1 };
+                                    st.decor_page =
+                                        ((st.decor_page as i32 + d).rem_euclid(pages as i32)) as usize;
+                                    st.decor_hover = None;
+                                    st.last_input = now_s();
+                                    frame(st, 255);
+                                }
+                            }
+                            _ => {}
+                        }
+                        return LRESULT(0);
+                    }
                     match w.0 {
                         KA_CLOSE => {
                             unlock(st);
@@ -14505,6 +15144,43 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
                 let x = CURSOR_X.load(Ordering::Relaxed);
                 let y = CURSOR_Y.load(Ordering::Relaxed);
+                let dpx = (x - st.win_x) as f32;
+                let dpy = (y - st.win_y) as f32;
+                if st.decor_mode {
+                    st.last_input = now_s();
+                    match decor_slot_at(st, dpx, dpy) {
+                        Some(slot) if !decor_hub_hit(dpx, dpy) => {
+                            let items = decor_page_items(st);
+                            if let Some(&gi) = items.get(slot) {
+                                let id = DECORS[gi].id.to_string();
+                                if decor_equipped(st, &id) {
+                                    st.decor.retain(|d| d != &id);
+                                } else {
+                                    st.decor.push(id);
+                                }
+                                save_settings(st);
+                                // 穿戴顺序变了 → 槽位会重排，旧的 hover 下标不再可信
+                                st.decor_hover = None;
+                            }
+                        }
+                        // 点空白 / 再点头像 = 退出装饰轮盘（不关整个菜单）
+                        _ => {
+                            st.decor_mode = false;
+                            st.decor_hover = None;
+                        }
+                    }
+                    frame(st, 255);
+                    return LRESULT(0);
+                }
+                // 点中心头像 → 展开装饰轮盘（不再当成「点空白收菜单」）
+                if !st.drop_mode && decor_hub_hit(dpx, dpy) {
+                    st.decor_mode = true;
+                    st.decor_page = 0;
+                    st.decor_hover = None;
+                    st.last_input = now_s();
+                    frame(st, 255);
+                    return LRESULT(0);
+                }
                 note_input(st, x, y);
                 update_hover(st, x, y);
                 // 仅测试：`FORCE_CHIP` >= 0 时用它顶替 hover 判定。
@@ -14637,6 +15313,35 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 4 => st.locked as usize,
                 5 => st.upd_only as usize,
                 6 => MENU_OPEN.load(Ordering::Relaxed) as usize,
+                _ => 0,
+            };
+            LRESULT(v as isize)
+        }
+        WM_APP_DECORINFO => {
+            let st = state_of(hwnd);
+            let v = match w.0 as u32 {
+                0 => ((st.decor_mode as usize) << 8) | st.decor_page,
+                1 => st.decor.len(),
+                2 => st.decor_hover.map(|i| i + 1).unwrap_or(0),
+                3 => st.decor.iter().fold(0usize, |acc, id| {
+                    match DECORS.iter().position(|d| d.id == id) {
+                        Some(i) => acc | (1usize << i),
+                        None => acc,
+                    }
+                }),
+                // 4 = 当前页 0 号槽的屏幕坐标（给自动化点按用）
+                4 => {
+                    let items = decor_page_items(st);
+                    if items.is_empty() {
+                        0
+                    } else {
+                        let (r, _) = ring_layout(st.apps.len());
+                        let (cx, cy) = decor_slot_center(0, items.len(), r);
+                        let sx = (st.win_x + cx as i32).clamp(0, 65535) as usize;
+                        let sy = (st.win_y + cy as i32).clamp(0, 65535) as usize;
+                        (sy << 16) | sx
+                    }
+                }
                 _ => 0,
             };
             LRESULT(v as isize)
@@ -14785,6 +15490,20 @@ WM_APP_DISMISS_FG => {
             // `w` = 原始增量（钩子把 `mouseData` 高 16 位当 u16 传过来，这里还原成 i16）。
             let st = state_of(hwnd);
             let d = (w.0 as u16) as i16;
+            // 装饰轮盘：滚轮 = 翻页（不是滚内环应用）
+            if st.decor_mode {
+                let pages = (DECORS.len() + DECOR_PER_PAGE - 1) / DECOR_PER_PAGE;
+                if pages > 0 {
+                    // 原始 delta：上滚为正 → 上一页（和页面自然方向一致）
+                    let step = if d > 0 { -1i32 } else { 1 };
+                    st.decor_page =
+                        ((st.decor_page as i32 + step).rem_euclid(pages as i32)) as usize;
+                    st.decor_hover = None;
+                    st.last_input = now_s();
+                    frame(st, 255);
+                }
+                return LRESULT(0);
+            }
             // 一格 = `WHEEL_DELTA`(120) = 正好转一个图标；触摸板的小增量自然变成连续滚。
             ring_scroll(st, -(d as f32 / 120.0));
             LRESULT(0)
@@ -17128,8 +17847,8 @@ fn update_status_text(st: &State) -> String {
         2 => format!("已是最新（v{}）", cur_version()),
         3 => format!("发现新版本 v{} · 点右上角「更新」", st.update_latest),
         4 => format!("检查失败：{}", st.update_msg),
-        5 => format!("新版本 v{} 已下载并校验 · 点右上角「重启并更新」", st.update_latest),
-        6 => "下载中…（校验 SHA256 后提示重启）".to_string(),
+        5 => format!("新版本 v{} 下载完成 · 点右上角「重启并更新」", st.update_latest),
+        6 => format!("v{} · {}", st.update_latest, update_dl_line()),
         _ => format!("未检查（当前 v{}）", cur_version()),
     }
 }
@@ -18395,6 +19114,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("clip_x={}\r\n", st.cl_x));
     out.push_str(&format!("clip_y={}\r\n", st.cl_y));
     out.push_str(&format!("note={}\r\n", b(st.note_on)));
+    out.push_str(&format!("decor={}\r\n", st.decor.join(",")));
     out.push_str(&format!("note_app={}\r\n", st.note_app));
     out.push_str(&format!("note_ring_pos={}\r\n", st.note_ring_pos));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
@@ -19409,6 +20129,47 @@ enum UpdateOutcome {
 
 /// 下载进度 0..=100（UI 在 setup tick 里读，避免每块都投消息）。
 static UPDATE_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 下载阶段：0 空闲 / 1 连接更新源 / 2 下载中 / 3 校验中 / 4 完成。
+/// ⚠️ 服务端可能不给 Content-Length（chunked）→ 只有百分比会一直停在 0%，
+///    必须靠阶段 + 已下字节数告诉用户「在动」（用户 2026-11-09 报卡 0% 半天）。
+static UPDATE_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static UPDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UPDATE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 下载阶段的人话（弹窗 / 更新条 / 关于页共用同一份）。
+fn update_dl_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let phase = UPDATE_PHASE.load(Relaxed);
+    match phase {
+        1 => "正在连接更新源…".to_string(),
+        2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
+            format!("下载中 {}%", UPDATE_PROGRESS.load(Relaxed))
+        }
+        2 => format!("下载中 {:.1} MB", UPDATE_BYTES.load(Relaxed) as f64 / 1_048_576.0),
+        3 => "正在校验…".to_string(),
+        4 => "下载完成".to_string(),
+        _ => "准备下载…".to_string(),
+    }
+}
+
+/// 更新条右侧的短值（「正在连接」「校验中」这类阶段没有数字就留空）。
+fn update_dl_short() -> (&'static str, String) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let phase = UPDATE_PHASE.load(Relaxed);
+    match phase {
+        1 => ("正在连接", String::new()),
+        2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
+            ("下载中", format!("{}%", UPDATE_PROGRESS.load(Relaxed)))
+        }
+        2 => (
+            "下载中",
+            format!("{:.1} MB", UPDATE_BYTES.load(Relaxed) as f64 / 1_048_576.0),
+        ),
+        3 => ("正在校验", String::new()),
+        4 => ("下载完成", String::new()),
+        _ => ("准备中", String::new()),
+    }
+}
 /// 检查成功时记下的 asset 下载地址（供随后「更新」按钮用）。
 static UPDATE_EXE_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static UPDATE_SUMS_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -26372,22 +27133,45 @@ fn start_update_check(st: &mut State, manual: bool) {
 /// 下载 + SHA256 校验 → `<exe 同目录>\.pipie-update.new`；完成后 post 状态（5 就绪 / 4 失败）。
 /// 下载 exe + 取 SHA256SUMS + 校验 + 写入 `dest`（同步，阻塞）。供后台线程与诊断 CLI 共用。
 fn download_and_verify(exe_url: &str, sums_url: &str, dest: &str) -> Result<(), String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dbg = std::env::var_os("RL_UPDDBG").is_some();
+    if dbg {
+        eprintln!("[upd] phase=1 connect {exe_url}");
+    }
+    UPDATE_PHASE.store(1, Relaxed);
+    UPDATE_BYTES.store(0, Relaxed);
+    UPDATE_TOTAL.store(0, Relaxed);
+    UPDATE_PROGRESS.store(0, Relaxed);
     let (code, bytes) = http_get_raw_cb(
         exe_url,
         Some(&mut |done, total| {
+            UPDATE_PHASE.store(2, Relaxed);
+            UPDATE_BYTES.store(done, Relaxed);
+            UPDATE_TOTAL.store(total, Relaxed);
             let p = if total > 0 {
                 ((done * 100 / total.max(1)) as u32).min(100)
             } else {
                 0
             };
-            UPDATE_PROGRESS.store(p, std::sync::atomic::Ordering::Relaxed);
+            UPDATE_PROGRESS.store(p, Relaxed);
+            if dbg && (done <= 16384 || done % 262144 < 16384) {
+                eprintln!("[upd] phase=2 {done}/{total} pct={p}");
+            }
         }),
     )
     .map_err(|e| format!("下载失败：{e}"))?;
     if code != 200 {
         return Err(format!("下载 HTTP {code}"));
     }
-    UPDATE_PROGRESS.store(100, std::sync::atomic::Ordering::Relaxed);
+    UPDATE_PHASE.store(3, Relaxed);
+    UPDATE_PROGRESS.store(100, Relaxed);
+    if dbg {
+        eprintln!(
+            "[upd] phase=3 verify total={} bytes={}",
+            UPDATE_TOTAL.load(Relaxed),
+            UPDATE_BYTES.load(Relaxed)
+        );
+    }
     let (s_code, sums) = http_get(sums_url).map_err(|e| format!("取校验文件失败：{e}"))?;
     if s_code != 200 {
         return Err(format!("校验文件 HTTP {s_code}"));
@@ -26398,6 +27182,10 @@ fn download_and_verify(exe_url: &str, sums_url: &str, dest: &str) -> Result<(), 
         return Err(format!("校验不符（期望 {want}，实际 {got}）"));
     }
     std::fs::write(dest, &bytes).map_err(|e| format!("写入失败：{e}"))?;
+    UPDATE_PHASE.store(4, Relaxed);
+    if dbg {
+        eprintln!("[upd] phase=4 done");
+    }
     Ok(())
 }
 

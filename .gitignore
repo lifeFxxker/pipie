@@ -46,6 +46,7 @@ __pycache__/
 !design/preview-chips.png
 !design/preview-live.png
 !design/preview-ring.png
+!assets/decor/*.png
 *.html
 *.jpg
 err.txt
