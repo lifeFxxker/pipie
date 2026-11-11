@@ -71,30 +71,82 @@ use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
 
 // ───────────────────────── 几何（对齐 demo-thering.html） ─────────────────────────
 
-/// ══ 全局界面缩放 ══
-/// 下面所有尺寸都写成「基准值 × K」。**要整体放大/缩小，只改这一个数。**
-/// 基准值是 K = 1.0 时的手感尺寸（盘面半径 178、图标 56 …）。
-/// 改完 `cargo build --release`，产物即 `target/release/PiPie.exe`（单文件，拷走就能用）。
-const K: f32 = 0.66;
+/// ══ 轮盘整体缩放 ══
+/// 所有尺寸都写成「基准值 × k()」。视觉基准 = `ring_scale() == 1.0`（旧版 `K = 0.66`
+/// 的手感：盘面半径 178、图标 56 …）。
+///
+/// 2026-11-11：用户报「win11 16:10 高分屏上轮盘也过小」。本进程是**系统级 DPI 感知**
+/// （`SetProcessDPIAware`），系统不会替我们放大窗口 —— 475px 的画布在高 DPI 上就是
+/// 475 物理像素。所以把「设计尺度」做成运行时量：`S = dpi/96`（夹 1..2，且保证画布
+/// 装得进屏幕），几何 / 字号 / 图标纹理全部从它派生。绘制与命中用同一套，拖放、外环
+/// 分页、装饰轮盘都不会因为缩放而错位。
+static RING_SCALE_BITS: AtomicU32 = AtomicU32::new(0); // 0 = 未初始化 → 1.0
+
+fn ring_scale() -> f32 {
+    let b = RING_SCALE_BITS.load(Ordering::Relaxed);
+    if b == 0 { 1.0 } else { f32::from_bits(b) }
+}
+fn set_ring_scale(v: f32) {
+    RING_SCALE_BITS.store(v.clamp(0.5, 3.0).to_bits(), Ordering::Relaxed);
+}
+/// 画布上写死的「裸像素」基准值 → 当前缩放（气泡 / 更新条这类元件用）。
+#[inline]
+fn pxs(v: f32) -> f32 { v * ring_scale() }
+
+/// 轮盘缩放初始化。`PIPIE_RING_SCALE` 可强制指定（离屏核对 125%/150%/200% 用）。
+unsafe fn init_ring_scale() {
+    if let Ok(s) = std::env::var("PIPIE_RING_SCALE") {
+        if let Ok(v) = s.trim().parse::<f32>() {
+            set_ring_scale(v);
+            return;
+        }
+    }
+    let dc = GetDC(None);
+    let dpi = if dc.is_invalid() {
+        96
+    } else {
+        let d = GetDeviceCaps(dc, windows::Win32::Graphics::Gdi::LOGPIXELSX);
+        let _ = ReleaseDC(None, dc);
+        d.max(96)
+    };
+    // 画布（含外环段）设计边长 = 720 × 0.66；留 40px 边距，保证呼出时不被屏幕裁掉。
+    let base = 720.0 * 0.66;
+    let sw = GetSystemMetrics(SM_CXSCREEN) as f32;
+    let sh = GetSystemMetrics(SM_CYSCREEN) as f32;
+    let fit = ((sw - 40.0) / base).min((sh - 40.0) / base);
+    set_ring_scale((dpi as f32 / 96.0).min(fit.max(1.0)).clamp(1.0, 2.0));
+}
+
+/// 布局缩放（跟随 `ring_scale`）
+#[inline]
+fn k() -> f32 { 0.66 * ring_scale() }
 /// 图标单独缩放：比布局缩得少 → 盘子变小了但图标相对更大、更清楚。
 /// ⚠️ 这个值算出来的是**底板边长**（不是图标本身，图标还要再除 `TILE_PAD_K`）。
 /// 2026-10-07 用户反馈「有点太小了，边框可以大一些，图标也大一点点」
 /// → 0.554（底板 31）→ **0.640（底板 35.8，图标 29.9）**。
-/// 上限提醒：盘径 `DISC_R_MAX = 145.2`。再往上（KI 0.68 → 盘径 141）会因为顶到上限
+/// 上限提醒：盘径 `disc_r_max()` = 240K。再往上（KI 0.68 → 盘径 141）会因为顶到上限
 /// 被布局**反过来压缩**，12 个应用时盘径反而变小 —— 别再无脑加。
-const KI: f32 = 0.640;
+#[inline]
+fn ki() -> f32 { 0.640 * ring_scale() }
 const KC: f32 = 1.34;   // chip 内容缩放（胶囊高度 / 图标方块 / 字号）
 
-const CANVAS: i32 = (720.0 * K) as i32; // 渲染画布边长：最远点 = r_out + 段内内容的半长
-const CC: f32 = CANVAS as f32 / 2.0;    // 画布中心
+/// 渲染画布边长：最远点 = r_out + 段内内容的半长（720 × k()）
+#[inline]
+fn canvas() -> i32 { (720.0 * k()).round() as i32 }
+/// 画布中心
+#[inline]
+fn cc() -> f32 { canvas() as f32 * 0.5 }
 
 // 盘面半径**上限**。⚠️ 220K 时 12 个应用正好顶到，底板被从 35.8 压到 30.8、图标只剩
 // 25.6px——肉眼就是「图标又小又糊」（用户 2026-10-08 反馈）。抬到 240K 之后 12 个应用
 // 还能保住整块底板：图标 25.6 → 29.1px（+13%），盘径 285 → 316px（窗口 475 装得下）。
 // 相邻底板间距仍然 = `GAP_K × 图标`，并没有变挤。
-const DISC_R_MAX: f32 = 240.0 * K;
-const R_ICON_MIN: f32 = 132.0 * K; // 图标环半径下限（条目少时别缩成一个点）
-const ICON_DRAW: f32 = 56.0 * KI;  // 图标绘制尺寸上限（真实图标直接立在盘面上）
+#[inline]
+fn disc_r_max() -> f32 { 240.0 * k() }
+#[inline]
+fn r_icon_min() -> f32 { 132.0 * k() } // 图标环半径下限（条目少时别缩成一个点）
+#[inline]
+fn icon_draw() -> f32 { 56.0 * ki() } // 图标绘制尺寸上限（真实图标直接立在盘面上）
 /// 相邻图标之间要留的空隙 = 图标边长 × GAP_K。
 /// 原实现的目标只是「刚好不相撞」→ 12 个应用时间隙/图标 ≈ 0.28，图标挤成一片看着乱。
 /// 对标参考（TheRing）实测间隙/图标 = 0.91；12 个应用在同盘径下取 0.45 已是现实上限。
@@ -102,8 +154,9 @@ const GAP_K: f32 = 0.45;
 /// 圆角方块在**切向**的最坏投影系数（方块在 45° 处 ≈1.414，圆角半径越大越小）。
 /// 按 TILE_RAD_K 的圆角实测 ≈1.22。
 const TANG: f32 = 1.22;
-/// 环带在图标内外各留的宽度：DISC_R = 图标环 + 图标半宽 + BAND_PAD。
-const BAND_PAD: f32 = 28.0; // 图标外沿 → 盘边留白（用户反馈贴边，18 → 24 → 28）
+/// 环带在图标内外各留的宽度：DISC_R = 图标环 + 图标半宽 + band_pad()。
+#[inline]
+fn band_pad() -> f32 { 28.0 * ring_scale() } // 图标外沿 → 盘边留白（用户反馈贴边，18 → 24 → 28）
 /// 环带底色浓度。**这是白底图标（记事本那页白纸）能在浅色盘面上显形的前提** ——
 /// 纯白盘上它整片消失，这也是「很多图标糊/看不见」的一半原因。
 const BAND_DARK: f32 = 0.28;
@@ -122,32 +175,43 @@ const TILE_PAD_K: f32 = 1.20;
 /// `normalize_to` 第③步的裁切圆角要跟着缩：纹理是按**图标**尺寸裁的，
 /// 不改的话图标放大时圆角会与底板的圆角对不上（露白缝）。
 const TILE_TEX_PAD_K: f32 = TILE_PAD_K;
-const ICON_MIN: f32 = 30.0;     // 图标缩放下限
+#[inline]
+fn icon_min() -> f32 { 30.0 * ring_scale() } // 图标缩放下限
 /// 图标纹理尺寸：**2 倍超采样**。256→82 用 box 下采样一次到位，
 /// 绘制 82→33（k≈2.5）走面积平均 —— 边缘接近像素完美锐利。
-const ICON_PX: usize = (ICON_DRAW * 2.05) as usize;
+/// ⚠️ 跟着 `icon_draw()` 缩放：高 DPI 下图标画得更大，纹理不跟着变会糊。
+#[inline]
+fn icon_px() -> usize { (icon_draw() * 2.05).round() as usize }
 /// mip 链**保留上限**（内存优化，2026-10-12）。
 ///
-/// `pick()` 取「≥ size 的最小一级」，而图标**实际最大只画到 ~35px**：
+/// `pick()` 取「≥ size 的最小一级」，而图标**实际最大只画到 ~35px**（×缩放）：
 ///   - 内环 `icon_side = icon_draw * scale / TILE_PAD_K`，`scale = (0.30+0.70·ap)·(1+0.10·hot)`
 ///     上限 ≈ 1.18 → `35.84 × 1.18 / 1.20 ≈ 35.2`
 ///   - 幽灵 `icon_draw × 0.86` ≈ 30.8；外环 chip `CHIP_ICON × 1.06` ≈ 23.4
-/// 所以 > MIP_CAP 的级**永远不会被命中**（73px 起那条链 32 级共 187KB，其中 62% 是死重）。
-/// 取 44 给足余量（44 > 35.2，且留着 43/41/39/37 几级兜住动画回弹的超调）。
-/// ⚠️ 若以后把图标画得更大（比如设置页用 48px），**必须同步抬高这个值**，
+/// 所以 > mip_cap 的级**永远不会被命中**（73px 起那条链 32 级共 187KB，其中 62% 是死重）。
+/// 取 44（×缩放）给足余量。⚠️ 若以后把图标画得更大，**必须同步抬高这个值**，
 /// 否则 `pick` 会退到最大级硬放大 → 发虚。
-const MIP_CAP: usize = 44;
-const TILE_R: f32 = 17.0 * K;   // 无图标时的字形方块圆角
-const HUB_R: f32 = 66.0 * K;    // 中心头像球半径
+#[inline]
+fn mip_cap() -> usize { (44.0 * ring_scale()).round() as usize }
+#[inline]
+fn tile_r() -> f32 { 17.0 * k() } // 无图标时的字形方块圆角
+#[inline]
+fn hub_r() -> f32 { 66.0 * k() } // 中心头像球半径
 /// 外环段（梯形环）的厚度 = 旧胶囊的高度 —— 「甲」方案保持原尺寸不变。
-const CHIP_H: f32 = 34.0 * K * KC;
-const CHIP_PAD_L: f32 = 6.0 * K * KC;   // 左内边距
+#[inline]
+fn chip_h() -> f32 { 34.0 * k() * KC }
+#[inline]
+fn chip_pad_l() -> f32 { 6.0 * k() * KC } // 左内边距
 // 左端图标边长。⚠️ 不是随手定的：外环带动画的图标就画这么大，19.5px 时肉眼
-// 已经偏小发虚（用户 2026-10-08 反馈）。环带厚 `RING_T = 30`，22.1 两侧各留 ~4px。
-const CHIP_ICON: f32 = 25.0 * K * KC;
-const CHIP_GAP: f32 = 8.0 * K * KC;     // 图标与文字间距
-const CHIP_PAD_R: f32 = 14.0 * K * KC;  // 右内边距
-const CHIP_MIN_GAP: f32 = 12.0 * K * KC; // 相邻 chip 最小切向间隙(px)
+// 已经偏小发虚（用户 2026-10-08 反馈）。环带厚 `ring_t() = 30`，22.1 两侧各留 ~4px。
+#[inline]
+fn chip_icon() -> f32 { 25.0 * k() * KC }
+#[inline]
+fn chip_gap() -> f32 { 8.0 * k() * KC }     // 图标与文字间距
+#[inline]
+fn chip_pad_r() -> f32 { 14.0 * k() * KC }  // 右内边距
+#[inline]
+fn chip_min_gap() -> f32 { 12.0 * k() * KC } // 相邻 chip 最小切向间隙(px)
 /// 贴弧胶囊的倾角 = **圆环在该处的切线角**（`t` 归一到 (-90°,90°]，见 `chip_layout`）。
 /// 胶囊的长轴必须严格平行于圆环 —— 3 点 / 9 点方向就该是竖着的。
 /// ⚠️ 之前这里是 `t * 0.82` 再夹到 ±58°，结果 3/9 点只倾斜 58°，看着是「斜着的」，
@@ -159,10 +223,11 @@ const CHIP_FAN_MAX: f32 = 336.0;
 /// 外环分页时**一页**允许铺开的角度。
 /// 用户 2026-11-10：220° 太早就换页，要「至少铺满一圈再换页」→ 直接用满圈上限 336°。
 const CHIP_PAGE_FAN: f32 = 336.0;
-/// 压缝时的最小缝（px）：比 `CHIP_MIN_GAP` 小，但别真贴到一起（圆角会咬）。
-const CHIP_GAP_MIN: f32 = 2.0 * K * KC;
+/// 压缝时的最小缝（px）：比 `chip_min_gap()` 小，但别真贴到一起（圆角会咬）。
+#[inline]
+fn chip_gap_min() -> f32 { 2.0 * k() * KC }
 
-/// 一屏槽位数 = 盘面几何上限（`DISC_R_MAX` 封顶后再加就只能把图标压糊）。
+/// 一屏槽位数 = 盘面几何上限（`disc_r_max()` 封顶后再加就只能把图标压糊）。
 const RING_SLOTS: usize = 12;
 /// 内环**数据**上限。超过一屏（`RING_SLOTS`）的应用不裁掉，靠滚轮连续滚动看到。
 const MAX_APPS: usize = 24;
@@ -171,7 +236,9 @@ const MAX_ITEMS: usize = 12; // 外环可围满一整圈
 const RING_SCROLL_K: f32 = 0.28;
 /// 淡出中的磁贴往盘心**内沉**的距离（画布 px）。
 /// 滚出去的图标是「退回盘里」，不是在原地变透明 —— 光有 alpha 交叉会看成两层重影。
-const SCROLL_SINK: f32 = 6.0;
+#[inline]
+fn scroll_sink() -> f32 { 6.0 * ring_scale() }
+
 
 const WM_APP_SHOW: u32 = WM_APP + 1;
 const WM_APP_HOVER: u32 = WM_APP + 2;
@@ -797,8 +864,15 @@ const CAP_SLOW_MS: u128 = 250;
 /// 反正每次都黑，白抓只是每次呼出都多等一拍（用户 2026-11-02 公司电脑）。
 static CAP_BLACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 抓屏到底还能不能用（慢过一次 / 黑过两次 → 不能）
+/// 抓屏到底还能不能用（慢过一次 / 黑过两次 → 不能）。
+/// `RL_GLASS_DEAD=1` 是测试钩子：直接当「抓屏已死」，用来在正常机器上验证
+/// 「不设 WDA + 退回纸面」这条公司电脑路径。
 fn capture_dead() -> bool {
+    // 每帧都会问一次（draw_scene 也问），环境变量只读一次
+    static FORCE_DEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_DEAD.get_or_init(|| glass_env("RL_GLASS_DEAD")) {
+        return true;
+    }
     CAP_SLOW.load(Ordering::Relaxed) || CAP_BLACK.load(Ordering::Relaxed) >= 2
 }
 /// 慢帧日志只记前 20 条（一次 hover 动画能出十几帧，别把日志刷爆）
@@ -1958,10 +2032,10 @@ unsafe fn flat_circle(
 ) {
     let ext = r + bw + sh_dy.abs() + sh_blur * 1.7 + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
-    let w = CANVAS as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
+    let w = canvas() as usize;
     let sh = SHADOW;
     let rb = r + bw;
     // 投影扩散层最多只能覆盖到 (r - bw - |sh_dy|*1.55 - sh_blur*1.7 - 2)，
@@ -2022,10 +2096,10 @@ unsafe fn flat_round_rect(
 ) {
     let ext = half_w.max(half_h) + bw + sh_dy.abs() + sh_blur * 1.7 + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
-    let w = CANVAS as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
+    let w = canvas() as usize;
     let sh = SHADOW;
     // 注意：sdf_rounded_rect 是「内部为正」，统一取负
     let sdf = |x: f32, y: f32| -sdf_rounded_rect(x, y, half_w, half_h, rad);
@@ -2080,15 +2154,15 @@ unsafe fn ball_gradient(
     if rx <= 0.5 || ry <= 0.5 {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let lx = cx - 0.24 * rx; // 光源 x（对应 38%）
     let ly = cy - 0.36 * ry; // 光源 y（对应 32%）
     let rr = 1.5 * rx.max(ry);
     let ext = rx.max(ry) + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     let px_scale = rx.min(ry).max(0.5);
     for py in y0..=y1 {
         let dy = py as f32 + 0.5 - cy;
@@ -2128,13 +2202,13 @@ unsafe fn rot_rrect(
     if hw <= 0.05 || hh <= 0.05 || a <= 0.002 {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let (sn, cs) = rot.sin_cos();
     let ext = hw.max(hh) + 3.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     for py in y0..=y1 {
         let dy = py as f32 + 0.5 - cy;
         for px in x0..=x1 {
@@ -2176,15 +2250,15 @@ unsafe fn rot_rrect_ex(
     sh_blur: f32,
     am: f32,
 ) {
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let (sn, cs) = rot.sin_cos();
     // 屏幕竖直偏移换算到局部坐标
     let (shx, shy) = (sh_dy * sn, sh_dy * cs);
     let ext = hw.max(hh) + bw + sh_dy.abs() + sh_blur * 1.7 + 3.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     let sh = SHADOW;
     // 投影早退：深于形状内部的像素算出来的投影必然被不透明填充盖掉
     let sh_in = bw + sh_dy.abs() * 1.55 + sh_blur * 1.7 + 2.0;
@@ -2244,12 +2318,12 @@ unsafe fn flat_ellipse(
     if rx <= 0.05 || ry <= 0.05 {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let ext = rx.max(ry) + bw + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     // 把归一化半径差换算回像素量级，保证抗锯齿带宽稳定
     let px_scale = rx.min(ry).max(0.5);
     for py in y0..=y1 {
@@ -2281,11 +2355,11 @@ unsafe fn disc_gradient(
     top: (u8, u8, u8),
     bot: (u8, u8, u8),
 ) {
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let y0 = (cy - r).max(0.0) as usize;
-    let y1 = ((cy + r).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + r).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - r).max(0.0) as usize;
-    let x1 = ((cx + r).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + r).min(canvas() as f32 - 1.0)) as usize;
     for py in y0..=y1 {
         let dy = py as f32 + 0.5 - cy;
         for px in x0..=x1 {
@@ -2319,12 +2393,12 @@ unsafe fn ring_band(
     if a <= 0.002 || r1 <= r0 {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let ext = r1 + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     for py in y0..=y1 {
         let dy = py as f32 + 0.5 - cy;
         for px in x0..=x1 {
@@ -2358,12 +2432,12 @@ unsafe fn soft_rrect(
     if a <= 0.002 {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let ext = hw.max(hh) + blur + 2.0;
     let y0 = (cy - ext).max(0.0) as usize;
-    let y1 = ((cy + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y1 = ((cy + ext).min(canvas() as f32 - 1.0)) as usize;
     let x0 = (cx - ext).max(0.0) as usize;
-    let x1 = ((cx + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let x1 = ((cx + ext).min(canvas() as f32 - 1.0)) as usize;
     let b = blur.max(0.35);
     for py in y0..=y1 {
         let dy = py as f32 + 0.5 - cy;
@@ -2384,25 +2458,31 @@ unsafe fn soft_rrect(
 //
 // 唯一的反馈通道：拖重复 / 落点没命中 / 真删掉那一刻，以前都只是 `println!`，
 // 用户完全看不到。凡是「用户该知道的事」一律走这里。
-//
-// ⚠️ 几何是量出来的，不是拍的：画布只有 475×475，盘心 237.6、球半径 43.56，
-// 所以气泡**左边缘钉死 x=262**（贴着球的右上）、最多长到 x=462 → 宽上限 150。
-// 宽度**按文字量收缩**（短消息只有 ~90），不是一律撑满 —— 撑满就是「太大了」。
-const BUB_X: f32 = 262.0;
+/// 气泡几何：**相对盘心**定位。原值按 475 画布量出来（x=262、底边 y=193、盘心 237.5），
+/// 现在整体跟画布缩放。
+#[inline]
+fn bub_x() -> f32 { cc() + pxs(24.5) }
 /// 气泡**底边**（不含尾巴）钉在这里，往上长 —— 高了就往上蹿，不会压到头像球上
-/// （球顶在 194，尾巴尖再从这儿往下探 13）。
-const BUB_Y_BOT: f32 = 193.0;
-const BUB_W_MAX: f32 = 190.0;
-const BUB_W_MIN: f32 = 56.0;
-const BUB_PAD: f32 = 12.0;
-const BUB_R: f32 = 10.0;
-/// ⚠️ 21/22 = 绝对像素的 `font_bub`(14px) / `font_bub_s`(12px)。
-/// 不能用 12/10 —— 那两个是 `font_cnt`(12*K=7.9px) / `font_hint`(10*K=6.6px)，
+/// （球顶在 盘心-43.6，尾巴尖再从这儿往下探 13）。
+#[inline]
+fn bub_y_bot() -> f32 { cc() - pxs(44.5) }
+#[inline]
+fn bub_w_max() -> f32 { pxs(190.0) }
+#[inline]
+fn bub_w_min() -> f32 { pxs(56.0) }
+#[inline]
+fn bub_pad() -> f32 { pxs(12.0) }
+#[inline]
+fn bub_r() -> f32 { pxs(10.0) }
+/// ⚠️ 21/22 = 气泡字体槽位（`font_bub` / `font_bub_s`：14px / 12px，**跟 DPI 缩放**）。
+/// 不能用 12/10 —— 那两个是 `font_cnt`(12*K≈7.9px) / `font_hint`(10*K≈6.6px)，
 /// 借来用就是「小到看不清」（用户 2026-10-14 报）。
 const BUB_MAIN_PX: i32 = 21;
-const BUB_MAIN_LH: f32 = 19.0;
+#[inline]
+fn bub_main_lh() -> f32 { pxs(19.0) }
 const BUB_SUB_PX: i32 = 22;
-const BUB_SUB_LH: f32 = 16.0;
+#[inline]
+fn bub_sub_lh() -> f32 { pxs(16.0) }
 
 /// 说一句话。`secs > 0` = 状态消息（**压住** hover 名字，到点自己消失）；
 /// `secs <= 0` = 常驻（如「松手就移除」），必须由调用方用 `hush` 收掉。
@@ -2463,9 +2543,9 @@ unsafe fn flat_tri(
     a: f32,
 ) {
     let minx = p0.0.min(p1.0).min(p2.0).floor().max(0.0) as i32;
-    let maxx = p0.0.max(p1.0).max(p2.0).ceil().min(CANVAS as f32 - 1.0) as i32;
+    let maxx = p0.0.max(p1.0).max(p2.0).ceil().min(canvas() as f32 - 1.0) as i32;
     let miny = p0.1.min(p1.1).min(p2.1).floor().max(0.0) as i32;
-    let maxy = p0.1.max(p1.1).max(p2.1).ceil().min(CANVAS as f32 - 1.0) as i32;
+    let maxy = p0.1.max(p1.1).max(p2.1).ceil().min(canvas() as f32 - 1.0) as i32;
     if minx > maxx || miny > maxy {
         return;
     }
@@ -2489,7 +2569,7 @@ unsafe fn flat_tri(
             if hit == 0 {
                 continue;
             }
-            let o = (y as usize * CANVAS as usize + x as usize) * 4;
+            let o = (y as usize * canvas() as usize + x as usize) * 4;
             blend_over(buf, o, col.0 as f32, col.1 as f32, col.2 as f32,
                        hit as f32 / 9.0 * a);
         }
@@ -2517,7 +2597,7 @@ unsafe fn text_w(st: &State, text: &str, px: i32) -> i32 {
     };
     let _ = SelectObject(dc, HGDIOBJ(font.0));
     let mut chars: Vec<u16> = text.encode_utf16().collect();
-    let mut rect = RECT { left: 0, top: 0, right: CANVAS - 8, bottom: 40 };
+    let mut rect = RECT { left: 0, top: 0, right: canvas() - 8, bottom: 40 };
     // DT_CALCRECT 只算不画，不会污染 `draw_text` 共用的那块 DC
     let _ = DrawTextW(dc, &mut chars, &mut rect, DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
     (rect.right - rect.left).max(0)
@@ -2565,8 +2645,8 @@ unsafe fn draw_bubble(st: &mut State, buf: &mut [u8], pal: &Pal) {
     }
     let mw = text_w(st, &main, BUB_MAIN_PX) as f32;
     let sw = if sub.is_empty() { 0.0 } else { text_w(st, &sub, BUB_SUB_PX) as f32 };
-    let tw = mw.max(sw).min(BUB_W_MAX - BUB_PAD * 2.0);
-    let w = (tw + BUB_PAD * 2.0).max(BUB_W_MIN);
+    let tw = mw.max(sw).min(bub_w_max() - bub_pad() * 2.0);
+    let w = (tw + bub_pad() * 2.0).max(bub_w_min());
     if std::env::var("RL_BUBDBG").is_ok() {
         let (lm, ls) = unsafe {
             (font_px(st, BUB_MAIN_PX), font_px(st, BUB_SUB_PX))
@@ -2574,53 +2654,53 @@ unsafe fn draw_bubble(st: &mut State, buf: &mut [u8], pal: &Pal) {
         eprintln!("[bub] main={:?} mw={} | sub={:?} sw={} | tw={} w={} | font身高 {} / {}",
             main, mw, sub, sw, tw, w, lm, ls);
     }
-    let gap = 4.0;
-    let h = BUB_PAD * 2.0 + BUB_MAIN_LH
-        + if sub.is_empty() { 0.0 } else { BUB_SUB_LH + gap }
-        - 2.0;
+    let gap = pxs(4.0);
+    let h = bub_pad() * 2.0 + bub_main_lh()
+        + if sub.is_empty() { 0.0 } else { bub_sub_lh() + gap }
+        - pxs(2.0);
     // 底边钉死、往上长：字号变大后 h 变高，若还按「顶边固定」就会往下压到头像球上
-    let y0 = BUB_Y_BOT - h;
+    let y0 = bub_y_bot() - h;
 
     // 本体：与内环磁贴 / 外环胶囊同一套 token（块色底 + `mix(ink 34%)` 描边 + 硬投影）
     flat_round_rect(
         buf,
-        BUB_X + w * 0.5,
+        bub_x() + w * 0.5,
         y0 + h * 0.5,
         w * 0.5,
         h * 0.5,
-        BUB_R,
+        bub_r(),
         pal.paper,
-        1.0,
+        pxs(1.0),
         mixc(pal.paper, pal.ink, 0.34),
         am,
-        2.0,
+        pxs(2.0),
         0.35 * am,
-        2.0,
+        pxs(2.0),
         am,
     );
     // 尾巴：指向头像球右上。画在**本体之后**，本体盖住它的上半，露出的是干净三角。
     flat_tri(
         buf,
-        (BUB_X + 10.0, BUB_Y_BOT - 2.0),
-        (BUB_X + 30.0, BUB_Y_BOT - 2.0),
-        (BUB_X - 7.0, BUB_Y_BOT + 13.0),
+        (bub_x() + pxs(10.0), bub_y_bot() - pxs(2.0)),
+        (bub_x() + pxs(30.0), bub_y_bot() - pxs(2.0)),
+        (bub_x() - pxs(7.0), bub_y_bot() + pxs(13.0)),
         pal.paper,
         am,
     );
     // ⚠️ 文字必须画在本体**之后**：`draw_text` 会跳过 `alpha == 0` 的像素，
     //    先画字等于一个字都不出。
-    let tx = (BUB_X + BUB_PAD) as i32;
-    let max_w = (w - BUB_PAD * 2.0 + 1.0) as i32;
+    let tx = (bub_x() + bub_pad()) as i32;
+    let max_w = (w - bub_pad() * 2.0 + pxs(1.0)) as i32;
     let a8 = (255.0 * am) as u8;
     draw_text(
-        st, buf, tx, (y0 + BUB_PAD + BUB_MAIN_LH * 0.5) as i32,
+        st, buf, tx, (y0 + bub_pad() + bub_main_lh() * 0.5) as i32,
         &main, BUB_MAIN_PX, 400, pal.ink.0, pal.ink.1, pal.ink.2, a8, max_w, 0,
     );
     if !sub.is_empty() {
         // 副行提到 0.68 —— 0.55 在深色下太灰，读起来费劲
         let sc = mixc(pal.paper, pal.ink, 0.68);
         draw_text(
-            st, buf, tx, (y0 + BUB_PAD + BUB_MAIN_LH + gap + BUB_SUB_LH * 0.5) as i32,
+            st, buf, tx, (y0 + bub_pad() + bub_main_lh() + gap + bub_sub_lh() * 0.5) as i32,
             &sub, BUB_SUB_PX, 400, sc.0, sc.1, sc.2, a8, max_w, 0,
         );
     }
@@ -2739,7 +2819,7 @@ unsafe fn draw_hub_face(st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, pa
 
     // ① 球体：扁平实心（无渐变、无描边）+ 向下偏移的柔和投影
     flat_circle(buf, bcx + m_bx * fr, bcy, fr, pal.block, 0.0, pal.block, 0.0,
-        2.6 * K, 0.16, 9.0 * K, 1.0);
+        2.6 * k(), 0.16, 9.0 * k(), 1.0);
 
     // ② 眼睛：药丸，贴着球面滑动
     //    参考的定位模型：x = R_ORB·sin(经度)，透视 = cos(经度)/cos(基准经度)
@@ -2894,7 +2974,7 @@ fn decor_page_items(st: &State) -> Vec<usize> {
 /// 装饰槽中心：**与内环应用图标同半径、同起始角**，从正上方开始等分一圈。
 fn decor_slot_center(i: usize, n: usize, r: f32) -> (f32, f32) {
     let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n.max(1) as f32;
-    (CC + r * a.cos(), CC + r * a.sin())
+    (cc() + r * a.cos(), cc() + r * a.sin())
 }
 
 /// 光标命中当前页的哪个装饰槽。
@@ -2912,7 +2992,7 @@ fn decor_slot_at(st: &State, px: f32, py: f32) -> Option<usize> {
 }
 
 fn decor_hub_hit(px: f32, py: f32) -> bool {
-    ((px - CC).powi(2) + (py - CC).powi(2)).sqrt() <= HUB_R * 1.05
+    ((px - cc()).powi(2) + (py - cc()).powi(2)).sqrt() <= hub_r() * 1.05
 }
 
 /// 把一张直通 alpha 的 BGRA 素材双线性缩放着画到缓冲（预乘采样，透明边不发黑）。
@@ -2931,7 +3011,7 @@ fn blend_decor_sprite_tinted(
     }
     let x0 = cx - dw as f32 * 0.5;
     let y0 = cy - dh as f32 * 0.5;
-    let w = CANVAS as i32;
+    let w = canvas() as i32;
     let tw = tex.w as i32;
     let th = tex.h as i32;
     let texel = |tx: i32, ty: i32| -> (f32, f32, f32, f32) {
@@ -3001,7 +3081,7 @@ fn blend_decor_outline(
     let dh = (tex.h as f32 * scale).round() as i32;
     let x0 = cx - dw as f32 * 0.5;
     let y0 = cy - dh as f32 * 0.5;
-    let w = CANVAS as i32;
+    let w = canvas() as i32;
     let aat = |fx: f32, fy: f32| -> f32 {
         let tx = fx.round().clamp(0.0, (tex.w - 1) as f32) as usize;
         let ty = fy.round().clamp(0.0, (tex.h - 1) as f32) as usize;
@@ -3058,8 +3138,8 @@ fn draw_equipped_decor(st: &State, buf: &mut [u8], behind: bool, r: f32, pal: &P
             continue;
         }
         if let Some(Some(t)) = texs.get(i) {
-            blend_decor_outline(buf, t, CC, CC, r * 2.56, pal.paper, 0.92);
-            blend_decor_sprite(buf, t, CC, CC, r * 2.56, 1.0);
+            blend_decor_outline(buf, t, cc(), cc(), r * 2.56, pal.paper, 0.92);
+            blend_decor_sprite(buf, t, cc(), cc(), r * 2.56, 1.0);
         }
     }
 }
@@ -3095,12 +3175,12 @@ unsafe fn draw_decor_ring(st: &State, buf: &mut [u8], pal: &Pal) {
             half,
             side * TILE_RAD_K,
             pal.paper,
-            (1.4 + 1.6 * sel) * K,
+            (1.4 + 1.6 * sel) * k(),
             mixc(mixc(pal.paper, pal.ink, 0.34), pal.ink, sel),
             1.0,
-            (3.0 + 2.0 * sel) * K,
+            (3.0 + 2.0 * sel) * k(),
             0.20 + 0.10 * sel,
-            1.5 * K,
+            1.5 * k(),
             1.0,
         );
         // 素材按内容包围盒居中，占格子约 72%（留一圈内边距，和 app 图标一致）
@@ -3108,7 +3188,7 @@ unsafe fn draw_decor_ring(st: &State, buf: &mut [u8], pal: &Pal) {
         if on {
             // 已穿戴：右下角一个小墨点（状态点，不是边框）
             flat_circle(
-                buf, cx + half * 0.58, cy + half * 0.58, 2.4,
+                buf, cx + half * 0.58, cy + half * 0.58, pxs(2.4),
                 pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, 1.0,
             );
         }
@@ -3116,14 +3196,14 @@ unsafe fn draw_decor_ring(st: &State, buf: &mut [u8], pal: &Pal) {
     // 页码点：放在图标环外沿下方
     let pages = (DECORS.len() + DECOR_PER_PAGE - 1) / DECOR_PER_PAGE;
     if pages > 1 {
-        let gap = 8.0;
+        let gap = pxs(8.0);
         let total = (pages - 1) as f32 * gap;
-        let y = CC + r_icon + icon_draw * 0.5 + 18.0;
+        let y = cc() + r_icon + icon_draw * 0.5 + pxs(18.0);
         for p in 0..pages {
-            let x = CC - total * 0.5 + p as f32 * gap;
+            let x = cc() - total * 0.5 + p as f32 * gap;
             let on = p == st.decor_page.min(pages - 1);
             let col = if on { pal.ink } else { mixc(pal.paper, pal.ink, 0.25) };
-            flat_circle(buf, x, y, if on { 2.6 } else { 2.0 }, col, 0.0, col, 0.0, 0.0, 0.0, 0.0, 1.0);
+            flat_circle(buf, x, y, if on { pxs(2.6) } else { pxs(2.0) }, col, 0.0, col, 0.0, 0.0, 0.0, 0.0, 1.0);
         }
     }
 }
@@ -3136,10 +3216,11 @@ unsafe fn draw_decor_label(st: &State, buf: &mut [u8], pal: &Pal) {
     let d = &DECORS[gi];
     let mark = if decor_equipped(st, d.id) { " · 已穿戴" } else { "" };
     let txt = format!("{}{}", d.name, mark);
-    let cx = CC as i32;
-    let cy = (CC + HUB_R + 16.0) as i32;
+    let cx = cc() as i32;
+    let cy = (cc() + hub_r() + pxs(16.0)) as i32;
     // 玻璃盘上文字可能压到深色桌面 → 先描一圈纸色，再画墨字（不是底板，只提高对比）
-    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+    let oh = pxs(1.0) as i32;
+    for (dx, dy) in [(-oh, 0), (oh, 0), (0, -oh), (0, oh)] {
         draw_text(
             st, buf, cx + dx, cy + dy, &txt, 13, 500,
             pal.paper.0, pal.paper.1, pal.paper.2, 210, 0, 0,
@@ -3223,6 +3304,7 @@ const GL_SNAP_BLACK: u32 = 1 << 2;
 const GL_SNAP_CAP: u32 = 1 << 3;  // 呼出时那次抓屏失败（GetDC / BitBlt）
 const GL_LIVE_CAP: u32 = 1 << 5;
 const GL_OFFSCREEN: u32 = 1 << 6; // 抓取矩形整个落在虚拟屏幕之外
+const GL_LIVE_OFF: u32 = 1 << 7;  // 实时玻璃被自动关掉（慢帧 / WDA 不可靠）
 
 static GLASS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
@@ -3245,7 +3327,7 @@ fn glass_where(x: i32, y: i32) -> String {
     let (vx, vy, vw, vh) = virtual_screen();
     format!(
         "at=({},{}) size={}x{} virtual=({},{},{}x{})",
-        x, y, CANVAS, CANVAS, vx, vy, vw, vh
+        x, y, canvas(), canvas(), vx, vy, vw, vh
     )
 }
 
@@ -3301,7 +3383,7 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
 /// `mostly_black` 会放过，视觉上也就是盘沿一部分糊掉）。
 fn glass_offscreen(x: i32, y: i32) -> bool {
     let (vx, vy, vw, vh) = virtual_screen();
-    x + CANVAS <= vx || y + CANVAS <= vy || x >= vx + vw || y >= vy + vh
+    x + canvas() <= vx || y + canvas() <= vy || x >= vx + vw || y >= vy + vh
 }
 
 /// 抓桌面一块区域（`CANVAS²`，屏幕坐标）→ 模糊 → `st.glass_bg`。
@@ -3315,10 +3397,10 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let n = (CANVAS * CANVAS * 4) as usize;
+    let n = (canvas() * canvas() * 4) as usize;
     // 直接用 `make_dib`：它建的是 32bpp 顶朝下的 DIB，`bits` 就是像素，
     // 比 `CreateCompatibleBitmap` + `GetDIBits` 少一次拷贝、也躲开"选进 DC 时不能 GetDIBits"的坑。
-    let (bits, mdc, bmp) = make_dib(CANVAS, CANVAS);
+    let (bits, mdc, bmp) = make_dib(canvas(), canvas());
     if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
         return;
     }
@@ -3326,7 +3408,7 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
     let mut ok = false;
     if !sdc.is_invalid() {
         // CAPTUREBLT：带上分层窗口（否则某些叠层 / 播放器会抓成空洞）
-        if BitBlt(mdc, 0, 0, CANVAS, CANVAS, sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
+        if BitBlt(mdc, 0, 0, canvas(), canvas(), sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
             ok = true;
         }
         let _ = ReleaseDC(None, sdc);
@@ -3400,7 +3482,7 @@ fn glass_mean(raw: &[u8]) -> u64 {
 
 /// 一块 Vec 存两层：原图在前、模糊图在后（`glass_px` 要同时采样两层）
 fn build_glass(raw: &[u8]) -> Vec<u8> {
-    build_glass_sq(raw, CANVAS as usize)
+    build_glass_sq(raw, canvas() as usize)
 }
 
 /// 同上，边长参数版（剪贴板卡片用 `CL_WW`）。
@@ -3455,6 +3537,21 @@ static GLASS_LIVE_X: AtomicI32 = AtomicI32::new(0);
 static GLASS_LIVE_Y: AtomicI32 = AtomicI32::new(0);
 /// UI 线程取走了多少帧（只给 `RL_GLASSDBG` 的日志用）
 static GLASS_LIVE_TAKEN: AtomicU32 = AtomicU32::new(0);
+
+/// **本次运行不再跑实时玻璃**（快照玻璃照常）。
+///
+/// 两条触发路径，都是公司电脑实测（2026-11-11）：
+/// 1. WDA 设过一次失败 —— 那台机器的 WDA 先在启动时返回 0x80070008、几小时后突然又能设上；
+///    能设上之后 DLP/截屏驱动会把轮盘当成「排除抓屏」的窗口整块涂黑、并冻在
+///    **设置 WDA 那一刻的画面 = 呼出首帧**（图标还没入场）。既然这台机器对 WDA 不可靠，
+///    就整轮都别碰它。
+/// 2. 实时玻璃连续 8 帧耗时 >100ms —— 每帧都要重采盘内玻璃（≈7ms 的活在这台机器上要
+///    100~300ms），轮盘实际只剩 3~10fps。退回快照后色层命中缓存，帧立刻恢复。
+static GLASS_LIVE_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// 连续「慢帧」计数（只在实时玻璃开着时累计）
+static GLASS_LIVE_SLOW_N: AtomicU32 = AtomicU32::new(0);
+/// 单帧超过这个时长就算「实时玻璃拖不动」（正常机器 draw_scene ≈1~5ms）
+const GLASS_LIVE_SLOW_MS: u32 = 100;
 /// **外部窗口正在被拖向环**（窗口捕获武装中）→ 暂停抓屏、冻结盘面色层。
 /// 理由同「滚动中故意不换帧」（见 `on_timer`）：这时候背景本来就没人看，
 /// 而每 33ms 一次的全屏 `BitBlt(CAPTUREBLT)` 会和 DWM 的合成抢带宽 ——
@@ -3467,7 +3564,7 @@ static GLASS_FREEZE: AtomicBool = AtomicBool::new(false);
 fn glass_sig(raw: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let step = 16usize;
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let mut y = step / 2;
     while y < w {
         let mut x = step / 2;
@@ -3494,7 +3591,7 @@ static GLASS_LIVE_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 /// 后台抓屏线程。菜单关着时挂在条件变量上，不占 CPU、不占显存。
 fn glass_live_spawn() {
     std::thread::spawn(|| unsafe {
-        let n = (CANVAS * CANVAS * 4) as usize;
+        let n = (canvas() * canvas() * 4) as usize;
         let dbg = std::env::var_os("RL_GLASSDBG").is_some();
         let dump = std::env::var("RL_GLASSDUMP").ok();
         // 测试钩子：`RL_GLASS_FORCEBLACK=1` 把每一帧都当成「全黑」丢掉，
@@ -3522,8 +3619,15 @@ fn glass_live_spawn() {
             }
             // 抓屏太慢的机器（DLP / 审计钩住 GDI）→ 实时玻璃整条停掉，轮盘退回纸面。
             // 不停的话每 33ms 一次全屏 BitBlt 会把整台机器拖住（用户 2026-11-02 公司电脑卡顿）。
+            // ⚠️ 停的时候必须把 WDA 撤掉：它是在 `glass_live_start` 里设的，只有 `glass_live_stop`
+            //    会清；这里光 `GLASS_LIVE_ON=false` 会把「排除抓屏」留在窗口上直到菜单关闭，
+            //    公司那台机器的截屏/录屏驱动就会把轮盘整块涂黑（2026-11-11）。
             if capture_dead() {
                 GLASS_LIVE_ON.store(false, Ordering::Relaxed);
+                let rh = RING_HWND.load(Ordering::Relaxed);
+                if rh != 0 {
+                    let _ = SetWindowDisplayAffinity(HWND(rh as *mut c_void), WDA_NONE);
+                }
                 continue;
             }
             if on_since.is_none() {
@@ -3536,7 +3640,7 @@ fn glass_live_spawn() {
                 }
             }
             if dib.is_none() {
-                let (bits, mdc, bmp) = make_dib(CANVAS, CANVAS);
+                let (bits, mdc, bmp) = make_dib(canvas(), canvas());
                 if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
                     GLASS_LIVE_ON.store(false, Ordering::Relaxed);
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3560,7 +3664,7 @@ fn glass_live_spawn() {
                 let sdc = GetDC(None);
                 if !sdc.is_invalid() {
                     let t0 = Instant::now();
-                    if BitBlt(mdc, 0, 0, CANVAS, CANVAS, sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
+                    if BitBlt(mdc, 0, 0, canvas(), canvas(), sdc, x, y, SRCCOPY | CAPTUREBLT).is_ok() {
                         // ⚠️ 这一段包含「等 DWM 下一次合成」（≈16ms），不是 CPU 耗时
                         let t1 = Instant::now();
                         let raw = std::slice::from_raw_parts_mut(bits, n);
@@ -3569,7 +3673,7 @@ fn glass_live_spawn() {
                         if let Some(p) = glass_dump_prefix("RL_GLASSDUMPROW") {
                             if matches!(dump_i, 0 | 12) {
                                 dump_ppm(&format!("{}-raw{:02}.ppm", p, dump_i + 1),
-                                         CANVAS as usize, CANVAS as usize, raw);
+                                         canvas() as usize, canvas() as usize, raw);
                             }
                         }
                         // 这一帧不发出去有两个**完全不同**的原因，日志必须分得开：
@@ -3592,7 +3696,7 @@ fn glass_live_spawn() {
                             if let Some(p) = &dump {
                                 if matches!(dump_i, 1 | 13 | 25 | 37) {
                                     dump_ppm(&format!("{}-{:02}.ppm", p, dump_i),
-                                             CANVAS as usize, CANVAS as usize, raw);
+                                             canvas() as usize, canvas() as usize, raw);
                                 }
                             }
                             stat_n += 1;
@@ -3647,6 +3751,18 @@ unsafe fn glass_live_start(st: &State, hwnd: HWND) {
     if !st.glass || !st.glass_live || hwnd.is_invalid() {
         return;
     }
+    // 抓屏本身已经判死（DLP 钩 GDI → 慢；或受保护会话 → 黑帧）→ 实时毫无意义。
+    // ⚠️ 更要紧的是**别设 WDA**：公司电脑实测，快照慢到降级纸面后 WDA 反而能设上，
+    //    这台机器的截屏/录屏驱动会把标了「排除抓屏」的窗口整块涂黑、并冻在设置 WDA
+    //    那一刻的画面（= 呼出首帧，图标还没入场）。用户看到的「轮盘只剩一个黑盘」
+    //    就是这么来的（2026-11-11）。抓不了屏就别碰 WDA。
+    if capture_dead() {
+        return;
+    }
+    // 本次运行已经被判过「WDA 不可靠 / 实时太慢」→ 不再碰 WDA，玻璃停在快照。
+    if GLASS_LIVE_BLOCKED.load(Ordering::Relaxed) {
+        return;
+    }
     // 轮盘窗口不参与抓屏 —— 实时抓背景时就不会把自己拍进去。
     // ⚠️ 老系统（< Win10 2004）、远程桌面 / 云桌面会话、被 DLP 管控的机器设不上这个属性。
     //    设不上就**不跑实时**，玻璃停在 `snap_glass` 那张呼出那一刻的真桌面快照。
@@ -3664,10 +3780,14 @@ unsafe fn glass_live_start(st: &State, hwnd: HWND) {
         }
     };
     if wda_err != 0 {
+        // ⚠️ 失败一次就**整轮拉黑**：公司那台电脑启动时设不上（0x80070008），几个小时后
+        //    又能设上（2026-11-10 17:51 日志）；能设上之后 DLP 会把轮盘整块涂黑、
+        //    画面冻在设置 WDA 那一刻的首帧。既然它对 WDA 不可靠，就别再试。
+        GLASS_LIVE_BLOCKED.store(true, Ordering::Relaxed);
         glass_note(GL_WDA, || {
             format!(
                 "GLASS reason=wda err=0x{wda_err:08X} {}（SetWindowDisplayAffinity 设不上 → \
-                 不跑实时，玻璃停在呼出那一刻的真桌面快照）",
+                 不跑实时，玻璃停在呼出那一刻的真桌面快照；本次运行不再尝试）",
                 wda_where()
             )
         });
@@ -3676,6 +3796,8 @@ unsafe fn glass_live_start(st: &State, hwnd: HWND) {
     glass_note(GL_LIVE_ON, || "GLASS live=on（WDA 排除自己，抓屏干净）".to_string());
     GLASS_LIVE_X.store(st.win_x, Ordering::Relaxed);
     GLASS_LIVE_Y.store(st.win_y, Ordering::Relaxed);
+    // 「连续慢帧」必须从这次呼出从零数（上一轮可能只攒了一两帧就关菜单了）
+    GLASS_LIVE_SLOW_N.store(0, Ordering::Relaxed);
     // 别把上一轮（可能已关菜单）的残留帧喂给这一次
     if let Ok(mut s) = GLASS_LIVE_SLOT.lock() {
         *s = None;
@@ -3703,7 +3825,7 @@ unsafe fn glass_live_stop(hwnd: HWND) {
 ///
 /// 输出是**非预乘** BGRA（与 `flat_*` 的输入约定一致），直接喂 `glass_px`。
 fn blur_glass(src: &[u8]) -> Vec<u8> {
-    blur_glass_sq(src, CANVAS as usize)
+    blur_glass_sq(src, canvas() as usize)
 }
 
 /// `blur_glass` 的边长参数版：轮盘的缓冲是 `CANVAS²`，剪贴板卡片是 `CL_WW²`，
@@ -3815,10 +3937,10 @@ fn glass_px(bg: &[u8], x: f32, y: f32, cx: f32, cy: f32, r: f32, dark: bool, ta:
     let pull = edge_k * GLASS_REFRACT;
     let sx = x + (dx0 / d0) * pull;
     let sy = y + (dy0 / d0) * pull;
-    let ix = sx.clamp(0.0, CANVAS as f32 - 1.0) as usize;
-    let iy = sy.clamp(0.0, CANVAS as f32 - 1.0) as usize;
-    let idx = iy * CANVAS as usize + ix;
-    let n = (CANVAS * CANVAS * 4) as usize;
+    let ix = sx.clamp(0.0, canvas() as f32 - 1.0) as usize;
+    let iy = sy.clamp(0.0, canvas() as f32 - 1.0) as usize;
+    let idx = iy * canvas() as usize + ix;
+    let n = (canvas() * canvas() * 4) as usize;
     let mb = idx * 4;          // 模糊层（缓冲后半）
     let mr = mb + n;           // 原图（缓冲前半）—— 顺序：raw 在前、blur 在后
     let mut c = [bg[mr + 2] as f32, bg[mr + 1] as f32, bg[mr] as f32];
@@ -3910,16 +4032,16 @@ fn glass_disc_drop() {
 /// **滚轮偏移动的是图标，盘面一个像素都不变**。所以这里把它缓存成一层，
 /// 命中时只做一次顺序 blit（~0.3ms）。
 unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
-    let need = (CANVAS * CANVAS * 4) as usize * 2;
+    let need = (canvas() * canvas() * 4) as usize * 2;
     if st.glass_bg.len() < need {
         return;
     }
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let ext = r + 2.0;
-    let y0 = (CC - ext).max(0.0) as usize;
-    let y1 = ((CC + ext).min(CANVAS as f32 - 1.0)) as usize;
-    let x0 = (CC - ext).max(0.0) as usize;
-    let x1 = ((CC + ext).min(CANVAS as f32 - 1.0)) as usize;
+    let y0 = (cc() - ext).max(0.0) as usize;
+    let y1 = ((cc() + ext).min(canvas() as f32 - 1.0)) as usize;
+    let x0 = (cc() - ext).max(0.0) as usize;
+    let x1 = ((cc() + ext).min(canvas() as f32 - 1.0)) as usize;
     let lw = x1 - x0 + 1;
     let lh = y1 - y0 + 1;
     let ta = if dark { GLASS_TINT_A_D } else { GLASS_TINT_A_L };
@@ -3939,14 +4061,14 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
         let mut px = vec![0u8; lw * lh * 4];
         for (row, py) in (y0..=y1).enumerate() {
             let fy = py as f32 + 0.5;
-            let dy = fy - CC;
+            let dy = fy - cc();
             for (col, pxi) in (x0..=x1).enumerate() {
                 let fx = pxi as f32 + 0.5;
-                let dx = fx - CC;
+                let dx = fx - cc();
                 if cov1((dx * dx + dy * dy).sqrt() - r) < 0.999 {
                     continue;
                 }
-                let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0, sharp);
+                let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, cc(), cc(), r, dark, ta, 1.0, sharp);
                 let o = (row * lw + col) * 4;
                 px[o] = cb as u8;
                 px[o + 1] = cg as u8;
@@ -3984,15 +4106,15 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
     // 真正贵的 `glass_px` 只会在那道带上触发。
     for py in y0..=y1 {
         let fy = py as f32 + 0.5;
-        let dy = fy - CC;
+        let dy = fy - cc();
         for pxi in x0..=x1 {
             let fx = pxi as f32 + 0.5;
-            let dx = fx - CC;
+            let dx = fx - cc();
             let cov = cov1((dx * dx + dy * dy).sqrt() - r);
             if cov <= 0.002 || cov >= 0.999 {
                 continue; // 盘外，或已由缓存整像素替换
             }
-            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, CC, CC, r, dark, ta, 1.0, sharp);
+            let (cr, cg, cb) = glass_px(&st.glass_bg, fx, fy, cc(), cc(), r, dark, ta, 1.0, sharp);
             blend_over(buf, (py * w + pxi) * 4, cr, cg, cb, cov);
         }
     }
@@ -4013,32 +4135,33 @@ fn upd_offer(st: &State) -> bool {
 }
 
 fn upd_pill_box() -> (f32, f32, f32, f32) {
-    (CC - 161.0, 391.0, CC + 161.0, 437.0)
+    // 相对盘心：原值按 475 画布量出（y 391..437、半宽 161）
+    (cc() - pxs(161.0), cc() + pxs(153.5), cc() + pxs(161.0), cc() + pxs(199.5))
 }
 
 fn upd_pill_btn_box() -> (f32, f32, f32, f32) {
-    let x1 = CC + 161.0;
-    (x1 - 68.0, 399.0, x1 - 10.0, 429.0)
+    let x1 = cc() + pxs(161.0);
+    (x1 - pxs(68.0), cc() + pxs(161.5), x1 - pxs(10.0), cc() + pxs(191.5))
 }
 
 fn upd_card_box() -> (f32, f32, f32, f32) {
-    (CC - 186.0, CC - 110.0, CC + 186.0, CC + 110.0)
+    (cc() - pxs(186.0), cc() - pxs(110.0), cc() + pxs(186.0), cc() + pxs(110.0))
 }
 
 fn upd_card_btn_box(primary: bool) -> (f32, f32, f32, f32) {
     let (_, _, x1, y1) = upd_card_box();
-    let by = y1 - 50.0;
+    let by = y1 - pxs(50.0);
     if primary {
-        (x1 - 138.0, by, x1 - 20.0, by + 32.0)
+        (x1 - pxs(138.0), by, x1 - pxs(20.0), by + pxs(32.0))
     } else {
-        let px = x1 - 138.0;
-        (px - 86.0, by, px - 10.0, by + 32.0)
+        let px = x1 - pxs(138.0);
+        (px - pxs(86.0), by, px - pxs(10.0), by + pxs(32.0))
     }
 }
 
 fn upd_close_box() -> (f32, f32, f32, f32) {
     let (_, y0, x1, _) = upd_card_box();
-    (x1 - 40.0, y0 + 10.0, x1 - 12.0, y0 + 38.0)
+    (x1 - pxs(40.0), y0 + pxs(10.0), x1 - pxs(12.0), y0 + pxs(38.0))
 }
 
 fn in_box(b: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
@@ -4182,13 +4305,13 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         // 卡片自身有纸色 + 投影，已经压得住盘面，这里不再画遮罩。
         let (x0, y0, x1, _y1) = upd_card_box();
         rot_rrect_ex(
-            buf, CC, CC, 186.0, 110.0, 20.0, 0.0,
-            UPD_PAPER, 0.0, UPD_INK, 0.0, 6.0, 0.35, 10.0, 1.0,
+            buf, cc(), cc(), pxs(186.0), pxs(110.0), pxs(20.0), 0.0,
+            UPD_PAPER, 0.0, UPD_INK, 0.0, pxs(6.0), 0.35, pxs(10.0), 1.0,
         );
-        upd_icon(st, buf, x0 + 36.0, y0 + 38.0, 17.0, UPD_INK, UPD_PAPER);
+        upd_icon(st, buf, x0 + pxs(36.0), y0 + pxs(38.0), pxs(17.0), UPD_INK, UPD_PAPER);
 
-        draw_text(st, buf, (x0 + 64.0) as i32, (y0 + 34.0) as i32,
-                  "发现新版本", 20, 700, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 280, 0);
+        draw_text(st, buf, (x0 + pxs(64.0)) as i32, (y0 + pxs(34.0)) as i32,
+                  "发现新版本", 20, 700, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(280.0) as i32, 0);
         let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
         let sub = match st.update_st {
             5 => format!("v{} · 下载完成，重启后生效", st.update_latest),
@@ -4196,24 +4319,24 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
             4 if !st.update_msg.is_empty() => format!("v{} · {}", st.update_latest, st.update_msg),
             _ => format!("v{} · 建议尽快更新", st.update_latest),
         };
-        draw_text(st, buf, (x0 + 64.0) as i32, (y0 + 58.0) as i32,
-                  &sub, 13, 500, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 280, 0);
+        draw_text(st, buf, (x0 + pxs(64.0)) as i32, (y0 + pxs(58.0)) as i32,
+                  &sub, 13, 500, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(280.0) as i32, 0);
         if st.update_st == 6 {
-            let (bx0, bx1, by) = (x0 + 64.0, x1 - 26.0, y0 + 74.0);
-            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
+            let (bx0, bx1, by) = (x0 + pxs(64.0), x1 - pxs(26.0), y0 + pxs(74.0));
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_EDGE, 1.0);
             let span = bx1 - bx0;
             if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
                 let fw = span * (pct.min(100) as f32 / 100.0);
-                if fw > 1.0 {
-                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+                if fw > pxs(1.0) {
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 1.0);
                 }
-            } else if span > 4.0 {
+            } else if span > pxs(4.0) {
                 // 总大小未知（chunked）：一条游标来回走，证明「在动」，不是卡 0%
                 let ph = (now_s() * 0.9) % 2.0;
                 let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
                 let seg = span * 0.32;
                 let sx = bx0 + (span - seg) * k;
-                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, 1.0, 1.0, 0.0, UPD_INK, 0.75);
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 0.75);
             }
         }
         for (i, t) in [
@@ -4223,16 +4346,16 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         .iter()
         .enumerate()
         {
-            draw_text(st, buf, (x0 + 26.0) as i32, (y0 + 92.0 + i as f32 * 22.0) as i32,
-                      t, 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 320, 0);
+            draw_text(st, buf, (x0 + pxs(26.0)) as i32, (y0 + pxs(92.0) + i as f32 * pxs(22.0)) as i32,
+                      t, 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(320.0) as i32, 0);
         }
-        draw_text(st, buf, (x1 - 26.0) as i32, (y0 + 24.0) as i32,
+        draw_text(st, buf, (x1 - pxs(26.0)) as i32, (y0 + pxs(24.0)) as i32,
                   "×", 20, 700, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
 
         let (gx0, gy0, gx1, gy1) = upd_card_btn_box(false);
         rot_rrect_ex(
             buf, (gx0 + gx1) * 0.5, (gy0 + gy1) * 0.5,
-            (gx1 - gx0) * 0.5, (gy1 - gy0) * 0.5, 16.0, 0.0,
+            (gx1 - gx0) * 0.5, (gy1 - gy0) * 0.5, pxs(16.0), 0.0,
             UPD_PAPER, 1.0, UPD_EDGE, 1.0, 0.0, 0.0, 0.0, 1.0,
         );
         draw_text(st, buf, ((gx0 + gx1) * 0.5) as i32, ((gy0 + gy1) * 0.5) as i32,
@@ -4242,7 +4365,7 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         let pf = if st.upd_hover == 5 { (52, 52, 58) } else { UPD_INK };
         rot_rrect_ex(
             buf, (px0 + px1) * 0.5, (py0 + py1) * 0.5,
-            (px1 - px0) * 0.5, (py1 - py0) * 0.5, 16.0, 0.0,
+            (px1 - px0) * 0.5, (py1 - py0) * 0.5, pxs(16.0), 0.0,
             pf, 0.0, UPD_INK, 0.0, 0.0, 0.0, 0.0, 1.0,
         );
         let ptext = match st.update_st {
@@ -4261,40 +4384,40 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
 
     let (x0, y0, x1, y1) = upd_pill_box();
     rot_rrect_ex(
-        buf, CC, (y0 + y1) * 0.5, 161.0, 23.0, 23.0, 0.0,
-        UPD_PAPER, 0.0, UPD_INK, 0.0, 5.0, 0.28, 10.0, 1.0,
+        buf, cc(), (y0 + y1) * 0.5, pxs(161.0), pxs(23.0), pxs(23.0), 0.0,
+        UPD_PAPER, 0.0, UPD_INK, 0.0, pxs(5.0), 0.28, pxs(10.0), 1.0,
     );
-    upd_icon(st, buf, x0 + 27.0, (y0 + y1) * 0.5, 15.0, UPD_INK, UPD_PAPER);
+    upd_icon(st, buf, x0 + pxs(27.0), (y0 + y1) * 0.5, pxs(15.0), UPD_INK, UPD_PAPER);
 
-    let tx = (x0 + 52.0) as i32;
+    let tx = (x0 + pxs(52.0)) as i32;
     let cy = ((y0 + y1) * 0.5) as i32;
     match st.update_st {
         6 => {
             let (title, val) = update_dl_short();
-            draw_text(st, buf, tx, cy - 5, title, 14, 700,
-                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 100, 0);
+            draw_text(st, buf, tx, cy - pxs(5.0) as i32, title, 14, 700,
+                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(100.0) as i32, 0);
             let vs = format!("v{}", st.update_latest);
-            draw_text(st, buf, tx + 76, cy - 5, &vs, 13, 500,
-                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 70, 0);
+            draw_text(st, buf, tx + pxs(76.0) as i32, cy - pxs(5.0) as i32, &vs, 13, 500,
+                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(70.0) as i32, 0);
             if !val.is_empty() {
-                draw_text(st, buf, (x1 - 20.0) as i32, cy - 5, &val, 13, 500,
+                draw_text(st, buf, (x1 - pxs(20.0)) as i32, cy - pxs(5.0) as i32, &val, 13, 500,
                           UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
             }
-            let (bx0, bx1, by) = (x0 + 52.0, x1 - 16.0, y1 - 9.0);
-            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, 1.0, 1.0, 0.0, UPD_EDGE, 1.0);
+            let (bx0, bx1, by) = (x0 + pxs(52.0), x1 - pxs(16.0), y1 - pxs(9.0));
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_EDGE, 1.0);
             let span = bx1 - bx0;
             if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
                 let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
                 let fw = span * (pct.min(100) as f32 / 100.0);
-                if fw > 1.0 {
-                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, 1.0, 1.0, 0.0, UPD_INK, 1.0);
+                if fw > pxs(1.0) {
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 1.0);
                 }
-            } else if span > 4.0 {
+            } else if span > pxs(4.0) {
                 let ph = (now_s() * 0.9) % 2.0;
                 let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
                 let seg = span * 0.32;
                 let sx = bx0 + (span - seg) * k;
-                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, 1.0, 1.0, 0.0, UPD_INK, 0.75);
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 0.75);
             }
         }
         _ => {
@@ -4304,17 +4427,17 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                 _ => ("发现新版本", "更新"),
             };
             draw_text(st, buf, tx, cy, title, 14, 700,
-                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 170, 0);
-            let tw = (title.chars().count() as f32 * 14.0) as i32;
+                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(170.0) as i32, 0);
+            let tw = (title.chars().count() as f32 * pxs(14.0)) as i32;
             if st.update_st != 5 {
                 let vs = format!("v{}", st.update_latest);
-                draw_text(st, buf, tx + tw + 6, cy, &vs, 13, 500,
-                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 60, 0);
+                draw_text(st, buf, tx + tw + pxs(6.0) as i32, cy, &vs, 13, 500,
+                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(60.0) as i32, 0);
             }
             let (bx0, by0, bx1, by1) = upd_pill_btn_box();
             let bf = if st.upd_hover == 1 { (52, 52, 58) } else { UPD_INK };
             rot_rrect(buf, (bx0 + bx1) * 0.5, (by0 + by1) * 0.5,
-                      (bx1 - bx0) * 0.5, (by1 - by0) * 0.5, 15.0, 0.0, bf, 1.0);
+                      (bx1 - bx0) * 0.5, (by1 - by0) * 0.5, pxs(15.0), 0.0, bf, 1.0);
             draw_text(st, buf, ((bx0 + bx1) * 0.5) as i32, ((by0 + by1) * 0.5) as i32,
                       btn, 13, 700, UPD_PAPER.0, UPD_PAPER.1, UPD_PAPER.2, 255, 0, 0);
         }
@@ -4322,7 +4445,7 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
 }
 
 unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     let now = now_s() as f64;
     buf.fill(0);
     // 启动更新窗口：方画布上只留那张纸卡（其余全透明），不画轮盘/盘面
@@ -4347,7 +4470,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     let hair = mixc(pal.paper, pal.ink, 0.16);
 
     if st.dump_bg && !st.bg_bits.is_null() {
-        let src = std::slice::from_raw_parts(st.bg_bits, w * CANVAS as usize * 4);
+        let src = std::slice::from_raw_parts(st.bg_bits, w * canvas() as usize * 4);
         buf.copy_from_slice(src);
     }
 
@@ -4365,7 +4488,9 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // 盘沿：纸面是墨灰细线；玻璃是**白边**（玻璃边缘就是一道反光，不是墨线）
     // 盘面材质**只跟用户设置走**：装饰轮盘不再强制纸面（用户 2026-11-10：
     //「保持样式一致，不要一会玻璃一会纸质」）。装饰槽自带底板，玻璃下也看得清。
-    let paper_disc = !st.glass;
+    // 例外：抓屏已经判死（慢/黑帧）—— 玻璃没有背景可透，只剩一块没有渐变/环带的
+    // 死灰盘；这时候按日志里承诺的「退回纸面」真的画纸面，观感和纸面模式一致。
+    let paper_disc = !st.glass || capture_dead();
     let (rim_col, rim_a) = if !paper_disc {
         ((250u8, 250u8, 252u8), 0.42)
     } else {
@@ -4373,16 +4498,16 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     };
     flat_circle(
         buf,
-        CC,
-        CC,
+        cc(),
+        cc(),
         disc_r,
         pal.paper,
-        1.7 * K,
+        1.7 * k(),
         rim_col,
         rim_a,
-        6.0 * K,
+        6.0 * k(),
         0.11,
-        18.0 * K,
+        18.0 * k(),
         1.0,
     );
     // 液态玻璃：把盘面换成"模糊桌面 + tint"。
@@ -4395,14 +4520,14 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // 拖放感知指示：drop 模式下盘沿亮一圈绿环（证明 OLE 已找到我们）
     if st.drop_mode {
         let rim_r = disc_r0 * pop;
-        for py in 0..CANVAS as usize {
-            let dy = py as f32 + 0.5 - CC;
+        for py in 0..canvas() as usize {
+            let dy = py as f32 + 0.5 - cc();
             if dy.abs() > rim_r + 2.0 {
                 continue;
             }
             let sx = (rim_r * rim_r - dy * dy).sqrt().max(0.0);
-            for px in (CC - sx - 2.0).max(0.0) as usize..((CC + sx + 2.0).min(CANVAS as f32 - 0.5) as usize + 1) {
-                let dx = px as f32 + 0.5 - CC;
+            for px in (cc() - sx - 2.0).max(0.0) as usize..((cc() + sx + 2.0).min(canvas() as f32 - 0.5) as usize + 1) {
+                let dx = px as f32 + 0.5 - cc();
                 let d = circle_sdf(dx, dy, rim_r);
                 if d.abs() <= 1.6 {
                     let a = (1.0 - d.abs() / 1.6) * 0.55;
@@ -4422,8 +4547,8 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     if paper_disc {
         disc_gradient(
             buf,
-            CC,
-            CC,
+            cc(),
+            cc(),
             disc_r - 1.0,
             pal.paper,
             mixc(pal.paper, pal.ink, 0.055),
@@ -4441,10 +4566,10 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     } else {
         ring_band(
             buf,
-            CC,
-            CC,
+            cc(),
+            cc(),
             band_r0 * pop,
-            (r_icon + icon_draw * 0.5 + BAND_PAD) * pop,
+            (r_icon + icon_draw * 0.5 + band_pad()) * pop,
             mixc(pal.paper, pal.ink, BAND_DARK),
             1.0,
         );
@@ -4453,9 +4578,9 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // ── 2. 中心头像：GrokBot 式表情球 ──
     //    几何/动效全部在 `draw_hub_face` 里（与「关于」页的 logo 共用）。
     //    装饰分两层：球后的（爆炸头/翅膀）先画、球前的（帽子/眼镜…）后画。
-    draw_equipped_decor(&*st, buf, true, HUB_R * pop, &pal);
-    draw_hub_face(&*st, buf, CC, CC, HUB_R * pop, &pal, now);
-    draw_equipped_decor(&*st, buf, false, HUB_R * pop, &pal);
+    draw_equipped_decor(&*st, buf, true, hub_r() * pop, &pal);
+    draw_hub_face(&*st, buf, cc(), cc(), hub_r() * pop, &pal, now);
+    draw_equipped_decor(&*st, buf, false, hub_r() * pop, &pal);
 
     // ── 2b. 装饰轮盘：点中心头像展开，内环位置换成装饰槽 ──
     if st.decor_mode {
@@ -4507,7 +4632,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             continue;
         }
         // 淡出同时内沉 + 缩小（见 `SCROLL_SINK`）
-        let sink = SCROLL_SINK * (1.0 - appear);
+        let sink = scroll_sink() * (1.0 - appear);
         let am = (1.0 - 0.38 * dim) * ap * (1.0 - fade) * appear;
         // ⚠️ 只要**正在被拖**就跟光标走（不再要求 `fade > 0.01`）：
         //    改了 `want_fade` 之后盘内拖动时 fade 恒为 0，若还挂着这个条件，
@@ -4555,12 +4680,12 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 half,
                 rad,
                 pal.paper,
-                (1.4 + 1.6 * sel) * K,
+                (1.4 + 1.6 * sel) * k(),
                 mixc(mixc(pal.paper, pal.ink, 0.34), pal.ink, sel),
                 1.0,
-                (3.0 + 2.0 * sel) * K,
+                (3.0 + 2.0 * sel) * k(),
                 0.20 + 0.10 * sel,
-                1.5 * K,
+                1.5 * k(),
                 am,
             );
         }
@@ -4658,16 +4783,16 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
 
         if st.commit_pulse > 0.0 && st.commit_app == i && st.commit_chip == usize::MAX {
             let half = icon_draw * 0.5;
-            flat_round_rect(buf, cx, cy, half, half, TILE_R, (255, 255, 255), 0.0, (0, 0, 0),
+            flat_round_rect(buf, cx, cy, half, half, tile_r(), (255, 255, 255), 0.0, (0, 0, 0),
                 0.0, 0.0, 0.0, 0.0, 0.42 * st.commit_pulse);
         }
         // 运行中指示点：内环应用有同名窗口在跑 → 图标正下方一个小圆点。
         // ⚠️ 项目禁彩色（piik 灰阶），用 `ink` 实点 + 底下垫 `paper` 圈，
         //    避免压在亮背景玻璃上糊掉（和页点的思路一致）。
         if i < MAX_APPS && st.app_running[i] {
-            let off = icon_draw * scale * 0.5 + 5.0 * K;
-            let rr = 2.5 * K;
-            flat_circle(buf, cx, cy + off, rr + 1.3 * K, pal.paper, 0.0, pal.paper, 0.0,
+            let off = icon_draw * scale * 0.5 + 5.0 * k();
+            let rr = 2.5 * k();
+            flat_circle(buf, cx, cy + off, rr + 1.3 * k(), pal.paper, 0.0, pal.paper, 0.0,
                 0.0, 0.0, 0.0, 0.9);
             flat_circle(buf, cx, cy + off, rr, pal.ink, 0.0, pal.ink, 0.0,
                 0.0, 0.0, 0.0, 1.0);
@@ -4755,7 +4880,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             flat_round_rect(
                 buf, gx, gy, half, half, rad,
                 mixc(pal.paper, pal.ink, 0.06),
-                1.8 * K,
+                1.8 * k(),
                 pal.ink,
                 0.85,
                 0.0, 0.0, 0.0,
@@ -4791,7 +4916,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             // 屏幕上的「左端」是 214°（7 点），「右端」是 146°（5 点）→
             // 第 1 页靠左、最后一页靠右，读法和横向滚动条一致。
             let c = lerp(180.0 + half - th * 0.5, 180.0 - half + th * 0.5, t);
-            let w = 1.5 * K;
+            let w = 1.5 * k();
             flat_arc(buf, r, 180.0 - half, 180.0 + half, w,
                 mixc(pal.paper, pal.ink, 0.16), 0.9);
             flat_arc(buf, r, c - th * 0.5, c + th * 0.5, w,
@@ -4817,7 +4942,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
         flat_round_rect(buf, bx, by + 2.5 * a, hw, hh, RM_BTN_R * a,
             mixc(pal.paper, pal.ink, 0.16), 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, a);
         flat_round_rect(buf, bx, by, hw, hh, RM_BTN_R * a, pal.paper,
-            1.6 * K, mixc(pal.paper, pal.ink, 0.34), 1.0, 0.0, 0.0, 0.0, a);
+            1.6 * k(), mixc(pal.paper, pal.ink, 0.34), 1.0, 0.0, 0.0, 0.0, a);
         // 倒计时：底边直线段（避开两角圆角）画一条墨色圆头线，长度 ∝ 剩余
         let x0 = bx - hw + RM_BTN_R * a;
         let x1 = bx + hw - RM_BTN_R * a;
@@ -5001,13 +5126,13 @@ impl IconTex {
                 break;
             }
             // 一律从**基础纹理**降采样（逐级链式降采样会累积误差）
-            if next <= MIP_CAP {
+            if next <= mip_cap() {
                 levels.push((next, downsample_box(&base, px, next)));
             }
             cur = next;
         }
         // 基础纹理本身就是 ≤ MIP_CAP 的小图 → 它就是最大级，必须留着（否则 pick 无级可挑）
-        if px <= MIP_CAP {
+        if px <= mip_cap() {
             levels.insert(0, (px, base));
         }
         // px > MIP_CAP：`base` 在此随函数结束被丢弃
@@ -5107,12 +5232,12 @@ fn draw_bgra_icon(buf: &mut [u8], cx: f32, cy: f32, size: f32, tex: &IconTex, al
     let hw = k * 0.5;
     for iy in -ext..=ext {
         let py = by + iy;
-        if py < 0 || py >= CANVAS {
+        if py < 0 || py >= canvas() {
             continue;
         }
         for ix in -ext..=ext {
             let px = bx + ix;
-            if px < 0 || px >= CANVAS {
+            if px < 0 || px >= canvas() {
                 continue;
             }
             // 目标像素中心 → 源坐标（像素中心对像素中心的约定：
@@ -5167,7 +5292,7 @@ fn draw_bgra_icon(buf: &mut [u8], cx: f32, cy: f32, size: f32, tex: &IconTex, al
             let r = acc[0] / acc[3];
             let g = acc[1] / acc[3];
             let b = acc[2] / acc[3];
-            let o = (py as usize * CANVAS as usize + px as usize) * 4;
+            let o = (py as usize * canvas() as usize + px as usize) * 4;
             blend_over(buf, o, r, g, b, a);
         }
     }
@@ -5202,15 +5327,15 @@ fn draw_bgra_icon_rot(buf: &mut [u8], cx: f32, cy: f32, size: f32,
     // 近似做法：在**局部空间**做 N×N 亚样本的 box 积分，每个亚样本反旋到纹理空间
     // 再双线性取样。k ≤ 1.06 → N=3 足够（采样点间距 1/3 局部像素）。
     const N: i32 = 3;
-    let w_ = CANVAS as usize;
+    let w_ = canvas() as usize;
     for j in -ext..=ext {
         let py = by + j;
-        if py < 0 || py >= CANVAS {
+        if py < 0 || py >= canvas() {
             continue;
         }
         for i in -ext..=ext {
             let px = bx + i;
-            if px < 0 || px >= CANVAS {
+            if px < 0 || px >= canvas() {
                 continue;
             }
             let mut acc = [0.0f32; 4];
@@ -5314,12 +5439,12 @@ unsafe fn draw_text(
     let _ = SetBkMode(dc, TRANSPARENT); // 只画字，不画背景
     // 只清**上一次**用过的宽度（每次清满 448×42 ≈ 1.9 万像素纯属浪费：
     // 一个 chip 要画两次，5 个 chip 每帧就是 19 万次无效写）
-    let _ = PatBlt(dc, 0, 0, CANVAS, 140, BLACKNESS); // 全幅清除（与 draw_text_rot 共用 DC）
+    let _ = PatBlt(dc, 0, 0, canvas(), 140, BLACKNESS); // 全幅清除（与 draw_text_rot 共用 DC）
     let mut chars: Vec<u16> = text.encode_utf16().collect();
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: if max_w > 0 { max_w } else { CANVAS - 8 },
+        right: if max_w > 0 { max_w } else { canvas() - 8 },
         bottom: 40,
     };
     let fmt_base = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
@@ -5343,22 +5468,22 @@ unsafe fn draw_text(
     let af = alpha as f32 / 255.0;
     for yy in 0..40i32 {
         let py = y0 + yy;
-        if py < 0 || py >= CANVAS {
+        if py < 0 || py >= canvas() {
             continue;
         }
-        for xx in 0..CANVAS {
+        for xx in 0..canvas() {
             let px_x = x0 + xx;
-            if px_x < 0 || px_x >= CANVAS {
+            if px_x < 0 || px_x >= canvas() {
                 continue;
             }
-            let o = (yy as usize * CANVAS as usize + xx as usize) * 4;
+            let o = (yy as usize * canvas() as usize + xx as usize) * 4;
             let t = st.txt_bits.add(o);
             let lum = ((*t.add(2)) as u32 + (*t.add(1)) as u32 + (*t.add(0)) as u32) / 3;
             if lum == 0 {
                 continue;
             }
             let a = (lum as f32 / 255.0) * af;
-            let bo = (py as usize * CANVAS as usize + px_x as usize) * 4;
+            let bo = (py as usize * canvas() as usize + px_x as usize) * 4;
             if buf[bo + 3] == 0 {
                 continue;
             }
@@ -5419,9 +5544,9 @@ unsafe fn draw_text_rot(
         _ => st.font_name3,
     };
     let _ = SelectObject(dc, HGDIOBJ(font3.0));
-    let _ = PatBlt(dc, 0, 0, CANVAS, 140, BLACKNESS); // 全幅清除（与 draw_text 共用 DC）
+    let _ = PatBlt(dc, 0, 0, canvas(), 140, BLACKNESS); // 全幅清除（与 draw_text 共用 DC）
     let mut chars: Vec<u16> = text.encode_utf16().collect();
-    let mut rect = RECT { left: 0, top: 0, right: CANVAS - 8, bottom: 132 };
+    let mut rect = RECT { left: 0, top: 0, right: canvas() - 8, bottom: 132 };
     let fmt = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
     let _ = DrawTextW(dc, &mut chars, &mut rect, fmt | DT_CALCRECT);
     let tw3 = (rect.right - rect.left).max(1) as f32;
@@ -5434,9 +5559,9 @@ unsafe fn draw_text_rot(
     if std::env::var_os("RL_MASKDBG").is_some() {
         static MC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let k = MC.fetch_add(1, Ordering::Relaxed);
-        let n = (CANVAS * 140 * 4) as usize;
+        let n = (canvas() * 140 * 4) as usize;
         let mb = std::slice::from_raw_parts(st.txt_bits, n);
-        let _ = save_bmp(&format!("{}\u{5c}mask_{}.bmp", std::env::var("RL_MASKDBG").unwrap(), k), mb, CANVAS, 140);
+        let _ = save_bmp(&format!("{}\u{5c}mask_{}.bmp", std::env::var("RL_MASKDBG").unwrap(), k), mb, canvas(), 140);
     }
 
     let (sn, cs) = rot.sin_cos();
@@ -5445,9 +5570,9 @@ unsafe fn draw_text_rot(
     let ext = (((tw * tw + 1600.0).sqrt()) * 0.5 + 4.0).ceil() as i32;
     let cxi = cx.round() as i32;
     let cyi = cy.round() as i32;
-    let w = CANVAS as usize;
-    for py in (cyi - ext).max(0)..=(cyi + ext).min(CANVAS - 1) {
-        for pxx in (cxi - ext).max(0)..=(cxi + ext).min(CANVAS - 1) {
+    let w = canvas() as usize;
+    for py in (cyi - ext).max(0)..=(cyi + ext).min(canvas() - 1) {
+        for pxx in (cxi - ext).max(0)..=(cxi + ext).min(canvas() - 1) {
             let dx = pxx as f32 + 0.5 - cx;
             let dy = py as f32 + 0.5 - cy;
             let lx = dx * cs + dy * sn;
@@ -5474,10 +5599,10 @@ unsafe fn draw_text_rot(
                 }
                 let sx = x0 + ox;
                 let sy = y0 + oy;
-                if sx < 0 || sy < 0 || sx >= CANVAS || sy >= 140 {
+                if sx < 0 || sy < 0 || sx >= canvas() || sy >= 140 {
                     continue;
                 }
-                let o = (sy as usize * CANVAS as usize + sx as usize) * 4;
+                let o = (sy as usize * canvas() as usize + sx as usize) * 4;
                 let t = st.txt_bits.add(o);
                 let lum = ((*t.add(2)) as u32 + (*t.add(1)) as u32 + (*t.add(0)) as u32) as f32
                     / 3.0;
@@ -5643,8 +5768,8 @@ fn hit_chip_at(st: &State, ai: usize, px: f32, py: f32) -> Option<usize> {
     }
     let (segs, _rots, _rads) = chip_layout(st, ai);
     let (r_in, r_out) = ring_radii(st.apps.len());
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     let r = (dx * dx + dy * dy).sqrt();
     let tol = 6.0;                       // 命中容差：比图形略松一点，好点
     if r < r_in - tol || r > r_out + tol {
@@ -5674,8 +5799,8 @@ fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     if n == 0 {
         return None;
     }
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     let (r_icon, icon_sz) = ring_layout(n);
     let hit_half = icon_sz * 0.5 + 7.0;
     if (dx * dx + dy * dy).sqrt() > r_icon + hit_half + slack + 4.0 {
@@ -5684,7 +5809,7 @@ fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
     let i = app_at_deg(st, deg, n)?;
     // 中心距也要按**显示槽位**算（滚动 / 淡出内沉后图标并不在自己的下标角度上）
-    let (ix, iy) = polar(r_icon - SCROLL_SINK * (1.0 - slot_appear(slot_of(st, i), n)),
+    let (ix, iy) = polar(r_icon - scroll_sink() * (1.0 - slot_appear(slot_of(st, i), n)),
         slot_angle(slot_of(st, i), n));
     let d = ((px - ix) * (px - ix) + (py - iy) * (py - iy)).sqrt();
     if d <= hit_half + slack {
@@ -5705,8 +5830,8 @@ fn drop_slot_app(st: &State, px: f32, py: f32) -> Option<usize> {
     if n == 0 {
         return None;
     }
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     let r = (dx * dx + dy * dy).sqrt();
     let (r_icon, icon_sz) = ring_layout(n);
     if (r - r_icon).abs() > icon_sz * 0.5 + 18.0 {
@@ -5724,8 +5849,8 @@ fn drop_band_app(st: &State, px: f32, py: f32) -> Option<usize> {
     if n == 0 {
         return None;
     }
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     let r = (dx * dx + dy * dy).sqrt();
     let (r_icon, icon_sz) = ring_layout(n);
     let (_r_in, r_out) = ring_radii(n);
@@ -5744,8 +5869,8 @@ fn drop_slot_chip(st: &State, ai: usize, px: f32, py: f32) -> Option<usize> {
     }
     let (segs, _rots, _rads) = chip_layout(st, ai);
     let (r_in, r_out) = ring_radii(st.apps.len());
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     let r = (dx * dx + dy * dy).sqrt();
     let tol = 10.0;
     if r < r_in - tol || r > r_out + tol {
@@ -6140,7 +6265,7 @@ fn ghost_pos(st: &State) -> (f32, f32) {
     let n = n_ap + 1; // 画幽灵时必然按 n+1 排
     let (r_icon, _sz) = ring_layout(n);
     let s = slot_of(st, n_ap);
-    polar(r_icon - SCROLL_SINK * (1.0 - slot_appear(s, n)), slot_angle(s, n))
+    polar(r_icon - scroll_sink() * (1.0 - slot_appear(s, n)), slot_angle(s, n))
 }
 
 
@@ -8648,11 +8773,11 @@ unsafe fn draw_wait_dots(buf: &mut [u8], cx: f32, cy: f32, half_w: f32, col: (u8
     let span = (n * 2 - 2).max(1);
     let ph = ((now_s() * 3.2) as usize) % span;
     let hi = if ph < n { ph } else { span - ph };
-    for k in 0..n {
-        let on = k == hi;
+    for kk in 0..n {
+        let on = kk == hi;
         let c = if on { col } else { mixc(paper, col, 0.42) };
-        let r = if on { 4.0 * K } else { 2.4 * K };
-        flat_circle(buf, cx + (k as f32 - 1.0) * step, cy, r, c, 0.0, c, 0.0, 0.0, 0.0, 0.0, alpha);
+        let r = if on { 4.0 * k() } else { 2.4 * k() };
+        flat_circle(buf, cx + (kk as f32 - 1.0) * step, cy, r, c, 0.0, c, 0.0, 0.0, 0.0, 0.0, alpha);
     }
 }
 
@@ -9077,8 +9202,8 @@ unsafe fn thumb_tick(st: &mut State) {
         }
         let mid = (segs[ci].0 + segs[ci].1) * 0.5;
         let (cxp, cyp) = polar(rads[ci], mid);
-        let dx = cxp - CC;
-        let dy = cyp - CC;
+        let dx = cxp - cc();
+        let dy = cyp - cc();
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
         let gap = 54.0;
         let half_diag = ((THUMB_W * THUMB_W + THUMB_H * THUMB_H) as f32).sqrt() * 0.5;
@@ -9095,8 +9220,8 @@ unsafe fn thumb_tick(st: &mut State) {
             slot_of(st, ai)
         };
         let (cxp, cyp) = polar(r_icon, slot_angle(s, n));
-        let dx = cxp - CC;
-        let dy = cyp - CC;
+        let dx = cxp - cc();
+        let dy = cyp - cc();
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
         let gap = 42.0; // 内环图标 → 预览边
         let half_diag = ((THUMB_W * THUMB_W + THUMB_H * THUMB_H) as f32).sqrt() * 0.5;
@@ -9213,12 +9338,12 @@ fn save_rgba(path: &str, bgra: &[u8]) -> bool {
 }
 
 unsafe fn synth_bg(st: &mut State, gray: bool) {    // 彩色壁纸（macOS Sonoma 风格），便于离屏校验玻璃染色
-    let n = (CANVAS * CANVAS) as usize;
+    let n = (canvas() * canvas()) as usize;
     let buf = std::slice::from_raw_parts_mut(st.bg_bits, n * 4);
-    for y in 0..CANVAS as usize {
-        for x in 0..CANVAS as usize {
-            let u = x as f32 / CANVAS as f32;
-            let v = y as f32 / CANVAS as f32;
+    for y in 0..canvas() as usize {
+        for x in 0..canvas() as usize {
+            let u = x as f32 / canvas() as f32;
+            let v = y as f32 / canvas() as f32;
             // 蓝紫底 + 三个光斑
             let mut r = 0.42 + 0.20 * (1.0 - v) + 0.10 * u;
             let mut g = 0.46 + 0.16 * (1.0 - u) + 0.06 * v;
@@ -9241,7 +9366,7 @@ unsafe fn synth_bg(st: &mut State, gray: bool) {    // 彩色壁纸（macOS Sono
             r = c[0].clamp(0.0, 1.0);
             g = c[1].clamp(0.0, 1.0);
             b = c[2].clamp(0.0, 1.0);
-            let o = (y * CANVAS as usize + x) * 4;
+            let o = (y * canvas() as usize + x) * 4;
             if gray {
                 // 近白灰桌面：盘面必须仍然是一块亮玻璃，不能跟着塌成中灰
                 let l = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -9260,7 +9385,7 @@ unsafe fn synth_bg(st: &mut State, gray: bool) {    // 彩色壁纸（macOS Sono
 }
 
 unsafe fn draw_to_buf(st: &mut State) -> Vec<u8> {
-    let n = (CANVAS * CANVAS * 4) as usize;
+    let n = (canvas() * canvas() * 4) as usize;
     let buf = std::slice::from_raw_parts_mut(st.dbi_bits, n);
     draw_scene(st, buf);
     std::slice::from_raw_parts(st.dbi_bits, n).to_vec()
@@ -9287,7 +9412,7 @@ unsafe fn dump_all(dir: &str) {
     eprintln!("[cp4] drawing disc");
     let buf = draw_to_buf(&mut st);
     eprintln!("[cp5] disc drawn");
-    save_bmp(&format!("{}\\dump_disc.bmp", dir), &buf, CANVAS, CANVAS);
+    save_bmp(&format!("{}\\dump_disc.bmp", dir), &buf, canvas(), canvas());
 
     // 1b) 滚动：应用超过一屏（`RING_SLOTS`）时再多出三张 ——
     //     第 1 页 / 中间整页 / 交叉淡化最坏情况（偏移 = 1/4 格，两端同时半透明）/ 最后一页。
@@ -9304,7 +9429,7 @@ unsafe fn dump_all(dir: &str) {
             st.ring_to = off;
             st.app_slot_s = [f32::NAN; MAX_APPS];
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_scroll_{}.bmp", dir, tag), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_scroll_{}.bmp", dir, tag), &buf, canvas(), canvas());
         }
         st.ring_off = 0.0;
         st.ring_to = 0.0;
@@ -9335,7 +9460,7 @@ unsafe fn dump_all(dir: &str) {
             *v = if j == 0 { 1.0 } else { 0.0 };
         }
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_hover.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_hover.bmp", dir), &buf, canvas(), canvas());
 
         // 2b) 改名编辑态：同一个 chip 换成墨底 + 输入缓冲（核对对比度与光标）
         let real_name = st.apps[hi].items[0].name.clone();
@@ -9344,7 +9469,7 @@ unsafe fn dump_all(dir: &str) {
         st.edit_caret = now_s(); // 让光标落在「亮」的相位上
         let buf = draw_to_buf(&mut st);
         let edit_path = [dir, "\\dump_edit.bmp"].concat();
-        save_bmp(&edit_path, &buf, CANVAS, CANVAS);
+        save_bmp(&edit_path, &buf, canvas(), canvas());
         st.editing = None;
         st.edit_buf.clear();
 
@@ -9352,31 +9477,31 @@ unsafe fn dump_all(dir: &str) {
         st.bub_a = 1.0;
         st.hover_now = Some(hi);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_name.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_name.bmp", dir), &buf, canvas(), canvas());
         // 2d) 气泡：状态消息（主行 + 副行，最长的一档 → 看会不会顶到上限 150）
         st.hover_now = None;
         say(&mut st, "已摘下：Visual Studio Code", "点「取消」可以放回", 99.0);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_add.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_add.bmp", dir), &buf, canvas(), canvas());
         // 2d-2) 气泡：发现新版本（用户 2026-10-27 要头像提醒）—— 文案必须和 `update_say` 一致
         say(&mut st, &format!("发现新版本 v{}", env!("CARGO_PKG_VERSION")), "", 99.0);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_update.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_update.bmp", dir), &buf, canvas(), canvas());
         // 2e) 气泡：短消息（验证「按文字量收缩」而不是一律撑满）
         say(&mut st, "已移除：终端", "", 99.0);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_short.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_short.bmp", dir), &buf, canvas(), canvas());
         // 2e-2) 启动引导气泡：主行必须整句可读（不能被 BUB_W_MAX 截掉）
         say(&mut st, REVEAL_MSG, REVEAL_SUB, 99.0);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_reveal.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_reveal.bmp", dir), &buf, canvas(), canvas());
         println!("[dump] dump_bub_reveal 启动气泡 {:?} / {:?}", REVEAL_MSG, REVEAL_SUB);
         // 2f) 深色主题下的气泡 —— 用户用的是深色，必须确认对比度没反
         //     （块色/字色在深浅下是同一套 token，搞反了就是白底白字）
         st.glass_liquid = true;
         say(&mut st, "已摘下：Chrome", "点「取消」可以放回", 99.0);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_bub_dark.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_bub_dark.bmp", dir), &buf, canvas(), canvas());
         st.glass_liquid = false;
         st.bub_until = 0.0;
         st.bub_a = 0.0;
@@ -9387,15 +9512,15 @@ unsafe fn dump_all(dir: &str) {
             st.drag_app = Some(0);
             st.drag_over_app = Some(2);
             st.drag_fade = 1.0;
-            st.drag_x = CC + 96.0;
-            st.drag_y = CC - 66.0;
+            st.drag_x = cc() + 96.0;
+            st.drag_y = cc() - 66.0;
             // ⚠️ 离线 dump 不走 `on_timer`，让位动画不会自己跑 —— 手动把**槽位**
             //    落到「预览排序」的终态，否则图标还停在原位、缝没开。
             for i in 0..nap {
                 st.app_slot_s[i] = drag_preview_slot(0, 2, i) as f32 - st.ring_off;
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_drag_caret.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_drag_caret.bmp", dir), &buf, canvas(), canvas());
             st.drag_app = None;
             st.drag_over_app = None;
             st.drag_fade = 0.0;
@@ -9420,7 +9545,7 @@ unsafe fn dump_all(dir: &str) {
                 st.chip_seg_a[k] = pv.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_drag_chip_caret.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_drag_chip_caret.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_drag_chip_caret 外环插入光标（缝中，drag_fade=0）");
             st.drag_chip = None;
             st.drag_over_chip = None;
@@ -9452,7 +9577,7 @@ unsafe fn dump_all(dir: &str) {
                 st.chip_seg_a[k] = segs.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_drop_chip.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_drop_chip.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_drop_chip 拖入窗口 → 外环末尾幽灵胶囊（虚线 + ＋ + 名字）");
             st.drop_suggest = None;
             st.window_capture = None;
@@ -9481,7 +9606,7 @@ unsafe fn dump_all(dir: &str) {
                 st.chip_seg_a[k] = segs.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_drop_chip_file.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_drop_chip_file.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_drop_chip_file 拖入文件夹 → 外环幽灵（跟悬停内环）");
             st.drop_target_app = None;
             if let Ok(mut q) = DROP_PAYLOAD.lock() {
@@ -9506,12 +9631,12 @@ unsafe fn dump_all(dir: &str) {
             let ntex = decor_tex().iter().filter(|t| t.is_some()).count();
             println!("[dump] decor tex {}/{}", ntex, DECORS.len());
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_decor_hub.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_decor_hub.bmp", dir), &buf, canvas(), canvas());
             st.decor_mode = true;
             st.decor_page = 0;
             st.decor_hover = Some(2);
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_decor_ring.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_decor_ring.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_decor_hub / dump_decor_ring 装饰穿戴 + 装饰轮盘");
             st.decor_mode = false;
             st.decor_hover = None;
@@ -9542,7 +9667,7 @@ unsafe fn dump_all(dir: &str) {
                         st.chip_seg_a[k] = segs[k];
                     }
                     let buf = draw_to_buf(&mut st);
-                    save_bmp(&format!("{}\\dump_chip_page0.bmp", dir), &buf, CANVAS, CANVAS);
+                    save_bmp(&format!("{}\\dump_chip_page0.bmp", dir), &buf, canvas(), canvas());
                     st.chip_page[hi] = u16::MAX;
                     st.chip_seg_a = [(f32::NAN, f32::NAN); MAX_ITEMS];
                     let segs = chip_layout(&st, hi).0;
@@ -9550,7 +9675,7 @@ unsafe fn dump_all(dir: &str) {
                         st.chip_seg_a[k] = segs[k];
                     }
                     let buf = draw_to_buf(&mut st);
-                    save_bmp(&format!("{}\\dump_chip_page_last.bmp", dir), &buf, CANVAS, CANVAS);
+                    save_bmp(&format!("{}\\dump_chip_page_last.bmp", dir), &buf, canvas(), canvas());
                     println!("[dump] dump_chip_page0 / dump_chip_page_last 外环分页");
                     st.chip_page[hi] = 0;
                     st.active_app = None;
@@ -9566,7 +9691,7 @@ unsafe fn dump_all(dir: &str) {
             st.loading = Some((hi, LOADING_HUB));
             st.mood = 5;
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_loading_hub.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_loading_hub.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_loading_hub 内环 loading（图标淡出 + 跳动的点）");
             st.loading = None;
             st.mood = 0;
@@ -9578,7 +9703,7 @@ unsafe fn dump_all(dir: &str) {
             st.loading = Some((hi, 0));
             st.mood = 5;
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_loading_chip.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_loading_chip.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_loading_chip 外环 loading（胶囊内跳动的点）");
             st.loading = None;
             st.mood = 0;
@@ -9598,7 +9723,7 @@ unsafe fn dump_all(dir: &str) {
         st.bub_until = now_s() + 999.0;
         st.bub_a = 1.0;
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_onb1.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_onb1.bmp", dir), &buf, canvas(), canvas());
         println!("[dump] dump_onb1 教学槽位（内环末位虚线格）");
         st.bub_until = 0.0;
         st.bub_a = 0.0;
@@ -9614,14 +9739,14 @@ unsafe fn dump_all(dir: &str) {
             // ⚠️ 盘内拖动：改过 `want_fade` 之后这里必须是 0（图标可见），
             //    否则说明淡出逻辑又退回「拖起即隐身」了。
             st.drag_fade = 0.0;
-            st.drag_x = CC + 96.0;
-            st.drag_y = CC - 66.0;
+            st.drag_x = cc() + 96.0;
+            st.drag_y = cc() - 66.0;
             st.bub_main = "松手换位".to_string();
             st.bub_sub = "拖到盘外 = 移除".to_string();
             st.bub_until = now_s() + 999.0;
             st.bub_a = 1.0;
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_onb3.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_onb3.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_onb3 拖动中（图标可见 · 无插入光标 · 相邻图标无白框 · 移除圈已隐藏）");
             st.drag_app = None;
             st.drag_over_app = None;
@@ -9641,8 +9766,8 @@ unsafe fn dump_all(dir: &str) {
             st.drag_fade = 1.0; // 已出界 → 被拖的淡掉
             let rr = remove_r(st.apps.len());
             // ⚠️ `drag_x/y` 是**画布坐标**：放到圈外（正下方 rr+14）
-            st.drag_x = CC;
-            st.drag_y = CC + rr + 14.0;
+            st.drag_x = cc();
+            st.drag_y = cc() + rr + 14.0;
             // ⚠️ 相位取**半个间距**（15°/2 = 7.5°）：转整格图案不变，出图核对不出来。
             st.rm_spin = 7.5;
             st.rm_spin_k = 1.0;
@@ -9651,7 +9776,7 @@ unsafe fn dump_all(dir: &str) {
             st.bub_until = now_s() + 999.0;
             st.bub_a = 1.0;
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_rm_armed.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_rm_armed.bmp", dir), &buf, canvas(), canvas());
             println!("[dump] dump_rm_armed 越过移除线（虚线旋转到相位 7.5° = 半个间距）");
             st.drag_app = None;
             st.drag_over_app = None;
@@ -9671,7 +9796,7 @@ unsafe fn dump_all(dir: &str) {
         *v = 1.0;
     }
     let buf = draw_to_buf(&mut st);
-    save_bmp(&format!("{}\\dump_disc_gray.bmp", dir), &buf, CANVAS, CANVAS);
+    save_bmp(&format!("{}\\dump_disc_gray.bmp", dir), &buf, canvas(), canvas());
     synth_bg(&mut st, false);
 
     // 3.5) 侧面方位：选「有子项且方位角最靠近 90°」的应用，
@@ -9700,7 +9825,7 @@ unsafe fn dump_all(dir: &str) {
                 *v = if i == b { 1.0 } else { 0.0 };
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_side.bmp", dir), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_side.bmp", dir), &buf, canvas(), canvas());
             st.app_hot = [0.0; MAX_APPS];
             st.chip_anim = [0.0; MAX_ITEMS];
         }
@@ -9710,7 +9835,7 @@ unsafe fn dump_all(dir: &str) {
     //       离屏没有真桌面 → 用 `synth_bg` 的彩色壁纸当后台，走**与真机同一条**
     //       `blur_glass` + `glass_disc`。明/暗两个主题各一张（tint 不同）。
     {
-        let n = (CANVAS * CANVAS * 4) as usize;
+        let n = (canvas() * canvas() * 4) as usize;
         let raw = std::slice::from_raw_parts(st.bg_bits, n).to_vec();
         {
             let mut buf = Vec::with_capacity(raw.len() * 2);
@@ -9741,7 +9866,7 @@ unsafe fn dump_all(dir: &str) {
                 st.chip_seg_a[k] = segs.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
             }
             let buf = draw_to_buf(&mut st);
-            save_bmp(&format!("{}\\dump_glass_{}.bmp", dir, tag), &buf, CANVAS, CANVAS);
+            save_bmp(&format!("{}\\dump_glass_{}.bmp", dir, tag), &buf, canvas(), canvas());
             println!("[dump] dump_glass_{} 液态玻璃盘面", tag);
         }
         // 浅灰桌面（近白）：最容易暴露"分层"——盘面近白时，任何一层灰带都会显形。
@@ -9763,7 +9888,7 @@ unsafe fn dump_all(dir: &str) {
             st.chip_seg_a[k] = segs.get(k).copied().unwrap_or((f32::NAN, f32::NAN));
         }
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_glass_gray.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_glass_gray.bmp", dir), &buf, canvas(), canvas());
         println!("[dump] dump_glass_gray 液态玻璃（浅灰桌面，查分层）");
 
         st.glass = false;
@@ -9778,7 +9903,7 @@ unsafe fn dump_all(dir: &str) {
     st.hover_chip = None;
     st.app_hot = [0.0; MAX_APPS];
     let buf = draw_to_buf(&mut st);
-    save_bmp(&format!("{}\\dump_dark.bmp", dir), &buf, CANVAS, CANVAS);
+    save_bmp(&format!("{}\\dump_dark.bmp", dir), &buf, canvas(), canvas());
     st.glass_liquid = false;
 
     // 3.85) 更新提示：环形更新条 / 下载进度 / 每版本一次的小卡
@@ -9791,7 +9916,7 @@ unsafe fn dump_all(dir: &str) {
         st.upd_dismissed = false;
         st.upd_modal = false;
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}{}dump_update_pill.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}{}dump_update_pill.bmp", dir, std::path::MAIN_SEPARATOR), &buf, canvas(), canvas());
 
         st.update_st = 6;
         UPDATE_PROGRESS.store(62, Ordering::Relaxed);
@@ -9799,7 +9924,7 @@ unsafe fn dump_all(dir: &str) {
         UPDATE_TOTAL.store(1_205_248, Ordering::Relaxed);
         UPDATE_BYTES.store(747_254, Ordering::Relaxed);
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}{}dump_update_progress.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}{}dump_update_progress.bmp", dir, std::path::MAIN_SEPARATOR), &buf, canvas(), canvas());
 
         UPDATE_PROGRESS.store(0, Ordering::Relaxed);
         UPDATE_PHASE.store(0, Ordering::Relaxed);
@@ -9808,7 +9933,7 @@ unsafe fn dump_all(dir: &str) {
         st.update_st = 3;
         st.upd_modal = true;
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}{}dump_update_modal.bmp", dir, std::path::MAIN_SEPARATOR), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}{}dump_update_modal.bmp", dir, std::path::MAIN_SEPARATOR), &buf, canvas(), canvas());
         st.upd_modal = false;
         st.update_st = 0;
         st.update_latest.clear();
@@ -9838,7 +9963,7 @@ unsafe fn dump_all(dir: &str) {
         st.editing = Some((hi, 0));
         st.edit_buf = "长按右键·改".to_string();
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_dark_edit.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_dark_edit.bmp", dir), &buf, canvas(), canvas());
         st.editing = None;
     }
     st.theme = saved_theme;
@@ -9869,7 +9994,7 @@ unsafe fn dump_all(dir: &str) {
             icon: unsafe { decode_icon(&gexe) }.map(|(px, d)| IconTex::from_base(px, d)),
         });
         let buf = draw_to_buf(&mut st);
-        save_bmp(&format!("{}\\dump_drop_ghost.bmp", dir), &buf, CANVAS, CANVAS);
+        save_bmp(&format!("{}\\dump_drop_ghost.bmp", dir), &buf, canvas(), canvas());
         st.drop_suggest = None;
         st.drop_ghost = None;
         st.app_hot = [0.0; MAX_APPS];
@@ -9908,9 +10033,9 @@ unsafe fn dump_all(dir: &str) {
     }
     // 调试：导出文字遮罩 DC 内容（3x 超采样遮罩诊断）
     {
-        let n = (CANVAS * 140 * 4) as usize;
+        let n = (canvas() * 140 * 4) as usize;
         let buf = std::slice::from_raw_parts(st.txt_bits, n);
-        save_bmp(&format!("{}\u{5c}dump_mask.bmp", dir), buf, CANVAS, 140);
+        save_bmp(&format!("{}\u{5c}dump_mask.bmp", dir), buf, canvas(), 140);
     }
     println!("[*] 已导出 dump_disc/dump_hover/dump_disc_gray.bmp 到 {dir}");
     println!("[*] chip 命中自检：PASS={pass} FAIL={fail}");
@@ -10834,17 +10959,17 @@ unsafe fn shell_icon_hires(exe_path: &str) -> Option<Vec<u8>> {
             .collect();
         let _ = save_bmp(&format!("{}\\raw_{}.bmp", dir, tag), bits, iw, ih);
         let _ = save_rgba(&format!("{}\\raw_{}.rgba", dir, tag), bits);
-        let n = normalize_to(bits, iw as usize, ih as usize, ICON_PX);
+        let n = normalize_to(bits, iw as usize, ih as usize, icon_px());
         let _ = save_bmp(
             &format!("{}\\norm_{}.bmp", dir, tag),
             &n,
-            ICON_PX as i32,
-            ICON_PX as i32,
+            icon_px() as i32,
+            icon_px() as i32,
         );
         let _ = save_rgba(&format!("{}\\norm_{}.rgba", dir, tag), &n);
         return Some(n);
     }
-    Some(normalize_to(bits, iw as usize, ih as usize, ICON_PX))
+    Some(normalize_to(bits, iw as usize, ih as usize, icon_px()))
 }
 
 
@@ -10992,7 +11117,7 @@ unsafe fn pe_png_icon(path: &str) -> Option<(usize, Vec<u8>)> {
     }
     let buf = &mut scratch[..need];
     frame.CopyPixels(std::ptr::null(), w * 4, buf).ok()?;
-    let tw = (w as usize).min(ICON_PX); // 只缩小不放大
+    let tw = (w as usize).min(icon_px()); // 只缩小不放大
     Some((tw, normalize_to(buf, w as usize, h as usize, tw)))
 }
 
@@ -11207,7 +11332,7 @@ unsafe fn decode_icon(target: &str) -> Option<(usize, Vec<u8>)> {
                     return Some(v);
                 }
                 if let Some(v) = shell_icon_hires(&exe) {
-                    return Some((ICON_PX, v));
+                    return Some((icon_px(), v));
                 }
             }
             return default_browser_icon();
@@ -11222,11 +11347,11 @@ unsafe fn decode_icon(target: &str) -> Option<(usize, Vec<u8>)> {
             // `shell:Downloads` / `shell:Personal` 两者一致，所以统一走路径。
             if let Some(p) = shell_ns_to_path(target) {
                 if let Some(v) = shell_icon_hires(&p) {
-                    return Some((ICON_PX, v));
+                    return Some((icon_px(), v));
                 }
             }
             if let Some(v) = shell_icon_hires(target) {
-                return Some((ICON_PX, v));
+                return Some((icon_px(), v));
             }
         }
         if target.starts_with("ms-settings") {
@@ -11238,7 +11363,7 @@ unsafe fn decode_icon(target: &str) -> Option<(usize, Vec<u8>)> {
                     return Some(v);
                 }
                 if let Some(v) = shell_icon_hires(p) {
-                    return Some((ICON_PX, v));
+                    return Some((icon_px(), v));
                 }
             }
         }
@@ -11267,7 +11392,7 @@ unsafe fn decode_icon(target: &str) -> Option<(usize, Vec<u8>)> {
             let resolved = path_str_of(&full);
             if resolved.contains("WindowsApps") {
                 if let Some(v) = shell_icon_hires(&resolved) {
-                    return Some((ICON_PX, v));
+                    return Some((icon_px(), v));
                 }
                 return None;
             }
@@ -11299,7 +11424,7 @@ unsafe fn decode_icon(target: &str) -> Option<(usize, Vec<u8>)> {
 
     // ── 3b) shell 高分辨率（连 reparse 存根也能解析成真实图标）──
     if let Some(v) = shell_icon_hires(&path) {
-        return Some((ICON_PX, v));
+        return Some((icon_px(), v));
     }
 
     // ── 4) 到这一步还拿不到，且是 reparse 存根 → 只能提出假图标，放弃 ──
@@ -11366,16 +11491,16 @@ unsafe fn init_surfaces(st: &mut State) {
     // 扁平化后不再抓屏模糊 —— 背景 DIB 仅 --dump 的合成壁纸会用到，
     // 常规运行时省下一块画布尺寸的缓冲
     if st.dump_bg {
-        let (b, d, m) = make_dib(CANVAS, CANVAS);
+        let (b, d, m) = make_dib(canvas(), canvas());
         st.bg_bits = b;
         st.bg_dc = d;
         st.bg_bmp = m;
     }
-    let (b2, d2, m2) = make_dib(CANVAS, CANVAS);
+    let (b2, d2, m2) = make_dib(canvas(), canvas());
     st.dbi_bits = b2;
     st.dbi_dc = d2;
     st.dbi_bmp = m2;
-    let (b3, d3, m3) = make_dib(CANVAS, 140);
+    let (b3, d3, m3) = make_dib(canvas(), 140);
     st.txt_bits = b3;
     st.txt_dc = d3;
     st.txt_bmp = m3;
@@ -11383,26 +11508,26 @@ unsafe fn init_surfaces(st: &mut State) {
 
 unsafe fn init_fonts(st: &mut State) {
     let face: Vec<u16> = wide("Microsoft YaHei UI");
-    st.font_name = CreateFontW(-(15.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_label = CreateFontW(-(11.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_row = CreateFontW(-(13.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_chip = CreateFontW(-(14.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_hint = CreateFontW(-(10.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_head = CreateFontW(-(16.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_cnt = CreateFontW(-(12.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_glyph = CreateFontW(-(22.0 * K).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    // 气泡：**绝对像素**，不乘 K（理由见 State 里的注释）
-    st.font_bub = CreateFontW(-14, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_bub_s = CreateFontW(-12, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_name = CreateFontW(-(15.0 * k()).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_label = CreateFontW(-(11.0 * k()).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_row = CreateFontW(-(13.0 * k() * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip = CreateFontW(-(14.0 * k() * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_hint = CreateFontW(-(10.0 * k()).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_head = CreateFontW(-(16.0 * k() * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_cnt = CreateFontW(-(12.0 * k()).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_glyph = CreateFontW(-(22.0 * k()).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    // 气泡：**绝对像素**（不跟布局 k() 缩），但要跟 DPI 缩放 —— 否则高分屏上字太小
+    st.font_bub = CreateFontW(-(14.0 * ring_scale()).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_bub_s = CreateFontW(-(12.0 * ring_scale()).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     // 3 倍超采样字体：与上面各字号一一对应 ×3（draw_text_rot 旋转文字防糊）
-    st.font_name3 = CreateFontW(-(45.0 * K).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_label3 = CreateFontW(-(33.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_row3 = CreateFontW(-(39.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_chip3 = CreateFontW(-(42.0 * K * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_hint3 = CreateFontW(-(30.0 * K).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_head3 = CreateFontW(-(48.0 * K * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_cnt3 = CreateFontW(-(36.0 * K).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
-    st.font_glyph3 = CreateFontW(-(66.0 * K).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_name3 = CreateFontW(-(45.0 * k()).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_label3 = CreateFontW(-(33.0 * k()).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_row3 = CreateFontW(-(39.0 * k() * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_chip3 = CreateFontW(-(42.0 * k() * KC).round() as i32, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_hint3 = CreateFontW(-(30.0 * k()).round() as i32, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_head3 = CreateFontW(-(48.0 * k() * KC).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_cnt3 = CreateFontW(-(36.0 * k()).round() as i32, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
+    st.font_glyph3 = CreateFontW(-(66.0 * k()).round() as i32, 0, 0, 0, 700, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(face.as_ptr()));
     // ⚠️ 设置页那5 号 SS× 字体**不在这里建** —— 只有设置页在用，而 GDI 每
     //    HFONT 各持一份字形缓存（yahei 18.8MB 的文件，只驻留用到的字形）。
     //    改成 `ensure_setup_fonts` 按需创建、`setup_free` 关窗时删。
@@ -11549,7 +11674,7 @@ fn ring_scroll(st: &mut State, d: f32) -> bool {
 /// 方位角（0=上，顺时针）→ 画布坐标
 fn polar(r: f32, deg: f32) -> (f32, f32) {
     let a = deg.to_radians();
-    (CC + r * a.sin(), CC - r * a.cos())
+    (cc() + r * a.sin(), cc() - r * a.cos())
 }
 
 /// 估算文字宽度（CJK 按全宽，其余按半宽）
@@ -11569,16 +11694,16 @@ fn est_text_w(text: &str, cjk_w: f32, lat_w: f32) -> f32 {
 /// 间隙只有 0.28×图标，视觉上就是「贴在一起」。
 fn ring_layout(n: usize) -> (f32, f32) {
     let hs = (std::f32::consts::PI / ring_vis(n) as f32).sin();
-    let mut icon = ICON_DRAW;
+    let mut icon = icon_draw();
     let mut r = icon * (TANG + GAP_K) / (2.0 * hs);
-    let r_cap = DISC_R_MAX - icon * 0.5 - BAND_PAD;
+    let r_cap = disc_r_max() - icon * 0.5 - band_pad();
     if r > r_cap {
         r = r_cap;
         icon = 2.0 * r * hs / (TANG + GAP_K);
     }
-    icon = icon.clamp(ICON_MIN, ICON_DRAW);
+    icon = icon.clamp(icon_min(), icon_draw());
     // 条目很少时别把环缩到盘心（要给中心头像留位置）
-    let r = r.max(R_ICON_MIN).max(HUB_R + icon * 0.5 + 10.0);
+    let r = r.max(r_icon_min()).max(hub_r() + icon * 0.5 + 10.0);
     (r, icon)
 }
 
@@ -11586,7 +11711,7 @@ fn ring_layout(n: usize) -> (f32, f32) {
 /// 否则「画在哪」和「点到哪」又会分家。
 fn disc_r(n: usize) -> f32 {
     let (r, icon) = ring_layout(n);
-    r + icon * 0.5 + BAND_PAD
+    r + icon * 0.5 + band_pad()
 }
 
 /// 环带内沿（中心留白区的半径）。
@@ -11597,7 +11722,7 @@ fn disc_r(n: usize) -> f32 {
 /// 留 5px 是因为呼吸动画会让球半径缩 ~2.4%。
 fn band_in(n: usize) -> f32 {
     let (r, icon) = ring_layout(n);
-    (HUB_R - 5.0).min(r - icon * 0.5 - 6.0).max(HUB_R * 0.5)
+    (hub_r() - 5.0).min(r - icon * 0.5 - 6.0).max(hub_r() * 0.5)
 }
 
 // ───────────────────── 外环：梯形环（圆角环形扇区）─────────────────────
@@ -11614,7 +11739,7 @@ fn band_in(n: usize) -> f32 {
 
 /// 外环厚度 = **与原来的胶囊同高**（`CHIP_H`）。
 /// 「甲」方案要的是「保持现有排布 + 只换外壳形状」，所以厚度不变。
-const RING_T: f32 = CHIP_H;
+fn ring_t() -> f32 { chip_h() }
 /// 四角圆角半径 = 厚度 × 这个比例（薄环用更大的比例，跟参考图一致）
 const RING_CR_K: f32 = 0.30;
 /// hover 时沿**径向向外**抬起的距离系数（段与段内内容必须用同一个，否则会脱开）
@@ -11623,14 +11748,14 @@ const RING_LIFT_K: f32 = 2.0;
 /// URL（`newtab.claisly.com`）会让单段吃掉 50°+ 的环，整圈被它一个人占满。
 /// 超过就截断加省略号。`chip_half_w` 与段内绘制**必须用同一个上限**，
 /// 否则「段宽 / 文字宽 / 命中框」三者会对不上。
-const RING_NAME_MAX_W: f32 = 90.0;
+fn ring_name_max_w() -> f32 { 90.0 * ring_scale() }
 /// 段内名称字号（传给 `draw_text_rot`：13 → `font_row`，13*K*KC ≈ 11.5px）
 const RING_NAME_PX: i32 = 15;
 
 /// 外环的内外半径（跟着自适应的盘面半径走）
 fn ring_radii(n: usize) -> (f32, f32) {
-    let r_in = disc_r(n) + 3.0 * K;
-    (r_in, r_in + RING_T)
+    let r_in = disc_r(n) + 3.0 * k();
+    (r_in, r_in + ring_t())
 }
 
 /// 圆角环形扇区的 SDF（**内部为负** —— 与项目里所有 `flat_*` 的约定一致）。
@@ -11703,15 +11828,15 @@ unsafe fn flat_arc(buf: &mut [u8], r: f32, a1: f32, a2: f32, hw: f32,
     let pad = hw + 3.0;
     let x0 = (minx - pad).floor().max(0.0) as i32;
     let y0 = (miny - pad).floor().max(0.0) as i32;
-    let x1 = (maxx + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
-    let y1 = (maxy + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
-    let w = CANVAS as usize;
+    let x1 = (maxx + pad).ceil().min(canvas() as f32 - 1.0) as i32;
+    let y1 = (maxy + pad).ceil().min(canvas() as f32 - 1.0) as i32;
+    let w = canvas() as usize;
     for y in y0..=y1 {
         let fy = y as f32 + 0.5;
         for x in x0..=x1 {
             let fx = x as f32 + 0.5;
             // 极坐标原点**只能是画布中心**（同梯形环那条铁律）
-            let c = cov1(sdf_sector(fx, fy, CC, CC, r, hw, hv, hw, mid_rad)) * alpha;
+            let c = cov1(sdf_sector(fx, fy, cc(), cc(), r, hw, hv, hw, mid_rad)) * alpha;
             if c > 0.002 {
                 let o = (y as usize * w + x as usize) * 4;
                 blend_over(buf, o, col.0 as f32, col.1 as f32, col.2 as f32, c);
@@ -11723,7 +11848,7 @@ unsafe fn flat_arc(buf: &mut [u8], r: f32, a1: f32, a2: f32, hw: f32,
 
 /// 玻璃参数：关着、或快照还没抓好 → `None`（走纸面）。
 fn glass_arg<'a>(st: &'a State, disc: f32) -> Option<(&'a [u8], bool, f32)> {
-    if !st.glass || st.glass_bg.len() < (CANVAS * CANVAS * 4) as usize * 2 {
+    if !st.glass || st.glass_bg.len() < (canvas() * canvas() * 4) as usize * 2 {
         None
     } else {
         Some((st.glass_bg.as_slice(), st.glass_liquid, disc))
@@ -11743,7 +11868,7 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
     let r0 = (r_in + r_out) * 0.5;                 // 基准中位半径（不含 hover 抬升）
     let alpha_span = (a2 - a1).to_radians();
     let hv = alpha_span * 0.5 * r0;
-    let cr = (RING_T * RING_CR_K).min(hu * 0.98).min(hv * 0.98);
+    let cr = (ring_t() * RING_CR_K).min(hu * 0.98).min(hv * 0.98);
     let mid_rad = mid_deg.to_radians();
 
     // mode：0 = 正常段（白底 + 描边 + 硬投影）
@@ -11756,12 +11881,12 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
     // 「梯形颜色跟内环要一致」）。底板是 `(1.4 + 1.6*sel)*K` / `pal.paper` /
     // `(3.0+2.0*sel)*K` 偏移 + `0.20+0.10*sel` 强度 —— 这里以前是 2.0/1.1、
     // 填充还掺了 2% 墨、投影只有 0.13，所以两圈看着不是一种材料。
-    let edge_w = if plain { 0.0 } else { (1.4 + 1.6 * hot) * K };
-    let lift = 2.0 * K * hot;
+    let edge_w = if plain { 0.0 } else { (1.4 + 1.6 * hot) * k() };
+    let lift = 2.0 * k() * hot;
     let r_mid = r0 + lift;
     // ⚠️ 极坐标原点**只能是画布中心**。之前这里收了一个 `cx, cy` 参数、调用方传的是
     // 「段中心」→ 半径算成了相对段中心的距离，整段被画成一坨巨形（真机一眼就看出）。
-    let (cx, cy) = (CC, CC);
+    let (cx, cy) = (cc(), cc());
 
     // 包围盒：沿弧采样 + 取内外两个半径（稳、不依赖解析极值）
     let mut minx = f32::MAX;
@@ -11779,14 +11904,14 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
             maxy = maxy.max(y);
         }
     }
-    let pad = edge_w + 3.0 * K + 3.0;
+    let pad = edge_w + 3.0 * k() + 3.0;
     let x0 = (minx - pad).floor().max(0.0) as i32;
     let y0 = (miny - pad).floor().max(0.0) as i32;
-    let x1 = (maxx + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
-    let y1 = (maxy + pad).ceil().min(CANVAS as f32 - 1.0) as i32;
+    let x1 = (maxx + pad).ceil().min(canvas() as f32 - 1.0) as i32;
+    let y1 = (maxy + pad).ceil().min(canvas() as f32 - 1.0) as i32;
 
     // 与内环底板同一套硬投影：偏移 `(3.0+2.0*sel)*K`、强度 `0.20+0.10*sel`
-    let sh_dy = if plain { 0.0 } else { (3.0 + 2.0 * hot) * K };
+    let sh_dy = if plain { 0.0 } else { (3.0 + 2.0 * hot) * k() };
     let sh_a = if plain { 0.0 } else { 0.20 + 0.10 * hot };
     // 填充一律 `pal.paper`（纯白）—— 内环底板也是纯白，不能掺墨变灰
     let fill = match mode {
@@ -11794,7 +11919,7 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
         _ => pal.paper,
     };
     let edge = mixc(mixc(pal.paper, pal.ink, 0.34), pal.ink, hot);
-    let w = CANVAS as usize;
+    let w = canvas() as usize;
     for y in y0..=y1 {
         let fy = y as f32 + 0.5;
         for x in x0..=x1 {
@@ -11812,10 +11937,10 @@ fn draw_ring_sector(buf: &mut [u8], pal: &Pal, r_in: f32, r_out: f32,
                 // 在这条半径上不成立 —— 段在盘外，`e = disc_r - d` 是负的，正好自动跳过）。
                 // 于是胶囊看起来和盘是同一块材料，而不是"玻璃盘上贴了白纸板"。
                 match glass {
-                    Some((bg, dark, dr)) if mode == 0 && bg.len() >= (CANVAS * CANVAS * 4) as usize * 2 => {
+                    Some((bg, dark, dr)) if mode == 0 && bg.len() >= (canvas() * canvas() * 4) as usize * 2 => {
                         let ta = if dark { GLASS_CHIP_A_D } else { GLASS_CHIP_A_L };
                         let (gr, gg, gb) =
-                            glass_px(bg, fx, fy, CC, CC, dr, dark, ta, GLASS_CHIP_RIM, GLASS_SHARP);
+                            glass_px(bg, fx, fy, cc(), cc(), dr, dark, ta, GLASS_CHIP_RIM, GLASS_SHARP);
                         blend_over(buf, o, gr, gg, gb, a_f);
                     }
                     _ => blend_over(buf, o, fill.0 as f32, fill.1 as f32, fill.2 as f32, a_f),
@@ -11866,7 +11991,7 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
     let (a1, a2) = seg;
     let mid = (a1 + a2) * 0.5;
     let col = mixc(pal.paper, pal.ink, 0.50);
-    let lt = 1.5 * K;
+    let lt = 1.5 * k();
     // ① 内外弧虚线
     let dashes = (((a2 - a1) / 7.0).round() as usize).clamp(3, 7);
     dashed_arc(buf, r_in, a1, a2, dashes, col, 0.95 * alpha, lt);
@@ -11889,17 +12014,17 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
         let (x, y) = polar(r_mid, ang);
         (x, y, norm_rot(ang))
     };
-    let (ppx, ppy, pang) = place(-half + CHIP_PAD_L + CHIP_ICON * 0.5);
-    let arm = CHIP_ICON * 0.36;
+    let (ppx, ppy, pang) = place(-half + chip_pad_l() + chip_icon() * 0.5);
+    let arm = chip_icon() * 0.36;
     rot_rrect(buf, ppx, ppy, arm, lt, lt, pang.to_radians(), col, 0.95 * alpha);
     rot_rrect(buf, ppx, ppy, lt, arm, lt, pang.to_radians(), col, 0.95 * alpha);
 
-    let (cjk, lat) = (14.0 * K * KC, 7.5 * K * KC);
-    let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
+    let (cjk, lat) = (14.0 * k() * KC, 7.5 * k() * KC);
+    let avail = (2.0 * half - chip_pad_l() - chip_icon() - chip_gap() - chip_pad_r() + 1.0).max(10.0);
     let label = fit_chip_label(name, avail, cjk, lat);
     if !label.is_empty() {
         let tw = est_text_w(&label, cjk, lat);
-        let (tx, ty, tang) = place(-half + CHIP_PAD_L + CHIP_ICON + CHIP_GAP + tw * 0.5);
+        let (tx, ty, tang) = place(-half + chip_pad_l() + chip_icon() + chip_gap() + tw * 0.5);
         draw_text_rot(st, buf, tx, ty, &label, RING_NAME_PX, tang.to_radians(),
                       col.0, col.1, col.2, (255.0 * alpha).clamp(0.0, 255.0) as u8);
     }
@@ -11928,7 +12053,7 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
     }
     // hover 抬升必须与 `draw_ring_sector` 用同一个公式，否则内容会和段脱开
     let r_mid = (r_in + r_out) * 0.5;
-    let rc = r_mid + RING_LIFT_K * K * hot;
+    let rc = r_mid + RING_LIFT_K * k() * hot;
     // 局部坐标（lx = 沿弧的**弧长**、ly = 径向）→ 画布坐标 + 该处的切线角（度）。
     // ⚠️ 不要退回「切线近似」，理由见函数头注释。
     let place = |lx: f32, ly: f32| -> (f32, f32, f32) {
@@ -11937,22 +12062,22 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
         (x, y, norm_rot(ang))
     };
     let half = ((a2 - a1).to_radians() * 0.5 * r_mid).max(6.0);
-    let (cjk, lat) = (14.0 * K * KC, 7.5 * K * KC);
+    let (cjk, lat) = (14.0 * k() * KC, 7.5 * k() * KC);
     // `+1.0` 是余量：段宽本来就是按同一个 `est_text_w` 算出来的，不给余量会出现
     // 「刚好相等 → 判成放不下 → 截成空串」的浮点毛刺（名称「66」就这样消失过）。
-    let avail = (2.0 * half - CHIP_PAD_L - CHIP_ICON - CHIP_GAP - CHIP_PAD_R + 1.0).max(10.0);
+    let avail = (2.0 * half - chip_pad_l() - chip_icon() - chip_gap() - chip_pad_r() + 1.0).max(10.0);
     let label = fit_chip_label(name, avail, cjk, lat);
 
     // 左端图标（各自贴弧、按该处切线转；与内环同一套纹理管线）
-    let (ix, iy, iang) = place(-half + CHIP_PAD_L + CHIP_ICON * 0.5, 0.0);
+    let (ix, iy, iang) = place(-half + chip_pad_l() + chip_icon() * 0.5, 0.0);
     if let Some(tex) = icon {
-        draw_bgra_icon_rot(buf, ix, iy, CHIP_ICON * (1.0 + 0.06 * hot),
+        draw_bgra_icon_rot(buf, ix, iy, chip_icon() * (1.0 + 0.06 * hot),
                            tex, iang.to_radians(), alpha);
     } else if let Some(ch) = name.chars().next() {
         // 拿不到图标（少数 shell: 命名空间）→ **中性**小底板 + 首字母。
         // 全界面唯一允许有颜色的东西是真实图标，所以这里不放彩色。
-        let h2 = CHIP_ICON * 0.5;
-        rot_rrect(buf, ix, iy, h2, h2, 4.0 * K, iang.to_radians(),
+        let h2 = chip_icon() * 0.5;
+        rot_rrect(buf, ix, iy, h2, h2, 4.0 * k(), iang.to_radians(),
                   mixc(pal.paper, pal.ink, 0.14), alpha);
         let cht = ch.to_uppercase().to_string();
         draw_text_rot(st, buf, ix, iy, &cht, 13, iang.to_radians(),
@@ -11963,19 +12088,19 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
     // 「在等」必须看得出来在动，否则用户只会觉得「点了没反应 / 卡住」。
     if loading {
         let n = 3usize;
-        let step = 7.0 * K * KC;
+        let step = 7.0 * k() * KC;
         // 相位在 0..(2n-2) 之间来回（0,1,2,1,0,1,…）= 来回跳，比单向循环更像「在处理」
         let span = (n * 2 - 2).max(1);
         let ph = ((now_s() * 3.2) as usize) % span;
         let hi = if ph < n { ph } else { span - ph };
         // 把整组点**居中**在文字可用区里（名字变短了，别挤在图标旁边）
         let group = step * (n as f32 - 1.0);
-        let base = -half + CHIP_PAD_L + CHIP_ICON + CHIP_GAP + (avail - group).max(0.0) * 0.5;
-        for k in 0..n {
-            let (dx, dy, _ang) = place(base + k as f32 * step, 0.0);
-            let on = k == hi;
+        let base = -half + chip_pad_l() + chip_icon() + chip_gap() + (avail - group).max(0.0) * 0.5;
+        for kk in 0..n {
+            let (dx, dy, _ang) = place(base + kk as f32 * step, 0.0);
+            let on = kk == hi;
             let col = if on { fg } else { mixc(pal.paper, fg, 0.42) };
-            let r = if on { 3.4 * K } else { 2.1 * K };
+            let r = if on { 3.4 * k() } else { 2.1 * k() };
             flat_circle(buf, dx, dy, r, col, 0.0, col, 0.0, 0.0, 0.0, 0.0, alpha);
         }
         return; // 加载中不画名字、也不画光标
@@ -11983,7 +12108,7 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
 
     if !label.is_empty() {
         let textw = est_text_w(&label, cjk, lat);
-        let (tx, ty, tang) = place(-half + CHIP_PAD_L + CHIP_ICON + CHIP_GAP + textw * 0.5, 0.0);
+        let (tx, ty, tang) = place(-half + chip_pad_l() + chip_icon() + chip_gap() + textw * 0.5, 0.0);
         // ⚠️⚠️ `draw_text_rot` 收的是**弧度**（内部直接 `sin_cos()`）。传「度」=
         // 旋转矩阵整个是错的 → 文字被采样成一团乱码（2026-10-08 踩到，
         // 现场看起来就是「文字坏了」；遮罩本身是好的，落盘验证过）。
@@ -12002,12 +12127,12 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
             let textw = est_text_w(&label, cjk, lat);
             let cw = est_text_w("0", cjk, lat).max(4.0);
             let (bx, by, tang) = place(
-                -half + CHIP_PAD_L + CHIP_ICON + CHIP_GAP + textw + 1.5 + cw * 0.5,
+                -half + chip_pad_l() + chip_icon() + chip_gap() + textw + 1.5 + cw * 0.5,
                 0.0,
             );
             // 高度按**文字实际高度**取（原来是 7K ≈ 9.2px，比文字 11.5px 矮一截，
             // 看着像个小点）
-            let chh = (RING_NAME_PX as f32 * K * KC) * 0.5;
+            let chh = (RING_NAME_PX as f32 * k() * KC) * 0.5;
             rot_rrect(buf, bx, by, cw * 0.5, chh, 1.0, tang.to_radians(), fg, alpha);
         }
     }
@@ -12034,7 +12159,7 @@ const RM_BTN_R: f32 = RM_BTN_H * 0.5;
 /// 按钮边淡入边跟着缩小的球上移
 fn rm_btn_center(btn_a: f32) -> (f32, f32) {
     let a = btn_a.clamp(0.0, 1.0);
-    (CC, CC + HUB_R * (1.0 - RM_BALL_SHRINK * a) + RM_BTN_TUCK * a)
+    (cc(), cc() + hub_r() * (1.0 - RM_BALL_SHRINK * a) + RM_BTN_TUCK * a)
 }
 
 /// 点是否落在取消按钮热区（比视觉尺寸大一圈，指针好点中）
@@ -12066,7 +12191,7 @@ fn drag_screen(st: &State) -> (i32, i32) {
 /// 抽出来是为了让「判定」和「画整圈虚线」用的是同一个数 —— 否则画出来的圈
 /// 和真正的移除边界对不上（看着还在圈里、松手却被删了）。
 fn remove_r(n: usize) -> f32 {
-    (ring_radii(n).1 + REMOVE_PULL).min(CANVAS as f32 * 0.5 - 4.0)
+    (ring_radii(n).1 + REMOVE_PULL).min(canvas() as f32 * 0.5 - 4.0)
 }
 
 fn remove_zone(st: &State, sx: i32, sy: i32) -> bool {
@@ -12075,8 +12200,8 @@ fn remove_zone(st: &State, sx: i32, sy: i32) -> bool {
         return false;
     }
     let lim = remove_r(n);
-    let dx = (sx - st.win_x) as f32 - CC;
-    let dy = (sy - st.win_y) as f32 - CC;
+    let dx = (sx - st.win_x) as f32 - cc();
+    let dy = (sy - st.win_y) as f32 - cc();
     dx * dx + dy * dy > lim * lim
 }
 
@@ -12084,15 +12209,15 @@ fn remove_zone(st: &State, sx: i32, sy: i32) -> bool {
 fn in_disc(st: &State, sx: i32, sy: i32) -> bool {
     let px = (sx - st.win_x) as f32;
     let py = (sy - st.win_y) as f32;
-    let dx = px - CC;
-    let dy = py - CC;
+    let dx = px - cc();
+    let dy = py - cc();
     dx * dx + dy * dy <= disc_r(st.apps.len()) * disc_r(st.apps.len())
 }
 
 /// 屏幕坐标是否还在菜单窗口内（外环胶囊本来就悬在盘沿之外，
 /// 它的「拖出」判定用窗口边界：拖出窗口才算动真格）
 fn in_window(st: &State, sx: i32, sy: i32) -> bool {
-    sx >= st.win_x && sx < st.win_x + CANVAS && sy >= st.win_y && sy < st.win_y + CANVAS
+    sx >= st.win_x && sx < st.win_x + canvas() && sy >= st.win_y && sy < st.win_y + canvas()
 }
 
 /// 输入心跳：光标动了/点了就刷新 last_input，并唤醒发呆中的头像
@@ -12432,9 +12557,9 @@ fn jitter(t_ms: f64, speed: f64, amp: f32) -> f32 {
 /// 段半宽（命中判定与绘制共用同一公式）。
 /// ⚠️ 名称宽度封顶 `RING_NAME_MAX_W`；`draw_ring_content` 里截断用的也是它。
 fn chip_half_w(name: &str) -> f32 {
-    (CHIP_PAD_L + CHIP_ICON + CHIP_GAP
-        + est_text_w(name, 14.0 * K * KC, 7.5 * K * KC).min(RING_NAME_MAX_W)
-        + CHIP_PAD_R)
+    (chip_pad_l() + chip_icon() + chip_gap()
+        + est_text_w(name, 14.0 * k() * KC, 7.5 * k() * KC).min(ring_name_max_w())
+        + chip_pad_r())
         / 2.0
 }
 
@@ -12495,7 +12620,7 @@ fn chip_segs_of(st: &State, ai: usize, names: &[String]) -> Vec<(f32, f32)> {
     let r = (r_in + r_out) * 0.5;
     let a0 = slot_angle(slot_of(st, ai), n);
     let deg_per_px = 180.0 / (std::f32::consts::PI * r);
-    let gap_deg = CHIP_MIN_GAP * deg_per_px;
+    let gap_deg = chip_min_gap() * deg_per_px;
     let wdeg: Vec<f32> = halfs.iter().map(|h| 2.0 * h * deg_per_px).collect();
     let width_deg = sum * deg_per_px;
     let span0 = width_deg + gap_deg * (m.saturating_sub(1)) as f32;
@@ -12506,7 +12631,7 @@ fn chip_segs_of(st: &State, ai: usize, names: &[String]) -> Vec<(f32, f32)> {
         gap_deg
     } else if m > 1 {
         let fit = (CHIP_FAN_MAX - width_deg) / (m - 1) as f32;
-        if fit >= CHIP_GAP_MIN * deg_per_px { fit } else { -1.0 }
+        if fit >= chip_gap_min() * deg_per_px { fit } else { -1.0 }
     } else {
         -1.0
     };
@@ -12521,7 +12646,7 @@ fn chip_segs_of(st: &State, ai: usize, names: &[String]) -> Vec<(f32, f32)> {
     } else {
         // ③ 压到最小缝还铺不下（条目多 + 名字长，一整圈都绕不完）→ 整圈均布兜底
         //    间隙数 = m（闭合环首尾之间也要算一个），第 1 段锚定在 a0
-        let gap = ((std::f32::consts::TAU * r - sum) / m as f32).max(CHIP_MIN_GAP);
+        let gap = ((std::f32::consts::TAU * r - sum) / m as f32).max(chip_min_gap());
         let gd = gap * deg_per_px;
         let mut acc = 0.0f32;
         for j in 0..m {
@@ -12626,7 +12751,7 @@ fn chip_page_cap(st: &State, ai: usize, names: &[String]) -> usize {
     let (r_in, r_out) = ring_radii(st.apps.len());
     let r = (r_in + r_out) * 0.5;
     let deg_per_px = 180.0 / (std::f32::consts::PI * r);
-    let gap = CHIP_MIN_GAP * deg_per_px;
+    let gap = chip_min_gap() * deg_per_px;
     let mut used = 0.0f32;
     let mut cap = 0usize;
     for name in names {
@@ -13795,8 +13920,8 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
         st.decor_hover = decor_slot_at(st, px as f32, py as f32);
         return;
     }
-    let dx = px as f32 - CC;
-    let dy = py as f32 - CC;
+    let dx = px as f32 - cc();
+    let dy = py as f32 - cc();
     let n_ap = st.apps.len();
     // 命中/绘制都必须按**含幽灵的格数**算：有幽灵时整环按 `n+1` 排布、
     // 每格角度也随之变化（`update_hover` 以前用 `apps.len()` 排布，幽灵一出现
@@ -13812,13 +13937,13 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
         let hit_half = icon_sz * 0.5 + 7.0;
         let rr = (dx * dx + dy * dy).sqrt();
         let mut hit: Option<usize> = None;
-        if rr <= r_icon + hit_half + 4.0 * K {
+        if rr <= r_icon + hit_half + 4.0 * k() {
             let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
             // 只认真正显示出来的那一格（`app_at_deg` 与绘制共用同一份槽位换算）
             if let Some(i) = app_at_deg(st, deg, n) {
                 let s = slot_of(st, i);
                 let (ix, iy) = polar(
-                    r_icon - SCROLL_SINK * (1.0 - slot_appear(s, n)),
+                    r_icon - scroll_sink() * (1.0 - slot_appear(s, n)),
                     slot_angle(s, n),
                 );
                 let ddx = px as f32 - ix;
@@ -13883,8 +14008,8 @@ fn face_tick(st: &mut State, now: f64) {
     st.face_prev = now;
 
     // 注视目标 = 鼠标相对盘心的方向，归一化到 -1..1
-    let bx = st.win_x as f32 + CC;
-    let by = st.win_y as f32 + CC;
+    let bx = st.win_x as f32 + cc();
+    let by = st.win_y as f32 + cc();
     let cx = CURSOR_X.load(Ordering::Relaxed) as f32;
     let cy = CURSOR_Y.load(Ordering::Relaxed) as f32;
     let rng = (disc_r(st.apps.len()) * 1.6).max(1.0);
@@ -14391,6 +14516,31 @@ unsafe fn on_timer(st: &mut State) {
         if fdt > 100 {
             diag_push(DK_UI_SLOW, fdt.min(0x00ff_ffff));
         }
+        // 实时玻璃自检：正常机器一帧 1~5ms；公司那台每帧重采盘内玻璃要 100~300ms，
+        // 轮盘实际只剩 3~10fps，而且 WDA 还会让窗口在截屏/录屏里冻住。
+        // 连续 8 帧超过阈值 → 本次运行退回快照玻璃，撤掉 WDA 让窗口恢复普通合成。
+        if st.glass && st.glass_live && GLASS_LIVE_ON.load(Ordering::Relaxed) {
+            let slow = fdt > GLASS_LIVE_SLOW_MS;
+            let n = if slow {
+                GLASS_LIVE_SLOW_N.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                GLASS_LIVE_SLOW_N.store(0, Ordering::Relaxed);
+                0
+            };
+            if n >= 8 {
+                GLASS_LIVE_BLOCKED.store(true, Ordering::Relaxed);
+                let rh = RING_HWND.load(Ordering::Relaxed);
+                if rh != 0 {
+                    glass_live_stop(HWND(rh as *mut c_void));
+                }
+                glass_note(GL_LIVE_OFF, || {
+                    format!(
+                        "GLASS live=off（连续 {n} 帧 >{GLASS_LIVE_SLOW_MS}ms → 本机实时抓屏太重，\
+                         本次运行退回快照玻璃，WDA 已撤）"
+                    )
+                });
+            }
+        }
     }
 }
 
@@ -14425,7 +14575,7 @@ unsafe fn frame(st: &mut State, alpha: u8) {
     if st.dbi_bits.is_null() {
         return;
     }
-    let n = (CANVAS * CANVAS * 4) as usize;
+    let n = (canvas() * canvas() * 4) as usize;
     let buf = std::slice::from_raw_parts_mut(st.dbi_bits, n);
     draw_scene(st, buf);
     premultiply(buf);
@@ -14436,7 +14586,7 @@ unsafe fn frame(st: &mut State, alpha: u8) {
     }
     let dst = POINT { x: st.win_x, y: st.win_y };
     let src = POINT::default();
-    let size = SIZE { cx: CANVAS, cy: CANVAS };
+    let size = SIZE { cx: canvas(), cy: canvas() };
     let blend = BLENDFUNCTION {
         BlendOp: 0u8,
         BlendFlags: 0,
@@ -14479,8 +14629,8 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    st.win_x = (sx - CANVAS / 2).clamp(vx, vx + vw - CANVAS);
-    st.win_y = (sy - CANVAS / 2).clamp(vy, vy + vh - CANVAS);
+    st.win_x = (sx - canvas() / 2).clamp(vx, vx + vw - canvas());
+    st.win_y = (sy - canvas() / 2).clamp(vy, vy + vh - canvas());
 
     // 呼出时刷新「哪些应用正在运行」+ 每个应用最前面的窗口（圆点 + 悬停预览的数据源）
     refresh_running(st);
@@ -14544,15 +14694,15 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     } else if !st.glass_bg.is_empty() {
         set_glass_bg(st, Vec::new());
     }
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, st.win_x, st.win_y, CANVAS, CANVAS, SWP_NOACTIVATE);
+    let _ = SetWindowPos(hwnd, HWND_TOPMOST, st.win_x, st.win_y, canvas(), canvas(), SWP_NOACTIVATE);
     frame(st, 255);
     let _ = SetWindowPos(
         hwnd,
         HWND_TOPMOST,
         st.win_x,
         st.win_y,
-        CANVAS,
-        CANVAS,
+        canvas(),
+        canvas(),
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
     // 窗口已经显示 → 从这一刻起后台线程每 33ms 重抓一次背景（首帧快照仍是上面那张）
@@ -15774,7 +15924,7 @@ WM_APP_DISMISS_FG => {
                 return LRESULT(0);
             }
             let (r, _icon) = ring_layout(n);
-            let (dx, dy) = polar(r - SCROLL_SINK * (1.0 - a), slot_angle(s, n));
+            let (dx, dy) = polar(r - scroll_sink() * (1.0 - a), slot_angle(s, n));
             let sx = (st.win_x + dx as i32).clamp(0, 65535);
             let sy = (st.win_y + dy as i32).clamp(0, 65535);
             return LRESULT(((sy as isize) << 16) | (sx as isize));
@@ -15812,10 +15962,10 @@ WM_APP_DISMISS_FG => {
                 st.win_y
             );
             if !st.dbi_bits.is_null() {
-                let n = (CANVAS * CANVAS * 4) as usize;
+                let n = (canvas() * canvas() * 4) as usize;
                 let buf = std::slice::from_raw_parts(st.dbi_bits, n);
                 let path = format!("{}\\live_dump.bmp", exe_dir());
-                let ok = save_bmp(&path, buf, CANVAS, CANVAS);
+                let ok = save_bmp(&path, buf, canvas(), canvas());
                 println!("[dump] {} {}", if ok { "OK" } else { "FAIL" }, path);
             }
             LRESULT(0)
@@ -17986,7 +18136,7 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
 ///   ② 头像 SDF 按全局 `CANVAS` 定宽 → 先渲染到那块画布，再搬中心一块过来；
 ///   ③ 在 CANVAS 上按 **SS 倍半径**画 = 目标像素尺寸 → 搬运是 **1:1**，不用缩放。
 unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
-    let n = (CANVAS * CANVAS * 4) as usize;
+    let n = (canvas() * canvas() * 4) as usize;
     if st.hub_buf.len() != n {
         st.hub_buf = vec![0u8; n];
     }
@@ -17997,7 +18147,7 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
         for b in src.iter_mut() {
             *b = 0;
         }
-        draw_hub_face(&*st, &mut src, CC, CC, r as f32 * ssx(), &pal, now);
+        draw_hub_face(&*st, &mut src, cc(), cc(), r as f32 * ssx(), &pal, now);
         st.hub_buf = src;
     }
 
@@ -18005,7 +18155,7 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
     let size = half * 2;
     let hi_w = (set_lo_w() * SS) as usize;
     let hi_h = (set_lo_h() * SS) as usize;
-    let cw = CANVAS as usize;
+    let cw = canvas() as usize;
     let dx0 = ((cx + S_M) as f32 * ssx()).round() as i32 - half;
     let dy0 = ((cy + S_M) as f32 * ssx()).round() as i32 - half;
     let hub = std::slice::from_raw_parts(st.hub_buf.as_ptr(), n);
@@ -18015,8 +18165,8 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
         if ty < 0 || ty >= hi_h as i32 {
             continue;
         }
-        let sy = CC as i32 - half + y;
-        if sy < 0 || sy >= CANVAS {
+        let sy = cc() as i32 - half + y;
+        if sy < 0 || sy >= canvas() {
             continue;
         }
         for x in 0..size {
@@ -18024,8 +18174,8 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
             if tx < 0 || tx >= hi_w as i32 {
                 continue;
             }
-            let sx = CC as i32 - half + x;
-            if sx < 0 || sx >= CANVAS {
+            let sx = cc() as i32 - half + x;
+            if sx < 0 || sx >= canvas() {
                 continue;
             }
             let so = (sy as usize * cw + sx as usize) * 4;
@@ -18738,6 +18888,11 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
         Ctl::GlassLive => {
             st.glass_live = !st.glass_live;
             save_settings(st);
+            // 用户在设置里手动再开一次 = 愿意再试一把：清掉「本次运行不再实时」的黑名单
+            if st.glass_live {
+                GLASS_LIVE_BLOCKED.store(false, Ordering::Relaxed);
+                GLASS_LIVE_SLOW_N.store(0, Ordering::Relaxed);
+            }
             // 轮盘可能正开着（常驻模式 / 从轮盘进的设置）：立刻把这条改动落实到窗口上，
             // 否则「关了还在录屏里留个洞」或「开了要等下次呼出才生效」。
             let rh = RING_HWND.load(Ordering::Relaxed);
@@ -27774,6 +27929,15 @@ fn main() {
         } else {
             set_ui_scale(1.0);
         }
+        if let Ok(v) = std::env::var("PIPIE_RING_SCALE") {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                set_ring_scale(f);
+            } else {
+                set_ring_scale(1.0);
+            }
+        } else {
+            set_ring_scale(1.0);
+        }
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -28339,8 +28503,9 @@ fn main() {
 
     unsafe {
         let _ = SetProcessDPIAware();
-        // 设置页按系统 DPI 缩放：高分屏（150%/200%）上不再是一小块。
-        unsafe { init_ui_scale(); }
+        // 轮盘 + 设置页都按系统 DPI 缩放：高分屏（150%/200%）上不再是一小块。
+        init_ring_scale();
+        init_ui_scale();
         let hinst = HINSTANCE(GetModuleHandleW(None).unwrap_or(HMODULE(ptr::null_mut())).0);
         let mut st = State::new();
         let p: *mut State = &mut st;
@@ -28426,8 +28591,8 @@ fn main() {
             WS_POPUP,
             0,
             0,
-            CANVAS,
-            CANVAS,
+            canvas(),
+            canvas(),
             HWND(ptr::null_mut()),
             HMENU(ptr::null_mut()),
             hinst,
