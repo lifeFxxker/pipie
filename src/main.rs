@@ -1282,19 +1282,19 @@ struct State {
     /// 后台检查发现「确实有更新」的那个版本号（ini `update_avail_ver`，空 = 没有）。
     /// ⚠️ 必须落盘：提醒是在**下一次呼出轮盘**时才发生的，中间可能已经重启过。
     update_avail_ver: String,
-    /// 已经用**更新弹窗**提醒过的版本（ini `update_modal_ver`）—— 每版本只弹一次
-    update_modal_ver: String,
     /// 本次运行里用户点了「稍后」：更新条 + 弹窗都不再出现（重启后恢复）
     upd_dismissed: bool,
     /// 更新弹窗是否正开着
     upd_modal: bool,
     /// 更新 UI 的悬停项：0 无 / 1 更新按钮 / 2 更新条本体 / 3 关闭 / 4 稍后 / 5 立即
     upd_hover: u8,
-    /// 启动时「只显示更新窗口」模式：不画轮盘，只画小卡，且不自动收起
+    /// 启动时「只显示更新窗口」模式：不画轮盘，只画小卡，且不自动收起（仅 `--upd-sim` 测试用）
     upd_only: bool,
-    /// 启动流程在等第一次版本检查出结果（决定亮环还是亮更新窗口）
-    upd_startup_wait: bool,
-    upd_startup_deadline: f64,
+    /// 本次呼出是否展示轮盘底部的更新条（每次 `show_menu` 重新决定）
+    upd_pill_vis: bool,
+    /// 这个更新版本已经展示过几次更新条（ini `update_seen_ver` / `update_seen_n`）
+    update_seen_ver: String,
+    update_seen_n: u8,
 
     // ── 拖入引导（onboarding）四步阶梯（用户 2026-10-14 定稿）──
     // ①② 由「**真的做了那个动作**」置位 → 槽位是 self-clearing 的，不需要任何"已读"状态；
@@ -1704,13 +1704,13 @@ impl State {
             update_latest: String::new(),
             update_msg: String::new(),
             update_avail_ver: String::new(),
-            update_modal_ver: String::new(),
             upd_dismissed: false,
             upd_modal: false,
             upd_hover: 0,
             upd_only: false,
-            upd_startup_wait: false,
-            upd_startup_deadline: 0.0,
+            upd_pill_vis: false,
+            update_seen_ver: String::new(),
+            update_seen_n: 0,
             onb_drag: false,
             onb_customized: false,
             onb_move: false,
@@ -2722,13 +2722,25 @@ unsafe fn draw_bubble(st: &mut State, buf: &mut [u8], pal: &Pal) {
 /// `buf` 必须是 `CANVAS×CANVAS` 的 BGRA 预乘缓冲：`flat_circle` / `rot_rrect` 按
 /// **全局 `CANVAS`** 定宽（写死了），所以只能在那个尺寸的画布上画；调用方要小图就
 /// 自己从中心裁一块缩下去。`r` = 球半径（入场 `pop`、让位缩放之类的**外部**系数由调用方乘好）。
-unsafe fn draw_hub_face(st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, pal: &Pal, now: f64) {
+unsafe fn draw_hub_face(
+    st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, pal: &Pal, now: f64, follow: bool,
+) {
     let ft = (now - st.face0) as f32;
-    // 自定义头像：把用户图片裁成圆画上去（保留呼吸 / 让位缩放），不再画表情球
+    // 自定义头像：把用户图片裁成圆画上去（保留呼吸 / 让位缩放），不再画表情球。
+    // `follow` = 轮盘中心：整圆跟着光标**轻微平移**（识别眼睛不现实，整头动就够了）。
     if let Some(av) = st.avatar.as_ref() {
         let br = (ft / 3.2 * std::f32::consts::TAU).sin() * 0.014;
         let fr = r * (1.0 + br) * (1.0 - RM_BALL_SHRINK * st.cancel_a.clamp(0.0, 1.0));
-        blend_avatar_circle(buf, canvas() as usize, av.frame_at(now), av.size, cx, cy, fr, 1.0);
+        let (ax, ay) = if follow {
+            // 与默认表情球同一套注视量（含常驻微漂移），只是幅度小一点
+            let gx = (st.gaze[0] + 0.05 * ((0.42 * ft).sin() + 0.35 * (1.0 * ft).sin()))
+                .clamp(-1.25, 1.25);
+            let gy = (st.gaze[1] + 0.04 * (0.58 * ft).sin()).clamp(-1.25, 1.25);
+            (cx + gx * r * 0.06, cy + gy * r * 0.06)
+        } else {
+            (cx, cy)
+        };
+        blend_avatar_circle(buf, canvas() as usize, av.frame_at(now), av.size, ax, ay, fr, 1.0);
         return;
     }
     let open = blink_open(&st.blink_q, now).clamp(0.0, 1.45);
@@ -4510,10 +4522,6 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
 // 设计稿：tools/_upddemo/。要点：只要轮盘被呼出，更新入口就一直在眼前；
 // 「稍后」只压本轮（会话），下次启动还会提示；弹窗每版本最多一次（ini 记账）。
 
-const UPD_PAPER: (u8, u8, u8) = (247, 247, 249);
-const UPD_INK: (u8, u8, u8) = (28, 28, 30);
-const UPD_MUTED: (u8, u8, u8) = (108, 108, 114);
-const UPD_EDGE: (u8, u8, u8) = (180, 180, 186);
 
 fn upd_offer(st: &State) -> bool {
     !st.update_latest.is_empty() && matches!(st.update_st, 3 | 4 | 5 | 6)
@@ -4567,7 +4575,7 @@ fn upd_hit(st: &State, x: f32, y: f32) -> u8 {
         }
         return 0;
     }
-    if st.upd_dismissed || !upd_offer(st) {
+    if !st.upd_pill_vis || st.upd_dismissed || !upd_offer(st) {
         return 0;
     }
     if in_box(upd_pill_btn_box(), x, y) {
@@ -4585,19 +4593,27 @@ fn upd_open_modal(st: &mut State) {
     LOCKED.store(true, Ordering::SeqCst);
 }
 
-/// 每版本第一次真实呼出时弹一次（记账落盘；新版本会重新弹）
-unsafe fn upd_maybe_modal(st: &mut State) {
-    if st.upd_modal
-        || st.upd_dismissed
-        || !upd_offer(st)
-        || !matches!(st.update_st, 3 | 5)
-        || st.update_modal_ver == st.update_latest
-    {
+/// 这次呼出要不要展示轮盘底部的更新条。
+///
+/// 规则（用户 2026-11-12）：**同一个更新版本只在前两次打开轮盘时展示**更新条；
+/// 第三次起不再出现（本轮版本），下次有新版本重新计数。
+/// 更新弹窗**不再自动弹出** —— 点更新条才展开。
+unsafe fn upd_refresh_pill(st: &mut State) {
+    if !upd_offer(st) {
+        st.upd_pill_vis = false;
         return;
     }
-    upd_open_modal(st);
-    st.update_modal_ver = st.update_latest.clone();
-    save_settings(st);
+    if st.update_seen_ver != st.update_latest {
+        st.update_seen_ver = st.update_latest.clone();
+        st.update_seen_n = 0;
+    }
+    if st.update_seen_n < 2 {
+        st.update_seen_n += 1;
+        st.upd_pill_vis = true;
+        save_settings(st);
+    } else {
+        st.upd_pill_vis = false;
+    }
 }
 
 /// 启动时的短暂「亮个相」
@@ -4613,7 +4629,8 @@ unsafe fn startup_reveal(st: &mut State) {
     st.hide_at = now_s() + REVEAL_SECS;
 }
 
-/// 启动时发现有新版本：不亮环，只弹更新窗口（方形画布 + 纯纸卡），不自动收
+/// 只弹更新窗口（方形画布 + 卡片），不画轮盘、不自动收。
+/// ⚠️ 现在只有测试参数 `--upd-sim` 会走这里；正常启动发现新版只出「更新条」。
 unsafe fn open_update_window(st: &mut State) {
     let mut cp = POINT::default();
     let _ = GetCursorPos(&mut cp);
@@ -4625,8 +4642,6 @@ unsafe fn open_update_window(st: &mut State) {
     st.locked = true;
     LOCKED.store(true, Ordering::SeqCst);
     st.hide_at = 0.0;
-    st.upd_startup_wait = false;
-    st.update_modal_ver = st.update_latest.clone();
     save_settings(st);
     frame(st, 255);
 }
@@ -4685,18 +4700,23 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
     if st.hiding {
         return;
     }
+    // 弹窗走设置页那套配色：纸色卡 + edge 描边 + block 主按钮（深色下不再是白卡）
+    let pal = pal_of(st.glass_liquid);
+    let up_fill = mixc(pal.paper, pal.ink, 0.04);
+    let up_muted = mixc(pal.paper, pal.ink, 0.55);
+    let up_bullet = mixc(pal.paper, pal.ink, 0.82);
     if st.upd_modal {
         // 不要整块压暗：环窗口只有 475²，压暗会把投影外的透明区也涂成灰方块。
         // 卡片自身有纸色 + 投影，已经压得住盘面，这里不再画遮罩。
         let (x0, y0, x1, _y1) = upd_card_box();
         rot_rrect_ex(
-            buf, cc(), cc(), pxs(186.0), pxs(110.0), pxs(20.0), 0.0,
-            UPD_PAPER, 0.0, UPD_INK, 0.0, pxs(6.0), 0.35, pxs(10.0), 1.0,
+            buf, cc(), cc(), pxs(186.0), pxs(110.0), pxs(18.0), 0.0,
+            up_fill, pxs(1.0), pal.edge, 1.0, pxs(6.0), 0.30, pxs(10.0), 1.0,
         );
-        upd_icon(st, buf, x0 + pxs(36.0), y0 + pxs(38.0), pxs(17.0), UPD_INK, UPD_PAPER);
+        upd_icon(st, buf, x0 + pxs(36.0), y0 + pxs(38.0), pxs(17.0), pal.block, pal.paper);
 
         draw_text(st, buf, (x0 + pxs(64.0)) as i32, (y0 + pxs(34.0)) as i32,
-                  "发现新版本", 20, 700, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(280.0) as i32, 0);
+                  "发现新版本", 20, 700, pal.ink.0, pal.ink.1, pal.ink.2, 255, pxs(280.0) as i32, 0);
         let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
         let sub = match st.update_st {
             5 => format!("v{} · 下载完成，重启后生效", st.update_latest),
@@ -4705,15 +4725,15 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
             _ => format!("v{} · 建议尽快更新", st.update_latest),
         };
         draw_text(st, buf, (x0 + pxs(64.0)) as i32, (y0 + pxs(58.0)) as i32,
-                  &sub, 13, 500, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(280.0) as i32, 0);
+                  &sub, 13, 500, up_muted.0, up_muted.1, up_muted.2, 255, pxs(280.0) as i32, 0);
         if st.update_st == 6 {
             let (bx0, bx1, by) = (x0 + pxs(64.0), x1 - pxs(26.0), y0 + pxs(74.0));
-            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_EDGE, 1.0);
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.edge, 1.0);
             let span = bx1 - bx0;
             if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
                 let fw = span * (pct.min(100) as f32 / 100.0);
                 if fw > pxs(1.0) {
-                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 1.0);
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 1.0);
                 }
             } else if span > pxs(4.0) {
                 // 总大小未知（chunked）：一条游标来回走，证明「在动」，不是卡 0%
@@ -4721,7 +4741,7 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                 let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
                 let seg = span * 0.32;
                 let sx = bx0 + (span - seg) * k;
-                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 0.75);
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 0.75);
             }
         }
         for (i, t) in [
@@ -4732,26 +4752,30 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         .enumerate()
         {
             draw_text(st, buf, (x0 + pxs(26.0)) as i32, (y0 + pxs(92.0) + i as f32 * pxs(22.0)) as i32,
-                      t, 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(320.0) as i32, 0);
+                      t, 13, 500, up_bullet.0, up_bullet.1, up_bullet.2, 255, pxs(320.0) as i32, 0);
         }
         draw_text(st, buf, (x1 - pxs(26.0)) as i32, (y0 + pxs(24.0)) as i32,
-                  "×", 20, 700, UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+                  "×", 20, 700, up_muted.0, up_muted.1, up_muted.2, 255, 0, 0);
 
         let (gx0, gy0, gx1, gy1) = upd_card_btn_box(false);
+        let ghv = if st.upd_hover == 4 { 1.0 } else { 0.0 };
+        let gedge = mixc(pal.edge, pal.ink, 0.25 + 0.5 * ghv);
         rot_rrect_ex(
             buf, (gx0 + gx1) * 0.5, (gy0 + gy1) * 0.5,
             (gx1 - gx0) * 0.5, (gy1 - gy0) * 0.5, pxs(16.0), 0.0,
-            UPD_PAPER, 1.0, UPD_EDGE, 1.0, 0.0, 0.0, 0.0, 1.0,
+            mixc(pal.paper, pal.ink, 0.06 * ghv), pxs(1.0), gedge, 1.0, 0.0, 0.0, 0.0, 1.0,
         );
+        let gtxt = mixc(pal.paper, pal.ink, 0.62 + 0.28 * ghv);
         draw_text(st, buf, ((gx0 + gx1) * 0.5) as i32, ((gy0 + gy1) * 0.5) as i32,
-                  "稍后", 13, 500, UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, 0, 0);
+                  "稍后", 13, 500, gtxt.0, gtxt.1, gtxt.2, 255, 0, 0);
 
         let (px0, py0, px1, py1) = upd_card_btn_box(true);
-        let pf = if st.upd_hover == 5 { (52, 52, 58) } else { UPD_INK };
+        let phv = if st.upd_hover == 5 { 1.0 } else { 0.0 };
+        let pf = mixc(pal.block, pal.paper, 0.10 * phv);
         rot_rrect_ex(
             buf, (px0 + px1) * 0.5, (py0 + py1) * 0.5,
             (px1 - px0) * 0.5, (py1 - py0) * 0.5, pxs(16.0), 0.0,
-            pf, 0.0, UPD_INK, 0.0, 0.0, 0.0, 0.0, 1.0,
+            pf, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, 1.0,
         );
         let ptext = match st.update_st {
             5 => "立即重启更新",
@@ -4760,19 +4784,19 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
             _ => "立即更新",
         };
         draw_text(st, buf, ((px0 + px1) * 0.5) as i32, ((py0 + py1) * 0.5) as i32,
-                  ptext, 13, 700, UPD_PAPER.0, UPD_PAPER.1, UPD_PAPER.2, 255, 0, 0);
+                  ptext, 13, 700, pal.paper.0, pal.paper.1, pal.paper.2, 255, 0, 0);
         return;
     }
-    if st.upd_dismissed || !upd_offer(st) {
+    if !st.upd_pill_vis || st.upd_dismissed || !upd_offer(st) {
         return;
     }
 
     let (x0, y0, x1, y1) = upd_pill_box();
     rot_rrect_ex(
         buf, cc(), (y0 + y1) * 0.5, pxs(161.0), pxs(23.0), pxs(23.0), 0.0,
-        UPD_PAPER, 0.0, UPD_INK, 0.0, pxs(5.0), 0.28, pxs(10.0), 1.0,
+        up_fill, pxs(1.0), pal.edge, 1.0, pxs(5.0), 0.26, pxs(10.0), 1.0,
     );
-    upd_icon(st, buf, x0 + pxs(27.0), (y0 + y1) * 0.5, pxs(15.0), UPD_INK, UPD_PAPER);
+    upd_icon(st, buf, x0 + pxs(27.0), (y0 + y1) * 0.5, pxs(15.0), pal.block, pal.paper);
 
     let tx = (x0 + pxs(52.0)) as i32;
     let cy = ((y0 + y1) * 0.5) as i32;
@@ -4780,29 +4804,29 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
         6 => {
             let (title, val) = update_dl_short();
             draw_text(st, buf, tx, cy - pxs(5.0) as i32, title, 14, 700,
-                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(100.0) as i32, 0);
+                      pal.ink.0, pal.ink.1, pal.ink.2, 255, pxs(100.0) as i32, 0);
             let vs = format!("v{}", st.update_latest);
             draw_text(st, buf, tx + pxs(76.0) as i32, cy - pxs(5.0) as i32, &vs, 13, 500,
-                      UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(70.0) as i32, 0);
+                      up_muted.0, up_muted.1, up_muted.2, 255, pxs(70.0) as i32, 0);
             if !val.is_empty() {
                 draw_text(st, buf, (x1 - pxs(20.0)) as i32, cy - pxs(5.0) as i32, &val, 13, 500,
-                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, 0, 0);
+                          up_muted.0, up_muted.1, up_muted.2, 255, 0, 0);
             }
             let (bx0, bx1, by) = (x0 + pxs(52.0), x1 - pxs(16.0), y1 - pxs(9.0));
-            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_EDGE, 1.0);
+            rot_rrect(buf, (bx0 + bx1) * 0.5, by, (bx1 - bx0) * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.edge, 1.0);
             let span = bx1 - bx0;
             if UPDATE_TOTAL.load(Ordering::Relaxed) > 0 {
                 let pct = UPDATE_PROGRESS.load(Ordering::Relaxed);
                 let fw = span * (pct.min(100) as f32 / 100.0);
                 if fw > pxs(1.0) {
-                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 1.0);
+                    rot_rrect(buf, bx0 + fw * 0.5, by, fw * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 1.0);
                 }
             } else if span > pxs(4.0) {
                 let ph = (now_s() * 0.9) % 2.0;
                 let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
                 let seg = span * 0.32;
                 let sx = bx0 + (span - seg) * k;
-                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, UPD_INK, 0.75);
+                rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 0.75);
             }
         }
         _ => {
@@ -4812,19 +4836,23 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                 _ => ("发现新版本", "更新"),
             };
             draw_text(st, buf, tx, cy, title, 14, 700,
-                      UPD_INK.0, UPD_INK.1, UPD_INK.2, 255, pxs(170.0) as i32, 0);
+                      pal.ink.0, pal.ink.1, pal.ink.2, 255, pxs(170.0) as i32, 0);
             let tw = (title.chars().count() as f32 * pxs(14.0)) as i32;
             if st.update_st != 5 {
                 let vs = format!("v{}", st.update_latest);
                 draw_text(st, buf, tx + tw + pxs(6.0) as i32, cy, &vs, 13, 500,
-                          UPD_MUTED.0, UPD_MUTED.1, UPD_MUTED.2, 255, pxs(60.0) as i32, 0);
+                          up_muted.0, up_muted.1, up_muted.2, 255, pxs(60.0) as i32, 0);
             }
             let (bx0, by0, bx1, by1) = upd_pill_btn_box();
-            let bf = if st.upd_hover == 1 { (52, 52, 58) } else { UPD_INK };
+            let bf = if st.upd_hover == 1 {
+                mixc(pal.block, pal.paper, 0.10)
+            } else {
+                pal.block
+            };
             rot_rrect(buf, (bx0 + bx1) * 0.5, (by0 + by1) * 0.5,
                       (bx1 - bx0) * 0.5, (by1 - by0) * 0.5, pxs(15.0), 0.0, bf, 1.0);
             draw_text(st, buf, ((bx0 + bx1) * 0.5) as i32, ((by0 + by1) * 0.5) as i32,
-                      btn, 13, 700, UPD_PAPER.0, UPD_PAPER.1, UPD_PAPER.2, 255, 0, 0);
+                      btn, 13, 700, pal.paper.0, pal.paper.1, pal.paper.2, 255, 0, 0);
         }
     }
 }
@@ -4965,7 +4993,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     //    几何/动效全部在 `draw_hub_face` 里（与「关于」页的 logo 共用）。
     //    装饰分两层：球后的（爆炸头/翅膀）先画、球前的（帽子/眼镜…）后画。
     draw_equipped_decor(&*st, buf, true, hub_r() * pop, &pal);
-    draw_hub_face(&*st, buf, cc(), cc(), hub_r() * pop, &pal, now);
+    draw_hub_face(&*st, buf, cc(), cc(), hub_r() * pop, &pal, now, true);
     draw_equipped_decor(&*st, buf, false, hub_r() * pop, &pal);
 
     // ── 2b. 装饰轮盘：点中心头像展开，内环位置换成装饰槽 ──
@@ -10301,6 +10329,7 @@ unsafe fn dump_all(dir: &str) {
         st.update_st = 3;
         st.upd_dismissed = false;
         st.upd_modal = false;
+        st.upd_pill_vis = true;
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}{}dump_update_pill.bmp", dir, std::path::MAIN_SEPARATOR), &buf, canvas(), canvas());
 
@@ -10323,6 +10352,7 @@ unsafe fn dump_all(dir: &str) {
         st.upd_modal = false;
         st.update_st = 0;
         st.update_latest.clear();
+        st.upd_pill_vis = false;
         st.glass_liquid = false;
     }
 
@@ -10876,13 +10906,41 @@ unsafe fn read_persistent(st: &mut State) {
                 st.update_last_check = v.parse::<f64>().unwrap_or(0.0);
             } else if let Some(v) = get("update_avail_ver=") {
                 st.update_avail_ver = v;
-            } else if let Some(v) = get("update_modal_ver=") {
-                st.update_modal_ver = v;
+            } else if let Some(v) = get("update_seen_ver=") {
+                st.update_seen_ver = v;
+            } else if let Some(v) = get("update_seen_n=") {
+                st.update_seen_n = v.parse::<u8>().unwrap_or(0);
             }
+        }
+    }
+    // 上次已经知道「有新版本」→ 恢复状态：重启后第一次打开轮盘也能看到更新条。
+    // 只在确实比当前版本新时才恢复（升级完再把旧记录当成「有新版」就荒唐了）。
+    if !st.update_avail_ver.is_empty() {
+        if ver_newer(&st.update_avail_ver, cur_version()) {
+            st.update_latest = st.update_avail_ver.clone();
+            st.update_st = 3;
+        } else {
+            st.update_avail_ver.clear();
         }
     }
     apply_theme(st);
     apply_key_opts(st);
+}
+
+/// a 比 b 新？（逐段数字比较，缺省按 0）
+fn ver_newer(a: &str, b: &str) -> bool {
+    let pa: Vec<u32> = a.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    let pb: Vec<u32> = b.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    for i in 0..pa.len().max(pb.len()) {
+        let (x, y) = (
+            pa.get(i).copied().unwrap_or(0),
+            pb.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
 }
 
 /// 重新解码全部应用图标（增删应用后调用）
@@ -15096,6 +15154,8 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     );
     // 窗口已经显示 → 从这一刻起后台线程每 33ms 重抓一次背景（首帧快照仍是上面那张）
     glass_live_start(st, hwnd);
+    // 更新条：同一个版本只在前两次呼出时展示（点击它才展开更新弹窗）
+    unsafe { upd_refresh_pill(st) };
     let mh = MAIN_HWND.load(Ordering::Relaxed);
     if mh != 0 {
         let _ = SetTimer(HWND(mh as *mut c_void), TIMER_FRAME, 16, None);
@@ -15337,7 +15397,6 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     st.locked = true;
                     LOCKED.store(true, Ordering::SeqCst);
                 }
-                unsafe { upd_maybe_modal(st) };
                 return LRESULT(0);
             }
             let mut x = CURSOR_X.load(Ordering::Relaxed);
@@ -15355,8 +15414,6 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 st.locked = true;
                 LOCKED.store(true, Ordering::SeqCst);
             }
-            // 有新版本 → 每个版本第一次真实呼出弹一张小卡（比头像气泡强）
-            unsafe { upd_maybe_modal(st) };
             LRESULT(0)
         }
         WM_APP_HOVER => {
@@ -16042,6 +16099,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 4 => st.locked as usize,
                 5 => st.upd_only as usize,
                 6 => MENU_OPEN.load(Ordering::Relaxed) as usize,
+                7 => UPDATE_PHASE.load(Ordering::Relaxed) as usize,
+                8 => UPDATE_BYTES.load(Ordering::Relaxed) as usize,
+                9 => UPDATE_TOTAL.load(Ordering::Relaxed) as usize,
+                10 => UPDATE_PROGRESS.load(Ordering::Relaxed) as usize,
+                11 => UPDATE_SRC.load(Ordering::Relaxed) as usize,
+                12 => st.upd_pill_vis as usize,
+                13 => st.update_seen_n as usize,
                 _ => 0,
             };
             LRESULT(v as isize)
@@ -16109,21 +16173,24 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     st.update_latest = latest;
                 }
                 st.update_msg = msg;
-                // s=3「有新版本」→ 把版本号记到 ini：提醒要等**下一次呼出**才发生，
-                // 中间进程可能已经重启过，不落盘这条提醒就会丢。
-                if s == 3 && st.update_avail_ver != st.update_latest {
-                    st.update_avail_ver = st.update_latest.clone();
+                // s=2「已是最新」→ 清掉「可更新版本」记录（升级后别再拿旧版本提示）
+                if s == 2 && !st.update_avail_ver.is_empty() {
+                    st.update_avail_ver.clear();
                     unsafe { save_settings(st) };
                 }
-                if st.upd_startup_wait {
-                    st.upd_startup_wait = false;
-                    if s == 3 && !st.update_latest.is_empty() {
-                        unsafe { open_update_window(st) };
-                    } else {
-                        unsafe { startup_reveal(st) };
+                // s=3「有新版本」→ 落盘版本号 + 重置「已展示次数」。
+                // ⚠️ 不再自动弹更新窗口：只在轮盘底部出更新条（每版前两次呼出），点它才展开。
+                if s == 3 && !st.update_latest.is_empty() {
+                    if st.update_avail_ver != st.update_latest {
+                        st.update_avail_ver = st.update_latest.clone();
+                        st.update_seen_ver = st.update_latest.clone();
+                        st.update_seen_n = 0;
+                        st.upd_pill_vis = false;
+                        unsafe { save_settings(st) };
                     }
-                } else if MENU_OPEN.load(Ordering::Relaxed) {
-                    unsafe { upd_maybe_modal(st) };
+                    if MENU_OPEN.load(Ordering::Relaxed) && !st.hiding {
+                        unsafe { upd_refresh_pill(st) };
+                    }
                 }
             }
             unsafe { kick_setup_frame(st) };
@@ -16411,10 +16478,6 @@ WM_APP_DISMISS_FG => {
                 // 判据要齐：`MENU_OPEN` 管可见性、`hiding` 管淡出动画、`locked` 管
                 // 常驻锁定、`bub_a` 管气泡淡入、`DRAG_ACTIVE` 管 OLE 拖放 ——
                 // 少一条就会在正画的时候裁剪、当前帧的页被丢回去 → 反而卡顿。
-                if st.upd_startup_wait && now_s() >= st.upd_startup_deadline {
-                    st.upd_startup_wait = false;
-                    startup_reveal(st);
-                }
                 if st.trim_at > 0.0 && now_s() >= st.trim_at {
                     st.trim_at = 0.0;
                     if !MENU_OPEN.load(Ordering::Relaxed)
@@ -18564,7 +18627,7 @@ unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
         for b in src.iter_mut() {
             *b = 0;
         }
-        draw_hub_face(&*st, &mut src, cc(), cc(), r as f32 * ssx(), &pal, now);
+        draw_hub_face(&*st, &mut src, cc(), cc(), r as f32 * ssx(), &pal, now, false);
         st.hub_buf = src;
     }
 
@@ -18747,10 +18810,7 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
         3 => ("更新".to_string(), mixc(pal.paper, pal.ink, 0.14)),
         4 => ("重试".to_string(), mixc(pal.paper, pal.ink, 0.04)),
         5 => ("重启并更新".to_string(), mixc(pal.paper, pal.ink, 0.14)),
-        6 => (
-            format!("下载中 {}%", UPDATE_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)),
-            mixc(pal.paper, pal.ink, 0.04),
-        ),
+        6 => (update_dl_line(), mixc(pal.paper, pal.ink, 0.04)),
         _ => ("检查更新".to_string(), mixc(pal.paper, pal.ink, 0.06)),
     };
     g_rrect(dc, ub, 10, ufill, Some(pal.edge), 2);
@@ -20023,7 +20083,8 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
     out.push_str(&format!("update_last_check={}\r\n", st.update_last_check as i64));
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
-    out.push_str(&format!("update_modal_ver={}\r\n", st.update_modal_ver));
+    out.push_str(&format!("update_seen_ver={}\r\n", st.update_seen_ver));
+    out.push_str(&format!("update_seen_n={}\r\n", st.update_seen_n));
     out.push_str(&format!("onb_drag={}\r\n", b(st.onb_drag)));
     out.push_str(&format!("onb_move={}\r\n", b(st.onb_move)));
     out.push_str(&format!("onb_edit={}\r\n", b(st.onb_edit)));
@@ -20943,8 +21004,28 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
 const UPDATE_API: &str = "https://api.github.com/repos/lifeFxxker/pipie/releases/latest";
 /// 备用源：公开的纯发布仓库（只放 exe/zip/SHA256SUMS/version.txt，不放源码）
 const GITEE_REPO_RAW: &str = "https://gitee.com/yangshengzhe/pipie-releases/raw/master";
+
+/// Gitee 发布仓基址（本地演练可覆盖）
+fn gitee_base() -> String {
+    std::env::var("PIPIE_GITEE_BASE")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| GITEE_REPO_RAW.to_string())
+}
 fn gitee_raw(name: &str) -> String {
-    format!("{GITEE_REPO_RAW}/{name}")
+    format!("{}/{}", gitee_base(), name)
+}
+
+/// 某个版本 GitHub release 资产的基址（本地演练可覆盖）
+fn github_release_base(latest: &str) -> String {
+    if let Ok(b) = std::env::var("PIPIE_UPDATE_GH_BASE") {
+        let b = b.trim().trim_end_matches('/').to_string();
+        if !b.is_empty() {
+            return b;
+        }
+    }
+    format!("https://github.com/lifeFxxker/pipie/releases/download/v{latest}")
 }
 /// 自动检查的最小间隔（秒）：防 GitHub 匿名 API 限流（60 次/时/IP）。
 const UPDATE_MIN_INTERVAL: f64 = 6.0 * 3600.0;
@@ -21007,7 +21088,17 @@ fn json_str_field(json: &str, key: &str) -> Option<String> {
 /// `on_read(已读字节, 总字节)` 每读一块回调一次（总字节未知时为 0）—— 下载进度用。
 fn http_get_raw_cb(
     url: &str,
+    on_read: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<(u32, Vec<u8>), String> {
+    http_get_raw_cb_t(url, on_read, 3000, 8000)
+}
+
+/// 同上，但连接/接收超时由调用方指定（GitHub 下载只给 1.5s 连接，慢了立刻换 Gitee）。
+fn http_get_raw_cb_t(
+    url: &str,
     mut on_read: Option<&mut dyn FnMut(u64, u64)>,
+    connect_ms: u32,
+    receive_ms: u32,
 ) -> Result<(u32, Vec<u8>), String> {
     use windows::core::PCWSTR;
     use windows::Win32::Networking::WinInet::{
@@ -21032,9 +21123,9 @@ fn http_get_raw_cb(
         }
         // 超时：GitHub 在国内可能长时间连不上；不设的话「主源失败→Gitee 备用」要干等。
         for (opt, ms) in [
-            (INTERNET_OPTION_CONNECT_TIMEOUT, 3000u32),
+            (INTERNET_OPTION_CONNECT_TIMEOUT, connect_ms),
             (INTERNET_OPTION_SEND_TIMEOUT, 6000u32),
-            (INTERNET_OPTION_RECEIVE_TIMEOUT, 8000u32),
+            (INTERNET_OPTION_RECEIVE_TIMEOUT, receive_ms),
         ] {
             let pms = &ms as *const u32 as *const core::ffi::c_void;
             let _ = InternetSetOptionW(Some(h as *const c_void), opt, Some(pms), 4);
@@ -21124,17 +21215,32 @@ static UPDATE_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 static UPDATE_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static UPDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPDATE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 当前下载源：0 未知 / 1 GitHub / 2 Gitee（阶段文案要告诉用户在连哪）
+static UPDATE_SRC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const UPD_SRC_GH: u8 = 1;
+const UPD_SRC_GT: u8 = 2;
+fn src_name(src: u8) -> &'static str {
+    match src {
+        UPD_SRC_GH => "GitHub",
+        UPD_SRC_GT => "Gitee",
+        _ => "更新源",
+    }
+}
 
 /// 下载阶段的人话（弹窗 / 更新条 / 关于页共用同一份）。
 fn update_dl_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let phase = UPDATE_PHASE.load(Relaxed);
+    let src = src_name(UPDATE_SRC.load(Relaxed));
     match phase {
-        1 => "正在连接更新源…".to_string(),
+        1 => format!("正在连接{src}…"),
         2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
-            format!("下载中 {}%", UPDATE_PROGRESS.load(Relaxed))
+            format!("{src} 下载中 {}%", UPDATE_PROGRESS.load(Relaxed))
         }
-        2 => format!("下载中 {:.1} MB", UPDATE_BYTES.load(Relaxed) as f64 / 1_048_576.0),
+        2 => format!(
+            "{src} 下载中 {:.1} MB",
+            UPDATE_BYTES.load(Relaxed) as f64 / 1_048_576.0
+        ),
         3 => "正在校验…".to_string(),
         4 => "下载完成".to_string(),
         _ => "准备下载…".to_string(),
@@ -21146,7 +21252,7 @@ fn update_dl_short() -> (&'static str, String) {
     use std::sync::atomic::Ordering::Relaxed;
     let phase = UPDATE_PHASE.load(Relaxed);
     match phase {
-        1 => ("正在连接", String::new()),
+        1 => ("正在连接", src_name(UPDATE_SRC.load(Relaxed)).to_string()),
         2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
             ("下载中", format!("{}%", UPDATE_PROGRESS.load(Relaxed)))
         }
@@ -28121,17 +28227,24 @@ fn start_update_check(st: &mut State, manual: bool) {
 
 /// 下载 + SHA256 校验 → `<exe 同目录>\.pipie-update.new`；完成后 post 状态（5 就绪 / 4 失败）。
 /// 下载 exe + 取 SHA256SUMS + 校验 + 写入 `dest`（同步，阻塞）。供后台线程与诊断 CLI 共用。
-fn download_and_verify(exe_url: &str, sums_url: &str, dest: &str) -> Result<(), String> {
+fn download_and_verify(
+    exe_url: &str,
+    sums_url: &str,
+    dest: &str,
+    src: u8,
+    connect_ms: u32,
+) -> Result<(), String> {
     use std::sync::atomic::Ordering::Relaxed;
     let dbg = std::env::var_os("RL_UPDDBG").is_some();
+    UPDATE_SRC.store(src, Relaxed);
     if dbg {
-        eprintln!("[upd] phase=1 connect {exe_url}");
+        eprintln!("[upd] phase=1 connect {} {exe_url} timeout={connect_ms}ms", src_name(src));
     }
     UPDATE_PHASE.store(1, Relaxed);
     UPDATE_BYTES.store(0, Relaxed);
     UPDATE_TOTAL.store(0, Relaxed);
     UPDATE_PROGRESS.store(0, Relaxed);
-    let (code, bytes) = http_get_raw_cb(
+    let (code, bytes) = http_get_raw_cb_t(
         exe_url,
         Some(&mut |done, total| {
             UPDATE_PHASE.store(2, Relaxed);
@@ -28147,6 +28260,8 @@ fn download_and_verify(exe_url: &str, sums_url: &str, dest: &str) -> Result<(), 
                 eprintln!("[upd] phase=2 {done}/{total} pct={p}");
             }
         }),
+        connect_ms,
+        8000,
     )
     .map_err(|e| format!("下载失败：{e}"))?;
     if code != 200 {
@@ -28178,6 +28293,70 @@ fn download_and_verify(exe_url: &str, sums_url: &str, dest: &str) -> Result<(), 
     Ok(())
 }
 
+/// Gitee 侧版本是否已对齐（`version.txt` 必须等于目标版本）。
+/// raw CDN 有缓存，加时间戳破缓存；没对齐就回 GitHub（用户 2026-11-12 要求）。
+fn gitee_version_ok(latest: &str) -> Result<(), String> {
+    let vu = format!("{}?t={}", gitee_raw("version.txt"), unix_now() as i64);
+    match http_get(&vu) {
+        Ok((200, body)) => {
+            let got = body.trim().trim_start_matches('v');
+            if got == latest {
+                Ok(())
+            } else {
+                Err(format!("Gitee 版本未对齐（{got} ≠ {latest}）"))
+            }
+        }
+        Ok((s, _)) => Err(format!("Gitee version.txt HTTP {s}")),
+        Err(e) => Err(format!("Gitee version.txt：{e}")),
+    }
+}
+
+/// 下载新 exe（带双源回退）：
+/// ① GitHub 只等 1.5s 连接 —— 连不上立刻换 Gitee；
+/// ② Gitee 先校验 `version.txt` 对齐 + 下载后 SHA256 校验；
+/// ③ Gitee 任何问题 → 回 GitHub 用正常超时再试一次。
+fn download_with_fallback(
+    latest: &str,
+    hint_exe: &str,
+    hint_sums: &str,
+    dest: &str,
+) -> Result<(), String> {
+    let dbg = std::env::var_os("RL_UPDDBG").is_some();
+    // 生产上 GitHub API 给的带 token 跳转地址更稳；本地演练用 GH_BASE 覆盖构造。
+    let use_hint = std::env::var_os("PIPIE_UPDATE_GH_BASE").is_none()
+        && hint_exe.contains("github.com");
+    let base = github_release_base(latest);
+    let (gh_exe, gh_sums) = if use_hint {
+        (hint_exe.to_string(), hint_sums.to_string())
+    } else {
+        (
+            format!("{base}/PiPie.exe"),
+            format!("{base}/SHA256SUMS"),
+        )
+    };
+    let gt_exe = gitee_raw(&format!("v{latest}/PiPie.exe"));
+    let gt_sums = gitee_raw(&format!("v{latest}/SHA256SUMS"));
+
+    let e1 = match download_and_verify(&gh_exe, &gh_sums, dest, UPD_SRC_GH, 1500) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if dbg {
+        eprintln!("[upd] GitHub 失败（{e1}）→ 换 Gitee");
+    }
+    let e2 = match gitee_version_ok(latest)
+        .and_then(|_| download_and_verify(&gt_exe, &gt_sums, dest, UPD_SRC_GT, 3000))
+    {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if dbg {
+        eprintln!("[upd] Gitee 失败（{e2}）→ 回 GitHub");
+    }
+    download_and_verify(&gh_exe, &gh_sums, dest, UPD_SRC_GH, 3000)
+        .map_err(|e3| format!("GitHub：{e1}；Gitee：{e2}；GitHub 重试：{e3}"))
+}
+
 fn start_download(st: &mut State) {
     if st.update_st == 1 || st.update_st == 6 {
         return; // 正在检查 / 下载
@@ -28196,29 +28375,7 @@ fn start_download(st: &mut State) {
     let latest = st.update_latest.clone();
     unsafe { save_settings(st) };
     std::thread::spawn(move || {
-        let mut result = download_and_verify(&exe_url, &sums_url, &new_path);
-        if result.is_err() {
-            // 主源下载失败/超时 → 换另一侧（GitHub 与 Gitee 互备）
-            let (alt_exe, alt_sums) = if exe_url.contains("gitee.com") {
-                (
-                    format!("https://github.com/lifeFxxker/pipie/releases/download/v{latest}/PiPie.exe"),
-                    format!("https://github.com/lifeFxxker/pipie/releases/download/v{latest}/SHA256SUMS"),
-                )
-            } else if !latest.is_empty() {
-                (
-                    gitee_raw(&format!("v{latest}/PiPie.exe")),
-                    gitee_raw(&format!("v{latest}/SHA256SUMS")),
-                )
-            } else {
-                (String::new(), String::new())
-            };
-            if !alt_exe.is_empty() {
-                UPDATE_PROGRESS.store(0, Ordering::Relaxed);
-                let first = result.err().unwrap_or_default();
-                result = download_and_verify(&alt_exe, &alt_sums, &new_path)
-                    .map_err(|e| format!("{first}；备用源：{e}"));
-            }
-        }
+        let result = download_with_fallback(&latest, &exe_url, &sums_url, &new_path);
         let (s, msg) = match result {
             Ok(()) => (5u8, String::new()),
             Err(e) => (4u8, e),
@@ -28418,7 +28575,7 @@ fn main() {
                 sums_url,
             } => {
                 let dest = format!("{dir}\\PiPie.exe");
-                match download_and_verify(&exe_url, &sums_url, &dest) {
+                match download_with_fallback(&latest, &exe_url, &sums_url, &dest) {
                     Ok(()) => println!("[update] 下载并校验通过 v{latest} → {dest}"),
                     Err(e) => {
                         eprintln!("[update] 失败: {e}");
@@ -29304,17 +29461,19 @@ fn main() {
         let listen_on = st.listening;
         set_running(&mut st, listen_on);
 
-        // 启动亮相：先查一次更新。有新版本 → 不亮环，直接弹更新窗口（不自动收）；
-        // 没有/查不动 → 照旧短暂亮个相。最多等 4 秒，网络慢也不把人晾着。
-        if st.update_auto && !autostart_sandbox() {
-            st.upd_startup_wait = true;
-            st.upd_startup_deadline = now_s() + 5.0;
-            start_update_check(&mut st, true);
-        } else if upd_offer(&st) {
-            // 测试 `--upd-sim`：已有伪造的「发现新版本」→ 直接走更新窗口，不亮环
+        // 启动亮相：照常亮个相。更新检查在后台跑，**不再自动弹更新窗口** ——
+        // 发现新版只在轮盘底部出更新条（每版前两次呼出），点它才展开详情。
+        let upd_sim = std::env::args_os().any(|a| a == "--upd-sim");
+        if upd_sim && upd_offer(&st) {
+            // 测试 `--upd-sim`：已有伪造的「发现新版本」→ 直接走更新窗口（仅测试用）
             open_update_window(&mut st);
-        } else if !st.apps.is_empty() {
-            startup_reveal(&mut st);
+        } else {
+            if st.update_auto && !autostart_sandbox() {
+                start_update_check(&mut st, true);
+            }
+            if !st.apps.is_empty() {
+                startup_reveal(&mut st);
+            }
         }
 
         println!("[*] PiPie 已就绪：{} · 托盘菜单 / Ctrl+Alt+R 开关监听", about_hotkeys(&st));
