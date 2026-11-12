@@ -28549,24 +28549,19 @@ fn download_with_fallback(
     let gt_exe = gitee_raw(&format!("v{latest}/PiPie.exe"));
     let gt_sums = gitee_raw(&format!("v{latest}/SHA256SUMS"));
 
-    let e1 = match download_and_verify(&gh_exe, &gh_sums, dest, UPD_SRC_GH, 1500) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
-    if dbg {
-        eprintln!("[upd] GitHub 失败（{e1}）→ 换 Gitee");
-    }
-    let e2 = match gitee_version_ok(latest)
+    // 默认 **Gitee 优先**（国内更快）：先校版本对齐 + 下载后 SHA256。
+    // 未对齐 / 404 / 超时 / 校验不符 → 回 GitHub（3s 连接）。
+    let e_gt = match gitee_version_ok(latest)
         .and_then(|_| download_and_verify(&gt_exe, &gt_sums, dest, UPD_SRC_GT, 3000))
     {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
     if dbg {
-        eprintln!("[upd] Gitee 失败（{e2}）→ 回 GitHub");
+        eprintln!("[upd] Gitee 失败（{e_gt}）→ 回 GitHub");
     }
     download_and_verify(&gh_exe, &gh_sums, dest, UPD_SRC_GH, 3000)
-        .map_err(|e3| format!("GitHub：{e1}；Gitee：{e2}；GitHub 重试：{e3}"))
+        .map_err(|e| format!("Gitee：{e_gt}；GitHub：{e}"))
 }
 
 /// 开始下载后：收起轮盘 → 打开设置页「关于」看进度（用户 2026-11-12 要求）
