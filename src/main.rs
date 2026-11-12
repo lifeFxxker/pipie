@@ -1029,6 +1029,13 @@ struct State {
     decor_page: usize,
     /// 当前页里被悬停的槽（0..本页数量）
     decor_hover: Option<usize>,
+    /// 自定义头像（用户上传的静图 / GIF）。`None` = 用默认表情球。
+    /// 懒加载：第一次绘制时才读盘+解码，失败也不再重试（`avatar_tried`）。
+    avatar: Option<AvatarTex>,
+    /// 是否已经尝试从磁盘加载过头像（成败都只试一次）
+    avatar_tried: bool,
+    /// ini `avatar=1`：使用配置目录下的 `avatar.img`
+    avatar_on: bool,
     /// 光标当前正悬停的磁贴（高亮严格跟随：移出即灭，与粘性的 active_app 解耦）
     hover_now: Option<usize>,
 
@@ -1557,6 +1564,9 @@ impl State {
             decor_mode: false,
             decor_page: 0,
             decor_hover: None,
+            avatar: None,
+            avatar_tried: false,
+            avatar_on: false,
             hover_now: None,
             active_app: None,
             hover_chip: None,
@@ -2714,6 +2724,13 @@ unsafe fn draw_bubble(st: &mut State, buf: &mut [u8], pal: &Pal) {
 /// 自己从中心裁一块缩下去。`r` = 球半径（入场 `pop`、让位缩放之类的**外部**系数由调用方乘好）。
 unsafe fn draw_hub_face(st: &State, buf: &mut [u8], cx: f32, cy: f32, r: f32, pal: &Pal, now: f64) {
     let ft = (now - st.face0) as f32;
+    // 自定义头像：把用户图片裁成圆画上去（保留呼吸 / 让位缩放），不再画表情球
+    if let Some(av) = st.avatar.as_ref() {
+        let br = (ft / 3.2 * std::f32::consts::TAU).sin() * 0.014;
+        let fr = r * (1.0 + br) * (1.0 - RM_BALL_SHRINK * st.cancel_a.clamp(0.0, 1.0));
+        blend_avatar_circle(buf, canvas() as usize, av.frame_at(now), av.size, cx, cy, fr, 1.0);
+        return;
+    }
     let open = blink_open(&st.blink_q, now).clamp(0.0, 1.45);
 
     // ── 情绪（拖出移除）────────────────────────────────────────────
@@ -2935,6 +2952,374 @@ unsafe fn decode_decor_png(png: &[u8]) -> Option<DecorTex> {
         bh: (y1 - y0 + 1) as f32,
         px,
     })
+}
+
+// ═════════════════════ 自定义头像（用户上传的图片 / GIF） ═════════════════════
+//
+// 静图走 WIC（PNG/JPG/BMP…）；GIF 走 `gif` crate 逐帧解码、**按 disposal 自己合成**，
+// 再中心裁成正方形缩到固定纹理尺寸。纹理统一是**直通 alpha 的 BGRA**（与 buffer 的
+// 绘制约定一致），画的时候按圆做 SDF 裁切 + alpha 加权双线性采样（透明边不发黑）。
+//
+// 帧缓存有上限（200²、最多 120 帧 ≈ 19MB）：GIF 再长也只播前 120 帧。
+// 帧序按**全局时间**走；轮盘没开就不画，不耗 CPU。
+
+struct AvatarTex {
+    /// 纹理边长（正方形；解码时已中心裁切）
+    size: usize,
+    /// 每帧 BGRA（直通 alpha）
+    frames: Vec<Vec<u8>>,
+    /// 每帧时长（毫秒）；静图为空
+    delays: Vec<u32>,
+    total_ms: u32,
+}
+
+impl AvatarTex {
+    fn frame_at(&self, now: f64) -> &[u8] {
+        if self.frames.len() <= 1 || self.total_ms == 0 {
+            return &self.frames[0];
+        }
+        let mut t = ((now * 1000.0) as u64 % self.total_ms as u64) as u32;
+        for (i, d) in self.delays.iter().enumerate() {
+            if t < *d {
+                if let Some(f) = self.frames.get(i) {
+                    return f;
+                }
+                break;
+            }
+            t -= *d;
+        }
+        &self.frames[0]
+    }
+    fn animated(&self) -> bool {
+        self.frames.len() > 1 && self.total_ms > 0
+    }
+}
+
+/// 头像文件放在 `settings.ini` **同目录**（沙箱/离屏图各自独立，不串到真实配置）。
+fn avatar_path(st: &State) -> String {
+    let dir = std::path::Path::new(&st.ini_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(config_dir);
+    format!("{}\\avatar.img", dir)
+}
+
+/// 懒加载：一次绘制时读盘解码；失败也标记已试过，不再每帧重试。
+fn ensure_avatar(st: &mut State) {
+    if st.avatar_tried {
+        return;
+    }
+    st.avatar_tried = true;
+    if st.avatar_on {
+        let path = avatar_path(st);
+        if let Ok(bytes) = std::fs::read(&path) {
+            st.avatar = unsafe { decode_avatar_bytes(&bytes) };
+        }
+    }
+}
+
+unsafe fn decode_avatar_bytes(bytes: &[u8]) -> Option<AvatarTex> {
+    // 上限 24MB：再大就不是头像了，解码也可能卡住 UI
+    if bytes.is_empty() || bytes.len() > 24 * 1024 * 1024 {
+        return None;
+    }
+    if bytes.starts_with(b"GIF8") {
+        decode_avatar_gif(bytes)
+    } else {
+        decode_avatar_static(bytes)
+    }
+}
+
+/// 静图：WIC 解码 → 短边贴到 384（保持比例）→ 中心裁 384²。
+unsafe fn decode_avatar_static(bytes: &[u8]) -> Option<AvatarTex> {
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, IWICImagingFactory, WICBitmapInterpolationModeHighQualityCubic,
+        WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    const TARGET: usize = 384;
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(bytes))?;
+    let decoder = factory
+        .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+        .ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    // ⚠️ 必须先统一成 **32bppBGRA（直通 alpha）** 再缩放：
+    //    JPEG / 索引 PNG 的原生格式是 24bppBGR，直接 CopyPixels 到 BGRA 缓冲会
+    //    按 4 字节步长错行读取 —— 用户看到的「反色/花屏」就是这么来的。
+    let conv = factory.CreateFormatConverter().ok()?;
+    conv.Initialize(
+        &frame,
+        &windows::Win32::Graphics::Imaging::GUID_WICPixelFormat32bppBGRA,
+        windows::Win32::Graphics::Imaging::WICBitmapDitherTypeNone,
+        None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+        0.0,
+        windows::Win32::Graphics::Imaging::WICBitmapPaletteTypeCustom,
+    )
+    .ok()?;
+    let (mut sw, mut sh) = (0u32, 0u32);
+    frame.GetSize(&mut sw, &mut sh).ok()?;
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (dw, dh) = if sw <= sh {
+        (
+            TARGET as u32,
+            ((sh as f64) * TARGET as f64 / sw as f64).round().max(1.0) as u32,
+        )
+    } else {
+        (
+            ((sw as f64) * TARGET as f64 / sh as f64).round().max(1.0) as u32,
+            TARGET as u32,
+        )
+    };
+    let scaler = factory.CreateBitmapScaler().ok()?;
+    scaler
+        .Initialize(&conv, dw, dh, WICBitmapInterpolationModeHighQualityCubic)
+        .ok()?;
+    let mut px = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    scaler.CopyPixels(std::ptr::null(), dw * 4, &mut px).ok()?;
+    let ox = (dw as usize - TARGET) / 2;
+    let oy = (dh as usize - TARGET) / 2;
+    let mut out = vec![0u8; TARGET * TARGET * 4];
+    let row = TARGET * 4;
+    for y in 0..TARGET {
+        let src = ((oy + y) * dw as usize + ox) * 4;
+        out[y * row..(y + 1) * row].copy_from_slice(&px[src..src + row]);
+    }
+    Some(AvatarTex {
+        size: TARGET,
+        frames: vec![out],
+        delays: Vec::new(),
+        total_ms: 0,
+    })
+}
+
+/// GIF：逐帧解码（RGBA）+ 按 disposal 合成到整幅画布，再裁中心正方形缩到 200²。
+fn decode_avatar_gif(bytes: &[u8]) -> Option<AvatarTex> {
+    use gif::{ColorOutput, DecodeOptions, DisposalMethod};
+    const TARGET: usize = 200;
+    const MAX_FRAMES: usize = 120;
+    let mut opt = DecodeOptions::new();
+    opt.set_color_output(ColorOutput::RGBA);
+    let mut dec = opt.read_info(std::io::Cursor::new(bytes)).ok()?;
+    let w = dec.width() as usize;
+    let h = dec.height() as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let side = w.min(h);
+    let ox = (w - side) / 2;
+    let oy = (h - side) / 2;
+    let mut canvas = vec![0u8; w * h * 4];
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut delays: Vec<u32> = Vec::new();
+    let mut total = 0u32;
+    loop {
+        let f = match dec.read_next_frame() {
+            Ok(Some(f)) => f,
+            _ => break,
+        };
+        let (fw, fh) = (f.width as usize, f.height as usize);
+        let (fx, fy) = (f.left as usize, f.top as usize);
+        let saved = if f.dispose == DisposalMethod::Previous {
+            Some(canvas.clone())
+        } else {
+            None
+        };
+        // 只覆盖帧矩形里的**非透明**像素（GIF 的帧经常是局部的）
+        for yy in 0..fh {
+            let dy = fy + yy;
+            if dy >= h {
+                break;
+            }
+            for xx in 0..fw {
+                let dx = fx + xx;
+                if dx >= w {
+                    break;
+                }
+                let s = (yy * fw + xx) * 4;
+                if f.buffer[s + 3] == 0 {
+                    continue;
+                }
+                let d = (dy * w + dx) * 4;
+                canvas[d..d + 4].copy_from_slice(&f.buffer[s..s + 4]);
+            }
+        }
+        frames.push(crop_scale_square_rgba(&canvas, w, side, ox, oy, TARGET));
+        // 浏览器习惯：0/极小 delay 按 20ms 计，超过 1s 的按 1s
+        let ms = ((f.delay as u32) * 10).clamp(20, 1000);
+        delays.push(ms);
+        total += ms;
+        match f.dispose {
+            DisposalMethod::Background => {
+                for yy in 0..fh {
+                    let dy = fy + yy;
+                    if dy >= h {
+                        break;
+                    }
+                    for xx in 0..fw {
+                        let dx = fx + xx;
+                        if dx >= w {
+                            break;
+                        }
+                        let d = (dy * w + dx) * 4;
+                        canvas[d..d + 4].fill(0);
+                    }
+                }
+            }
+            DisposalMethod::Previous => {
+                if let Some(s) = saved {
+                    canvas = s;
+                }
+            }
+            _ => {}
+        }
+        if frames.len() >= MAX_FRAMES {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    Some(AvatarTex {
+        size: TARGET,
+        frames,
+        delays,
+        total_ms: total.max(100),
+    })
+}
+
+/// 把画布中心 `side×side` 缩到 `target²`：RGBA → BGRA，alpha 加权双线性。
+fn crop_scale_square_rgba(
+    src: &[u8],
+    w: usize,
+    side: usize,
+    ox: usize,
+    oy: usize,
+    target: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; target * target * 4];
+    let step = side as f32 / target as f32;
+    let max_x = ox + side - 1;
+    let max_y = oy + side - 1;
+    let texel = |x: usize, y: usize| -> (f32, f32, f32, f32) {
+        let o = (y * w + x) * 4;
+        (
+            src[o + 3] as f32,
+            src[o] as f32,
+            src[o + 1] as f32,
+            src[o + 2] as f32,
+        )
+    };
+    for y in 0..target {
+        let sy = oy as f32 + (y as f32 + 0.5) * step - 0.5;
+        let y0 = (sy.floor().max(oy as f32) as usize).min(max_y);
+        let y1 = (y0 + 1).min(max_y);
+        let wy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..target {
+            let sx = ox as f32 + (x as f32 + 0.5) * step - 0.5;
+            let x0 = (sx.floor().max(ox as f32) as usize).min(max_x);
+            let x1 = (x0 + 1).min(max_x);
+            let wx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let (a00, r00, g00, b00) = texel(x0, y0);
+            let (a10, r10, g10, b10) = texel(x1, y0);
+            let (a01, r01, g01, b01) = texel(x0, y1);
+            let (a11, r11, g11, b11) = texel(x1, y1);
+            let w00 = (1.0 - wx) * (1.0 - wy);
+            let w10 = wx * (1.0 - wy);
+            let w01 = (1.0 - wx) * wy;
+            let w11 = wx * wy;
+            let a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
+            let o = (y * target + x) * 4;
+            if a <= 0.5 {
+                out[o..o + 4].fill(0);
+                continue;
+            }
+            let r = (r00 * a00 * w00 + r10 * a10 * w10 + r01 * a01 * w01 + r11 * a11 * w11) / a;
+            let g = (g00 * a00 * w00 + g10 * a10 * w10 + g01 * a01 * w01 + g11 * a11 * w11) / a;
+            let b = (b00 * a00 * w00 + b10 * a10 * w10 + b01 * a01 * w01 + b11 * a11 * w11) / a;
+            out[o] = b.clamp(0.0, 255.0) as u8;
+            out[o + 1] = g.clamp(0.0, 255.0) as u8;
+            out[o + 2] = r.clamp(0.0, 255.0) as u8;
+            out[o + 3] = a.clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// 把一帧头像画成**圆**：圆形 SDF 裁切 + 直通 alpha 双线性采样。
+/// `buf_w/buf_h` 是目标缓冲的像素尺寸（轮盘画布 / 设置页 lo 缓冲都复用它）。
+fn blend_avatar_circle(
+    buf: &mut [u8],
+    buf_w: usize,
+    px: &[u8],
+    tex_n: usize,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    alpha: f32,
+) {
+    if alpha <= 0.004 || r < 0.5 || tex_n == 0 {
+        return;
+    }
+    let w = buf_w as i32;
+    let hpx = (buf.len() / 4 / buf_w.max(1)) as i32;
+    let ext = r + 1.5;
+    let x0 = (cx - ext).max(0.0) as i32;
+    let x1 = ((cx + ext).min(w as f32 - 1.0)) as i32;
+    let y0 = (cy - ext).max(0.0) as i32;
+    let y1 = ((cy + ext).min(hpx as f32 - 1.0)) as i32;
+    let inv = 1.0 / (2.0 * r);
+    let n = tex_n as f32;
+    // 纹理是 BGRA（和 DecorTex / buffer 的约定一致）→ (a, b, g, r)
+    let texel = |tx: usize, ty: usize| -> (f32, f32, f32, f32) {
+        let o = (ty * tex_n + tx) * 4;
+        (
+            px[o + 3] as f32,
+            px[o] as f32,
+            px[o + 1] as f32,
+            px[o + 2] as f32,
+        )
+    };
+    for py in y0..=y1 {
+        let dy = py as f32 + 0.5 - cy;
+        for pxi in x0..=x1 {
+            let dx = pxi as f32 + 0.5 - cx;
+            let d = (dx * dx + dy * dy).sqrt();
+            let cov = cov1(d - r) * alpha;
+            if cov <= 0.003 {
+                continue;
+            }
+            let fx = ((dx * inv + 0.5).clamp(0.0, 1.0) * n).clamp(0.0, n - 1.0);
+            let fy = ((dy * inv + 0.5).clamp(0.0, 1.0) * n).clamp(0.0, n - 1.0);
+            let ix = fx.floor() as usize;
+            let iy = fy.floor() as usize;
+            let ix1 = (ix + 1).min(tex_n - 1);
+            let iy1 = (iy + 1).min(tex_n - 1);
+            let wx = fx - ix as f32;
+            let wy = fy - iy as f32;
+            let (a00, b00, g00, r00) = texel(ix, iy);
+            let (a10, b10, g10, r10) = texel(ix1, iy);
+            let (a01, b01, g01, r01) = texel(ix, iy1);
+            let (a11, b11, g11, r11) = texel(ix1, iy1);
+            let w00 = (1.0 - wx) * (1.0 - wy);
+            let w10 = wx * (1.0 - wy);
+            let w01 = (1.0 - wx) * wy;
+            let w11 = wx * wy;
+            let a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
+            if a <= 0.004 {
+                continue;
+            }
+            let r_ = (r00 * a00 * w00 + r10 * a10 * w10 + r01 * a01 * w01 + r11 * a11 * w11) / a;
+            let g_ = (g00 * a00 * w00 + g10 * a10 * w10 + g01 * a01 * w01 + g11 * a11 * w11) / a;
+            let b_ = (b00 * a00 * w00 + b10 * a10 * w10 + b01 * a01 * w01 + b11 * a11 * w11) / a;
+            let o = (py as usize * w as usize + pxi as usize) * 4;
+            blend_over(buf, o, r_, g_, b_, (a / 255.0) * cov);
+        }
+    }
 }
 
 /// 首次进入装饰轮盘时解码一次（34 张，~20ms），之后常驻。
@@ -4448,6 +4833,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     let w = canvas() as usize;
     let now = now_s() as f64;
     buf.fill(0);
+    ensure_avatar(st);
     // 启动更新窗口：方画布上只留那张纸卡（其余全透明），不画轮盘/盘面
     if st.upd_only {
         draw_upd_ui(st, buf);
@@ -10467,6 +10853,9 @@ unsafe fn read_persistent(st: &mut State) {
                     .filter(|x| DECORS.iter().any(|d| d.id == *x))
                     .map(|x| x.to_string())
                     .collect();
+            } else if let Some(v) = get("avatar=") {
+                // 1 = 使用配置目录下的 avatar.img（用户上传的图片/GIF）
+                st.avatar_on = v != "0";
             } else if let Some(v) = get("note=") {
                 // 缺省 = 开（和剪贴板同一个理由：装了就该有）
                 st.note_on = v != "0";
@@ -16302,6 +16691,9 @@ enum Ctl {
     Mat(usize),
     /// 外观页「录屏模式（玻璃不实时）」—— 开着 = `st.glass_live` 为**假**，见 `look_live_val`
     GlassLive,
+    /// 外观页「头像」：选择图片 / 恢复默认
+    AvatarPick,
+    AvatarReset,
     Key(usize),
     TrigCapture,         // 交互页「呼出方式」下的「自定义触发」行：点击进入录制态（再点取消）
     TrigClear,           // 自定义触发已设置时的「✕」清除按钮
@@ -16329,8 +16721,10 @@ enum Ctl {
     ExcPlus(u8),          // 当前生效卡片的「＋」= 选一个 exe 加进去
     // ── 交互页：名字右边的「?」→ 悬停出 tooltip ──
     Tip(u8),              // 1 常驻 2 监听 3 全屏放行 4 黑名单 5 白名单
-    /// 关于页「检查更新」按钮
+    /// 「关于」页「检查更新」按钮
     UpdateCheck,
+    /// 「关于」页三行位置右侧的「↗」跳转按钮：0 程序目录 / 1 配置目录 / 2 日志目录
+    OpenDir(u8),
     /// 应用页底部那张独立卡：「剪贴板」总开关（状态 = `st.cl_on`，见 `cl_set_on`）
     ClipOn,
     /// 便签总开关（和 `ClipOn` 同一个意思）
@@ -16354,8 +16748,6 @@ const LOOK_MAT_LABEL_Y: i32 = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP + ACT_CHIPS_H + 
 const LOOK_MAT_Y: i32 = LOOK_MAT_LABEL_Y + ACT_LABEL_H + ACT_GAP;
 /// 外观页「录屏模式」开关行：紧跟材质胶囊。`+8` —— 行矩形比内容顶高 8（与交互页同一套）
 const LOOK_LIVE_Y: i32 = LOOK_MAT_Y + ACT_CHIPS_H + ACT_GAP + 8;
-/// 行下方的说明 —— 与开关行**同属一块**，所以只隔 4px（同 `TRIG_ROW_Y` 的道理）
-const LOOK_LIVE_HINT_Y: i32 = LOOK_LIVE_Y + 34 + 4;
 const ACT_GAP: i32 = 16;       // **统一间距**：段标题↔内容、内容↔下一段标题 都用它
 const ACT_LABEL_H: i32 = 22;   // 段标题行高
 
@@ -16387,6 +16779,22 @@ fn act_sw_row(i: usize) -> RECT {
 /// 外观页「录屏模式」开关行（绘制与命中共用）
 fn look_live_row() -> RECT {
     RECT { left: S_X0, top: LOOK_LIVE_Y - 8, right: S_X1, bottom: LOOK_LIVE_Y + 34 }
+}
+
+/// 录屏模式标签右侧的「?」（说明改成 hover tooltip，不再在下方压两行小字）
+fn look_live_tip_rect() -> RECT {
+    RECT { left: S_X0 + 168, top: LOOK_LIVE_Y + 2, right: S_X0 + 186, bottom: LOOK_LIVE_Y + 20 }
+}
+
+// ── 外观页「头像」：自定义中心头像（图片 / GIF）──
+const LOOK_AVATAR_LABEL_Y: i32 = LOOK_LIVE_Y + 34 + ACT_GAP + 4;
+/// 头像区两颗按钮：0 选择图片 / 1 恢复默认
+fn avatar_btn_rect(i: usize) -> RECT {
+    let y = LOOK_AVATAR_LABEL_Y + ACT_LABEL_H + ACT_GAP - 4;
+    let w = 118;
+    let gap = 12;
+    let l = S_X0 + 8 + i as i32 * (w + gap);
+    RECT { left: l, top: y, right: l + w, bottom: y + ACT_CHIPS_H }
 }
 
 fn trig_row_rect() -> RECT {
@@ -16525,6 +16933,7 @@ fn tip_lines(id: u8) -> &'static [&'static str] {
         6 => &["鼠标悬停内环图标时，用头像旁的气泡显示它的应用名。", "关掉就只看图标（操作结果提示不受影响）。"],
         7 => &["关掉后不再记录，轮盘上的「剪贴板」图标一起消失。", "密码管理器里的复制始终不记录。"],
         8 => &["关掉后轮盘上的「便签」图标一起消失。", "已经写下的便签不会丢，再打开接着写。"],
+        9 => &["关着：玻璃实时透出桌面，但截图／录屏拍不到轮盘。", "开着：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘。"],
         _ => &[],
     }
 }
@@ -16556,6 +16965,10 @@ fn tip_anchor(id: u8) -> (i32, i32, bool) {
         8 => {
             let r = note_tip_rect();
             (r.left, r.top - 6, true)
+        }
+        9 => {
+            let r = look_live_tip_rect();
+            (r.left, r.bottom + 6, false)
         }
         _ => (0, 0, false),
     }
@@ -17325,9 +17738,8 @@ fn guide_btn_rect(i: usize, b: usize) -> RECT {
 
 /// 标题栏「查看引导」入口 —— 跳过的人也能随时找回来（避免「跳过即永久错过」）
 fn s_guide_entry_rect() -> RECT {
-    // ⚠️ 必须避开右侧的版本号（`v3 · N 个应用` 居中在 S_W-300..S_W-62 → 实测文字 559..639）；
-    // 原来放在 S_W-266..S_W-158（居中 568）会和它**叠字**。
-    RECT { left: S_W - 340, top: 14, right: S_W - 232, bottom: 38 }
+    // 版本号那行已去掉（用户 2026-11-11：极简风格），入口靠右、离关闭按钮留 16px。
+    RECT { left: S_W - 158, top: 12, right: S_W - 62, bottom: 40 }
 }
 
 /// 引导期间命中测试：返回 0=跳过 1=上一步 2=下一步；**-1 = 吃掉（不做任何事）**
@@ -17602,20 +18014,16 @@ unsafe fn settings_draw(st: &mut State, dc: HDC) {
 
     // 标题栏
     g_text(dc, "设置", RECT { left: 22, top: 0, right: 220, bottom: S_TITLE_H }, pal.ink, st.sf_title, false);
-    let ver = format!("v3 · {} 个应用", st.apps.len());
-    g_text(dc, &ver, RECT { left: S_W - 300, top: 0, right: S_W - 62, bottom: S_TITLE_H },
-        mixc(pal.paper, pal.ink, 0.55), st.sf_small, true);
-    // 标题栏「查看引导」：跳过首启引导的人随时能找回来
+    // 标题栏「查看引导」：跳过首启引导的人随时能找回来（做成一颗小胶囊按钮，
+    // 点击区域就是它自己的外框 —— 以前只有一行带下划线的字，实际能点中的地方很窄）
     {
         let er = s_guide_entry_rect();
         let ehv = hov(st, Ctl::GuideEntry);
-        let col = mixc(pal.paper, pal.ink, 0.45 - 0.30 * ehv);
-        g_text(dc, "查看引导", er, col, st.sf_small, true);
-        g_fill(
-            dc,
-            RECT { left: er.left + 14, top: er.bottom - 3, right: er.right - 14, bottom: er.bottom - 2 },
-            mixc(pal.paper, pal.ink, 0.28 - 0.20 * ehv),
-        );
+        if ehv > 0.01 {
+            g_rrect(dc, er, 9, mixc(pal.paper, pal.ink, 0.07 * ehv), None, 0);
+        }
+        g_text(dc, "查看引导", er, mixc(pal.paper, pal.ink, 0.5 - 0.28 * ehv),
+            st.sf_small, true);
     }
     g_fill(dc, RECT { left: 0, top: S_TITLE_H - 2, right: S_W, bottom: S_TITLE_H },
         mixc(pal.paper, pal.ink, 0.14));
@@ -17766,22 +18174,30 @@ unsafe fn s_paint_look(st: &mut State, dc: HDC, pal: &Pal) {
         g_text(dc, "录屏模式（玻璃不实时）",
             RECT { left: S_X0 + 8, top: rr.top + 12, right: S_X1 - 60, bottom: rr.top + 32 },
             mixc(pal.paper, pal.ink, dim), st.sf_body, false);
+        draw_tip_icon(st, dc, pal, look_live_tip_rect(), 9);
         g_switch(dc, pal, s_sw_rect_at(LOOK_LIVE_Y), st.sw_a[5]);
     }
-    // 一句说明（说清这条开关换来什么、失去什么）
-    let hint = if st.glass_live {
-        "关着：玻璃实时透出桌面，但截图／录屏拍不到轮盘"
-    } else {
-        "开着：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘"
-    };
-    g_text(dc, hint,
-        RECT { left: S_X0, top: LOOK_LIVE_HINT_Y, right: S_X1, bottom: LOOK_LIVE_HINT_Y + 20 },
-        mixc(pal.paper, pal.ink, 0.42), st.sf_small, false);
-    // 第二行：玻璃退化的另一条路（与这条开关无关，只是讲清「为什么有时是纸面」）
-    g_text(dc, "抓屏被系统挡住（受保护窗口）时自动回到纸面",
-        RECT { left: S_X0, top: LOOK_LIVE_HINT_Y + ACT_LABEL_H,
-               right: S_X1, bottom: LOOK_LIVE_HINT_Y + ACT_LABEL_H + 20 },
-        mixc(pal.paper, pal.ink, 0.42), st.sf_small, false);
+
+    // ── 头像：用户自己的图片 / GIF（圆形裁切后画在轮盘中心）──
+    let ay = LOOK_AVATAR_LABEL_Y;
+    g_text(dc, "头像", RECT { left: S_X0, top: ay, right: S_X1, bottom: ay + ACT_LABEL_H },
+        pal.ink, st.sf_bold, false);
+    for i in 0..2usize {
+        let r = avatar_btn_rect(i);
+        let ctl = if i == 0 { Ctl::AvatarPick } else { Ctl::AvatarReset };
+        let on = hov(st, ctl);
+        let dis = i == 1 && !st.avatar_on;
+        let fill = if dis {
+            mixc(pal.paper, pal.ink, 0.02)
+        } else if i == 0 {
+            mixc(pal.paper, pal.ink, 0.10 + 0.06 * on)
+        } else {
+            mixc(pal.paper, pal.ink, 0.04 + 0.05 * on)
+        };
+        g_rrect(dc, r, 10, fill, if dis { None } else { Some(pal.edge) }, 2);
+        g_text(dc, if i == 0 { "选择图片" } else { "恢复默认" }, r,
+            mixc(pal.paper, pal.ink, if dis { 0.30 } else { 0.85 }), st.sf_small, true);
+    }
 }
 
 unsafe fn s_paint_act(st: &mut State, dc: HDC, pal: &Pal) {
@@ -18136,6 +18552,7 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
 ///   ② 头像 SDF 按全局 `CANVAS` 定宽 → 先渲染到那块画布，再搬中心一块过来；
 ///   ③ 在 CANVAS 上按 **SS 倍半径**画 = 目标像素尺寸 → 搬运是 **1:1**，不用缩放。
 unsafe fn s_draw_avatar_logo(st: &mut State, cx: i32, cy: i32, r: i32) {
+    ensure_avatar(st);
     let n = (canvas() * canvas() * 4) as usize;
     if st.hub_buf.len() != n {
         st.hub_buf = vec![0u8; n];
@@ -18210,26 +18627,6 @@ unsafe fn s_text_w(dc: HDC, text: &str, font: HFONT) -> i32 {
     ((r.right - r.left) as f32 / ssx()).ceil() as i32
 }
 
-/// 「关于」页的分段：小标题（`sf_bold`）+ 若干正文行（`sf_small`，行距 24）。
-/// 节奏与其它页一致（标题底 +`ACT_GAP` 起正文），别在这里写死额外的间距常量。
-unsafe fn s_about_section(
-    st: &State,
-    dc: HDC,
-    pal: &Pal,
-    cy: &mut i32,
-    title: &str,
-    lines: &[String],
-) {
-    g_text(dc, title, RECT { left: S_X0, top: *cy, right: S_X1, bottom: *cy + ACT_LABEL_H },
-        pal.ink, st.sf_bold, false);
-    *cy += ACT_LABEL_H + ACT_GAP - 2;
-    for l in lines.iter() {
-        g_text(dc, l, RECT { left: S_X0, top: *cy, right: S_X1, bottom: *cy + 20 },
-            mixc(pal.paper, pal.ink, 0.62), st.sf_small, false);
-        *cy += 24;
-    }
-}
-
 /// 「关于」页里「呼出」那行的内容：**只列当前真的启用**的方式。
 /// 写死一串按键等于骗人 —— 用户把中键勾掉了，关于页还写着"鼠标中键"就不对。
 fn about_hotkeys(st: &State) -> String {
@@ -18255,24 +18652,66 @@ fn about_hotkeys(st: &State) -> String {
     }
 }
 
+/// 「关于」页名字行的顶边
+fn about_head_top() -> i32 {
+    ACT_TOP_Y + ACT_LABEL_H + ACT_GAP
+}
+
 /// 关于页「检查更新」按钮矩形（绘制与命中共用同一份，别写两处）。
-/// 高度取 `ACT_CHIPS_H`（与设置页其它按钮/胶囊统一），单独一行放在标语下方。
 fn s_update_btn_rect() -> RECT {
-    // 标语顶 = base+32、行高 20；按钮再下移 14px → base+66
-    let top = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP + 32 + 34;
+    let top = about_head_top() + 40; // 名字行 32 高 + 8 间距
     RECT { left: S_X0, top, right: S_X0 + 168, bottom: top + ACT_CHIPS_H }
 }
 
-/// 关于页「运行信息」里那行更新状态文案。
-fn update_status_text(st: &State) -> String {
-    match st.update_st {
-        1 => "检查中…".to_string(),
-        2 => format!("已是最新（v{}）", cur_version()),
-        3 => format!("发现新版本 v{} · 点右上角「更新」", st.update_latest),
-        4 => format!("检查失败：{}", st.update_msg),
-        5 => format!("新版本 v{} 下载完成 · 点右上角「重启并更新」", st.update_latest),
-        6 => format!("v{} · {}", st.update_latest, update_dl_line()),
-        _ => format!("未检查（当前 v{}）", cur_version()),
+/// 关于页「位置」段标题的顶边
+fn about_loc_label_y() -> i32 {
+    s_update_btn_rect().bottom + ACT_GAP + 12
+}
+
+/// 关于页三行位置（程序 / 配置 / 日志）的行矩形
+fn about_loc_row(i: usize) -> RECT {
+    let top = about_loc_label_y() + ACT_LABEL_H + ACT_GAP - 4 + i as i32 * 42;
+    RECT { left: S_X0, top, right: S_X1, bottom: top + 34 }
+}
+
+/// 行尾的「↗」跳转按钮
+fn about_loc_btn(i: usize) -> RECT {
+    let r = about_loc_row(i);
+    RECT { left: r.right - 34, top: r.top + 3, right: r.right - 2, bottom: r.top + 31 }
+}
+
+/// 三行的标签与显示路径
+fn about_loc_text(st: &State, i: usize) -> (&'static str, String) {
+    match i {
+        0 => ("程序", exe_path()),
+        1 => ("配置", st.ini_path.clone()),
+        2 => ("日志", log_dir()),
+        _ => ("", String::new()),
+    }
+}
+
+/// 跳转按钮打开的目录
+fn about_loc_dir(i: usize) -> String {
+    match i {
+        0 => exe_dir(),
+        1 => config_dir(),
+        _ => log_dir(),
+    }
+}
+
+/// 用资源管理器打开目录
+fn open_in_explorer(dir: &str) {
+    unsafe {
+        let f = wide("explorer.exe");
+        let a = wide(&format!("\"{}\"", dir));
+        let _ = ShellExecuteW(
+            HWND(ptr::null_mut()),
+            PCWSTR::null(),
+            PCWSTR(f.as_ptr()),
+            PCWSTR(a.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -18281,11 +18720,11 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
     g_text(dc, "关于", RECT { left: S_X0, top: y, right: S_X1, bottom: y + ACT_LABEL_H },
         pal.ink, st.sf_bold, false);
 
-    // ── 产品头：头像 logo + 名字 + 版本胶囊 + 一句话定位 + 细分割线 ──
+    // ── 产品头：头像 logo + 名字 + 版本胶囊 ──
     //
     // logo = **轮盘中心那个头像**（共用 `draw_hub_face`，不是再画一个相似图形）。
     // ⚠️ 不贴 exe 图标：图标是黑底白点，深色主题下整块看不见；现画取主题色，明暗都成立。
-    let mut cy = y + ACT_LABEL_H + ACT_GAP;
+    let cy = about_head_top();
     let mc = cy + 14; // logo 竖中心（与 28px 的名字行对齐）
     s_draw_avatar_logo(st, S_X0 + 15, mc, 11);
 
@@ -18300,12 +18739,7 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
     g_rrect(dc, vr, 9, mixc(pal.paper, pal.ink, 0.07), Some(pal.edge), 2);
     g_text(dc, &ver, vr, mixc(pal.paper, pal.ink, 0.55), st.sf_small, true);
 
-    cy += 32;
-    g_text(dc, "常驻后台，一键呼出；图标绕成一圈，指到就用",
-        RECT { left: tx, top: cy, right: S_X1, bottom: cy + 20 },
-        mixc(pal.paper, pal.ink, 0.55), st.sf_small, false);
-
-    // 「检查更新」按钮：整行 chip 高度（和设置页其它按钮统一），单独一行放标语下方
+    // 「检查更新」按钮：整行 chip 高度（和设置页其它按钮统一）
     let ub = s_update_btn_rect();
     let (ulabel, ufill) = match st.update_st {
         1 => ("检查中…".to_string(), mixc(pal.paper, pal.ink, 0.04)),
@@ -18321,38 +18755,31 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
     };
     g_rrect(dc, ub, 10, ufill, Some(pal.edge), 2);
     g_text(dc, &ulabel, ub, pal.ink, st.sf_small, true);
-    cy = ub.bottom + ACT_GAP;
 
-    g_line(dc, S_X0, cy, S_X1, cy, 1, mixc(pal.paper, pal.ink, 0.13));
-    cy += 20;
-
-    // ── 怎么用（呼出方式按当前设置动态生成）──
-    let how = [
-        format!("呼出：{}", about_hotkeys(st)),
-        "指到图标即选中 · 松开或单击执行 · Esc 取消".to_string(),
-        "把文件、文件夹、网页或窗口标题栏拖进来即可添加".to_string(),
-        "双击图标改名 · 按住拖动换位 · 拖到环外移除".to_string(),
-        "黑白名单在「交互」页设置，名单里的应用不会弹出".to_string(),
-    ];
-    s_about_section(st, dc, pal, &mut cy, "怎么用", &how);
-    cy += 8;
-
-    // ── 运行信息（现算，不写死）──
-    let sz = std::fs::metadata(exe_path()).map(|m| m.len()).unwrap_or(0);
-    let items = st.apps.iter().map(|a| a.items.len()).sum::<usize>();
-    let info = [
-        format!("单文件 {} KB · 无外部依赖 · 空闲内存约 1 MB", sz / 1024),
-        format!("已收录 {} 个应用 · 共 {} 条外环条目", st.apps.len(), items),
-        format!("更新：{}", update_status_text(st)),
-        format!("程序：{}", exe_path()),
-        format!("配置：{}（每次改动自动备份为 .bak）", st.ini_path),
-    ];
-    s_about_section(st, dc, pal, &mut cy, "运行信息", &info);
-    let _ = cy;
-
-    g_text(dc, "© 2026 PiPie · 配置只保存在本机",
-        RECT { left: S_X0, top: S_H - 64, right: S_X1, bottom: S_H - 28 },
-        mixc(pal.paper, pal.ink, 0.4), st.sf_small, false);
+    // ── 位置：程序 / 配置 / 日志（行尾「↗」直接打开所在目录）──
+    let ly = about_loc_label_y();
+    g_text(dc, "位置", RECT { left: S_X0, top: ly, right: S_X1, bottom: ly + ACT_LABEL_H },
+        pal.ink, st.sf_bold, false);
+    for i in 0..3usize {
+        let r = about_loc_row(i);
+        let (label, path) = about_loc_text(st, i);
+        let hv = hov(st, Ctl::OpenDir(i as u8));
+        if hv > 0.01 {
+            g_rrect(dc, r, 10, mixc(pal.paper, pal.ink, 0.05 * hv), None, 0);
+        }
+        g_text(dc, label,
+            RECT { left: r.left + 10, top: r.top, right: r.left + 46, bottom: r.bottom },
+            mixc(pal.paper, pal.ink, 0.45), st.sf_small, false);
+        g_text(dc, &path,
+            RECT { left: r.left + 50, top: r.top, right: r.right - 44, bottom: r.bottom },
+            mixc(pal.paper, pal.ink, 0.68), st.sf_small, false);
+        let br = about_loc_btn(i);
+        let on = hv > 0.01;
+        g_rrect(dc, br, 8,
+            mixc(pal.paper, pal.ink, if on { 0.16 } else { 0.07 }), None, 0);
+        g_text(dc, "↗", br,
+            mixc(pal.paper, pal.ink, if on { 0.82 } else { 0.55 }), st.sf_small, true);
+    }
 }
 
 // ── 命中 ──
@@ -18398,8 +18825,17 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
                     return Ctl::Mat(i);
                 }
             }
+            if in_rect(look_live_tip_rect(), x, y) {
+                // 「?」必须先于开关行判（它落在行内）—— 与交互页同一坑
+                return Ctl::Tip(9);
+            }
             if in_rect(look_live_row(), x, y) {
                 return Ctl::GlassLive;
+            }
+            for i in 0..2usize {
+                if in_rect(avatar_btn_rect(i), x, y) {
+                    return if i == 0 { Ctl::AvatarPick } else { Ctl::AvatarReset };
+                }
             }
         }
         1 => {
@@ -18524,9 +18960,14 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             }
         }
         3 => {
-            // 关于页：「检查更新」按钮
+            // 关于页：「检查更新」按钮 + 三行位置的「↗」跳转
             if in_rect(s_update_btn_rect(), x, y) {
                 return Ctl::UpdateCheck;
+            }
+            for i in 0..3usize {
+                if in_rect(about_loc_btn(i), x, y) {
+                    return Ctl::OpenDir(i as u8);
+                }
             }
         }
         _ => {}
@@ -18905,6 +19346,30 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
                 }
             }
         }
+        Ctl::AvatarPick => {
+            if let Some(p) = pick_avatar_file(hwnd) {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Some(tex) = decode_avatar_bytes(&bytes) {
+                        let path = avatar_path(st);
+                        if std::fs::write(&path, &bytes).is_ok() {
+                            st.avatar = Some(tex);
+                            st.avatar_on = true;
+                            st.avatar_tried = true;
+                            save_settings(st);
+                            setup_kick(st, hwnd);
+                        }
+                    }
+                }
+            }
+        }
+        Ctl::AvatarReset => {
+            st.avatar = None;
+            st.avatar_on = false;
+            st.avatar_tried = true;
+            let _ = std::fs::remove_file(avatar_path(st));
+            save_settings(st);
+            setup_kick(st, hwnd);
+        }
         Ctl::Key(i) => {
             match i {
                 0 => st.key_middle = !st.key_middle,
@@ -18997,6 +19462,7 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             1 | 6 => {}               // 检查/下载中：忽略
             _ => start_update_check(st, true),
         },
+        Ctl::OpenDir(i) => open_in_explorer(&about_loc_dir(i as usize)),
         Ctl::Tip(_) => {} // 「?」只用于悬停出 tooltip，点了不做事
         Ctl::ClipOn => {
             // 总开关：关 = 不记录 + 轮盘上摘掉那条图标（全在 `cl_set_on` 里）
@@ -19243,6 +19709,10 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
     {
         busy = true;
     }
+    // 动图头像：外观页的圆形预览 / 关于页的 logo 都要一直出帧，否则停在第一帧
+    if matches!(st.set_page, 0 | 3) && st.avatar.as_ref().map_or(false, |a| a.animated()) {
+        busy = true;
+    }
 
     if !busy {
         st.set_hover_prev = Ctl::None;
@@ -19284,11 +19754,14 @@ unsafe extern "system" fn setup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             // 标题条拖动（排除关闭按钮那一段，**以及「查看引导」入口** ——
             // ⚠️ 入口也落在标题条里，不排除的话点它会被判成「拖动标题栏」，
             // 窗口跟着鼠标跑，于是「点了没反应」（用户 2026-10-13 报）。
-            if x >= S_M
-                && x < S_M + S_W - 56
-                && y >= S_M
-                && y < S_M + S_TITLE_H
-                && !in_rect(s_guide_entry_rect(), x - S_M, y - S_M)
+            // ⚠️⚠️ `set_lx` 已经把客户区像素换算成**页面逻辑坐标**（并减掉了 S_M），
+            //    这里不能再减一次 —— 2026-11-11 之前就是这样：判断用的矩形整体偏了 22px，
+            //    于是「查看引导」几乎永远被判成标题栏，用户怎么点都点不中。
+            if x >= 0
+                && x < S_W - 56
+                && y >= 0
+                && y < S_TITLE_H
+                && !in_rect(s_guide_entry_rect(), x, y)
             {
                 return LRESULT(HTCAPTION as isize);
             }
@@ -19544,6 +20017,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("clip_y={}\r\n", st.cl_y));
     out.push_str(&format!("note={}\r\n", b(st.note_on)));
     out.push_str(&format!("decor={}\r\n", st.decor.join(",")));
+    out.push_str(&format!("avatar={}\r\n", b(st.avatar_on)));
     out.push_str(&format!("note_app={}\r\n", st.note_app));
     out.push_str(&format!("note_ring_pos={}\r\n", st.note_ring_pos));
     out.push_str(&format!("update_auto={}\r\n", b(st.update_auto)));
@@ -19931,6 +20405,33 @@ unsafe fn pick_image_file(owner: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+/// 选**头像图片**：只列 WIC 一定能解的格式（不列 webp —— 系统缺解码器时会「选了没反应」）。
+unsafe fn pick_avatar_file(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OPENFILENAMEW, OFN_DONTADDTORECENT, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_PATHMUSTEXIST,
+    };
+    let filter: Vec<u16> = "图片 / GIF\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0所有文件\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut buf = [0u16; 1024];
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+    ofn.lpstrFile = windows::core::PWSTR(buf.as_mut_ptr());
+    ofn.nMaxFile = buf.len() as u32;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if !GetOpenFileNameW(&mut ofn).as_bool() {
+        return None;
+    }
+    let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
 /// 选**文件夹**（原生「选择文件夹」对话框 = 同一个 `IFileOpenDialog`，只是开了
 /// `FOS_PICKFOLDERS`）。
 ///
@@ -19995,6 +20496,43 @@ unsafe fn ensure_setup_surfaces(st: &mut State) {
         st.s_lo_dc = d;
         st.s_lo_bmp = m;
     }
+}
+
+/// 外观页「头像」预览的几何（逻辑坐标：圆心 x、圆心 y、半径）
+fn avatar_preview_geom() -> (f32, f32, f32) {
+    let b = avatar_btn_rect(1);
+    let cy = (b.top + b.bottom) as f32 * 0.5;
+    (S_X1 as f32 - 40.0, cy, 26.0)
+}
+
+/// 外观页头像预览：纸底圆 + 细边 + 圆形裁切后的头像（和轮盘中心同一套采样）。
+fn draw_avatar_preview(
+    lo: &mut [u8], lo_w: usize, lo_h: usize, pal: &Pal,
+    av: &AvatarTex, cx: f32, cy: f32, r: f32, now: f64,
+) {
+    let edge = mixc(pal.paper, pal.ink, 0.30);
+    let ext = r + 2.5;
+    let x0 = (cx - ext).max(0.0) as i32;
+    let x1 = ((cx + ext).min(lo_w as f32 - 1.0)) as i32;
+    let y0 = (cy - ext).max(0.0) as i32;
+    let y1 = ((cy + ext).min(lo_h as f32 - 1.0)) as i32;
+    for py in y0..=y1 {
+        for pxi in x0..=x1 {
+            let dx = pxi as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let o = (py as usize * lo_w + pxi as usize) * 4;
+            let cov = cov1(d - r);
+            if cov > 0.002 {
+                blend_over(lo, o, pal.paper.0 as f32, pal.paper.1 as f32, pal.paper.2 as f32, cov);
+            }
+            let ring = (cov1(d - (r + 1.3)) - cov1(d - (r + 0.1))).max(0.0);
+            if ring > 0.002 {
+                blend_over(lo, o, edge.0 as f32, edge.1 as f32, edge.2 as f32, ring);
+            }
+        }
+    }
+    blend_avatar_circle(lo, lo_w, av.frame_at(now), av.size, cx, cy, r, 1.0);
 }
 
 /// 把当前页渲染进 lo 缓冲（**未预乘**）：hi 上 SS× 画 → SS×SS 盒式降采样 → 投影 + alpha
@@ -20096,6 +20634,23 @@ unsafe fn setup_render(st: &mut State) {
         }
     }
 
+    // 4.5) 外观页「头像」预览：按真实圆形裁切画一遍（上传后立刻看到效果）
+    if st.set_page == 0 {
+        ensure_avatar(st);
+        if let Some(av) = st.avatar.as_ref() {
+            let (pcx, pcy, pr) = avatar_preview_geom();
+            let sc = set_k();
+            let ppal = pal_of(st.glass_liquid);
+            draw_avatar_preview(
+                lo, lo_w, lo_h, &ppal, av,
+                (pcx + S_M as f32) * sc,
+                (pcy + S_M as f32) * sc,
+                pr * sc,
+                now_s() as f64,
+            );
+        }
+    }
+
     if std::env::var("RL_SETDBG").is_ok() {
         eprintln!("[setdbg] setup_render {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -20168,6 +20723,8 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1)])
         // 应用页底部「剪贴板」卡那个「?」
         .chain([(2usize, 7u8, -1), (2, 8, -1)])
+        // 外观页「录屏模式」的「?」
+        .chain([(0usize, 9u8, -1)])
         // 交互页的 4 个引导步骤也出图（离屏没法点按钮，直接置位核对）
         .chain([(1usize, 0u8, 0i32), (1, 0, 1), (1, 0, 2), (1, 0, 3)])
     {

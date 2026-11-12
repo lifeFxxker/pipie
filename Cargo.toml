@@ -1,6 +1,6 @@
 [package]
 name = "pipie"
-version = "1.0.24"
+version = "1.0.25"
 edition = "2021"
 description = "A radial (pie-menu) app launcher for Windows with live window previews"
 authors = ["PiPie"]
@@ -16,6 +16,7 @@ name = "PiPie"
 path = "src/main.rs"
 
 [dependencies]
+gif = "0.14"
 windows-core = "0.58"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
