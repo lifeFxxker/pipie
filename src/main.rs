@@ -4542,6 +4542,27 @@ unsafe fn glass_disc(st: &State, buf: &mut [u8], r: f32, dark: bool) {
 // 「稍后」只压本轮（会话），下次启动还会提示；弹窗每版本最多一次（ini 记账）。
 
 
+/// 更新说明拆成前两行（去 Markdown 记号；没有就兜底）
+fn upd_note_lines(st: &State) -> Vec<String> {
+    let mut v: Vec<String> = st
+        .update_notes
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | ' ' | '#'))
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty() && !l.starts_with("Full Changelog"))
+        .take(2)
+        .collect();
+    if v.is_empty() {
+        v.push("修复已知问题，体验更稳定".to_string());
+        v.push("重启后自动使用新版本".to_string());
+    }
+    v
+}
+
 fn upd_offer(st: &State) -> bool {
     !st.update_latest.is_empty() && matches!(st.update_st, 3 | 4 | 5 | 6)
 }
@@ -4765,24 +4786,8 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                 rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 0.75);
             }
         }
-        // 更新说明：优先用 release body / Gitee NOTES.txt 的前两行（去掉 Markdown 记号）
-        let mut notes: Vec<String> = st
-            .update_notes
-            .lines()
-            .map(|l| {
-                l.trim()
-                    .trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | ' ' | '#'))
-                    .trim()
-                    .to_string()
-            })
-            .filter(|l| !l.is_empty() && !l.starts_with("Full Changelog"))
-            .take(2)
-            .collect();
-        if notes.is_empty() {
-            notes.push("修复已知问题，体验更稳定".to_string());
-            notes.push("重启后自动使用新版本".to_string());
-        }
-        for (i, t) in notes.iter().enumerate() {
+        // 更新说明：release body / Gitee NOTES.txt 的前两行
+        for (i, t) in upd_note_lines(st).iter().enumerate() {
             let line = format!("· {t}");
             draw_text(st, buf, (x0 + pxs(26.0)) as i32, (y0 + pxs(92.0) + i as f32 * pxs(22.0)) as i32,
                       &line, 13, 500, up_bullet.0, up_bullet.1, up_bullet.2, 255, pxs(320.0) as i32, 0);
@@ -18882,31 +18887,46 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
     g_rrect(dc, ub, 10, ufill, Some(pal.edge), 2);
     g_text(dc, &ulabel, ub, pal.ink, st.sf_small, true);
 
-    // 下载中：按钮下方一条真实进度（未知总长时游标来回），下面一行阶段文案
+    // 下载中：**只有真正开始下载/校验才画进度条**（查找源阶段只出文字）
     if st.update_st == 6 {
         use std::sync::atomic::Ordering::Relaxed;
+        let phase = UPDATE_PHASE.load(Relaxed);
         let bar = RECT { left: S_X0, top: ub.bottom + 10, right: S_X0 + 300, bottom: ub.bottom + 14 };
-        g_rrect(dc, bar, 2, mixc(pal.paper, pal.ink, 0.10), None, 0);
-        let total = UPDATE_TOTAL.load(Relaxed);
-        let pct = UPDATE_PROGRESS.load(Relaxed);
-        if total > 0 {
-            if pct > 0 {
-                let fr = bar.left + (((bar.right - bar.left) as u32 * pct / 100).max(2) as i32);
-                g_rrect(dc, RECT { left: bar.left, top: bar.top, right: fr.min(bar.right), bottom: bar.bottom },
+        if phase >= 2 {
+            g_rrect(dc, bar, 2, mixc(pal.paper, pal.ink, 0.10), None, 0);
+            let total = UPDATE_TOTAL.load(Relaxed);
+            let pct = UPDATE_PROGRESS.load(Relaxed);
+            if total > 0 {
+                if pct > 0 {
+                    let fr = bar.left + (((bar.right - bar.left) as u32 * pct / 100).max(2) as i32);
+                    g_rrect(dc, RECT { left: bar.left, top: bar.top, right: fr.min(bar.right), bottom: bar.bottom },
+                        2, pal.ink, None, 0);
+                }
+            } else {
+                let span = (bar.right - bar.left) as f32;
+                let seg = (span * 0.28) as i32;
+                let ph = (now_s() * 0.9) % 2.0;
+                let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
+                let sx = bar.left + ((span - seg as f32) * k) as i32;
+                g_rrect(dc, RECT { left: sx, top: bar.top, right: (sx + seg).min(bar.right), bottom: bar.bottom },
                     2, pal.ink, None, 0);
             }
-        } else {
-            let span = (bar.right - bar.left) as f32;
-            let seg = (span * 0.28) as i32;
-            let ph = (now_s() * 0.9) % 2.0;
-            let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
-            let sx = bar.left + ((span - seg as f32) * k) as i32;
-            g_rrect(dc, RECT { left: sx, top: bar.top, right: (sx + seg).min(bar.right), bottom: bar.bottom },
-                2, pal.ink, None, 0);
         }
         g_text(dc, &update_dl_line(),
             RECT { left: S_X0, top: bar.bottom + 4, right: S_X1, bottom: bar.bottom + 22 },
             mixc(pal.paper, pal.ink, 0.6), st.sf_small, false);
+    }
+
+    // 右侧：更新说明（1~2 句），有新版本/下载中/已完成都展示
+    if matches!(st.update_st, 3 | 5 | 6) {
+        let nx = S_X0 + 330;
+        for (i, t) in upd_note_lines(st).iter().enumerate() {
+            let line = format!("· {t}");
+            let top = ub.top + 2 + i as i32 * 18;
+            g_text(dc, &line,
+                RECT { left: nx, top, right: S_X1, bottom: top + 20 },
+                mixc(pal.paper, pal.ink, 0.55), st.sf_small, false);
+        }
     }
 
     // ── 位置：程序 / 配置 / 日志（行尾「↗」直接打开所在目录）──
@@ -20927,6 +20947,45 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         let p = format!("{}\\{}.bmp", dir, name);
         let ok = save_bmp(&p, &px, set_lo_w(), set_lo_h());
         println!("[setup] {} page={} tip={} guide={} {}", name, page, tip, guide, if ok { "OK" } else { "FAIL" });
+    }
+
+    // 「关于」页 · 更新三态：有新版本 / 正在查找更新源（**不画进度条**）/ 下载中（进度条 + 右侧说明）
+    {
+        st.set_page = 3;
+        st.set_page_a = 1.0;
+        st.guide_step = -1;
+        st.tip = 0;
+        st.set_hover = Ctl::None;
+        st.update_notes = "新增自定义中心头像（图片/GIF，圆形裁切）
+更新下载更稳定".to_string();
+        st.update_latest = "9.9.9".to_string();
+        st.update_st = 3;
+        st.upd_pill_vis = false;
+        setup_render(st);
+        s_dump_save(st, dir, "setup_upd_avail");
+
+        st.update_st = 6;
+        UPDATE_PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
+        setup_render(st);
+        s_dump_save(st, dir, "setup_upd_find");
+
+        UPDATE_PHASE.store(2, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_TOTAL.store(1_205_248, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_BYTES.store(747_254, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_PROGRESS.store(62, std::sync::atomic::Ordering::Relaxed);
+        setup_render(st);
+        s_dump_save(st, dir, "setup_upd_dl");
+
+        UPDATE_PHASE.store(0, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        UPDATE_PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
+        st.update_st = 0;
+        st.update_latest.clear();
+        st.update_notes.clear();
     }
 
     // 应用页底部那张「剪贴板」卡的关态：开关滑到左，**且列表里那条「剪贴板」已经没了**
