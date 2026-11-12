@@ -35,7 +35,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, SetProcessWorkingSetSize};
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetFocus, MapVirtualKeyW, RegisterHotKey, SetFocus, UnregisterHotKey,
     MAPVK_VSC_TO_VK_EX, MOD_ALT, MOD_CONTROL,
@@ -1297,6 +1297,10 @@ struct State {
     /// 这个更新版本已经展示过几次更新条（ini `update_seen_ver` / `update_seen_n`）
     update_seen_ver: String,
     update_seen_n: u8,
+    /// 展示计数所属的**本地日期**（YYYYMMDD，每天重置前两次）
+    update_seen_day: u32,
+    /// 当前这次呼出是否计入「前两次」（启动亮相不计，只展示不消耗次数）
+    upd_counted_open: bool,
 
     // ── 拖入引导（onboarding）四步阶梯（用户 2026-10-14 定稿）──
     // ①② 由「**真的做了那个动作**」置位 → 槽位是 self-clearing 的，不需要任何"已读"状态；
@@ -1714,6 +1718,8 @@ impl State {
             upd_pill_vis: false,
             update_seen_ver: String::new(),
             update_seen_n: 0,
+            update_seen_day: 0,
+            upd_counted_open: false,
             onb_drag: false,
             onb_customized: false,
             onb_move: false,
@@ -4616,8 +4622,10 @@ unsafe fn upd_refresh_pill(st: &mut State) {
         st.upd_pill_vis = false;
         return;
     }
-    if st.update_seen_ver != st.update_latest {
+    let today = local_ymd();
+    if st.update_seen_ver != st.update_latest || st.update_seen_day != today {
         st.update_seen_ver = st.update_latest.clone();
+        st.update_seen_day = today;
         st.update_seen_n = 0;
     }
     if st.update_seen_n < 2 {
@@ -4637,7 +4645,7 @@ unsafe fn startup_reveal(st: &mut State) {
     let mut cp = POINT::default();
     let _ = GetCursorPos(&mut cp);
     st.upd_only = false;
-    show_menu(st, cp.x, cp.y);
+    show_menu(st, cp.x, cp.y, false);
     say(st, REVEAL_MSG, REVEAL_SUB, REVEAL_SECS);
     st.hide_at = now_s() + REVEAL_SECS;
 }
@@ -4648,7 +4656,7 @@ unsafe fn open_update_window(st: &mut State) {
     let mut cp = POINT::default();
     let _ = GetCursorPos(&mut cp);
     st.upd_only = true;
-    show_menu(st, cp.x, cp.y);
+    show_menu(st, cp.x, cp.y, false);
     st.upd_only = true;
     st.upd_modal = true;
     st.upd_dismissed = false;
@@ -10935,6 +10943,8 @@ unsafe fn read_persistent(st: &mut State) {
                 st.update_seen_ver = v;
             } else if let Some(v) = get("update_seen_n=") {
                 st.update_seen_n = v.parse::<u8>().unwrap_or(0);
+            } else if let Some(v) = get("update_seen_day=") {
+                st.update_seen_day = v.parse::<u32>().unwrap_or(0);
             }
         }
     }
@@ -10954,6 +10964,12 @@ unsafe fn read_persistent(st: &mut State) {
 }
 
 /// a 比 b 新？（逐段数字比较，缺省按 0）
+/// 本地日期 YYYYMMDD（更新条「每天前两次展示」的换日依据）
+fn local_ymd() -> u32 {
+    let t = unsafe { GetLocalTime() };
+    t.wYear as u32 * 10000 + t.wMonth as u32 * 100 + t.wDay as u32
+}
+
 fn ver_newer(a: &str, b: &str) -> bool {
     let pa: Vec<u32> = a.split('.').map(|x| x.parse().unwrap_or(0)).collect();
     let pb: Vec<u32> = b.split('.').map(|x| x.parse().unwrap_or(0)).collect();
@@ -15081,7 +15097,8 @@ unsafe fn frame(st: &mut State, alpha: u8) {
 
 // ───────────────────── 菜单生命周期 ─────────────────────
 
-unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
+unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
+    st.upd_counted_open = count_update;
     // 轮盘一出来就把卡片收掉：卡片是「呼出型」的，两张卡一起在场只会互相挡。
     // ⚠️ 轮盘是 `WS_EX_NOACTIVATE`，它不会让卡片失活 —— 所以必须显式收。
     unsafe {
@@ -15180,8 +15197,14 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32) {
     );
     // 窗口已经显示 → 从这一刻起后台线程每 33ms 重抓一次背景（首帧快照仍是上面那张）
     glass_live_start(st, hwnd);
-    // 更新条：同一个版本只在前两次呼出时展示（点击它才展开更新弹窗）
-    unsafe { upd_refresh_pill(st) };
+    // 更新条：每天前两次「真正的呼出」展示（启动亮相只展示、不消耗次数）
+    if count_update {
+        unsafe { upd_refresh_pill(st) };
+    } else {
+        st.upd_pill_vis = upd_offer(st)
+            && matches!(st.update_st, 3 | 4)
+            && st.update_seen_n < 2;
+    }
     let mh = MAIN_HWND.load(Ordering::Relaxed);
     if mh != 0 {
         let _ = SetTimer(HWND(mh as *mut c_void), TIMER_FRAME, 16, None);
@@ -15433,7 +15456,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 x = p.x;
                 y = p.y;
             }
-            show_menu(st, x, y);
+            show_menu(st, x, y, true);
             // ⚠️ 键盘自定义触发没有 keyup：不锁定的话左键点击只会收起菜单，
             //    表现就是「点了应用没反应」（用户 2026-11-05 报）。
             if w.0 == 1 && MENU_OPEN.load(Ordering::Relaxed) {
@@ -16229,7 +16252,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         st.upd_pill_vis = false;
                         unsafe { save_settings(st) };
                     }
-                    if MENU_OPEN.load(Ordering::Relaxed) && !st.hiding {
+                    if MENU_OPEN.load(Ordering::Relaxed) && st.upd_counted_open && !st.hiding {
                         unsafe { upd_refresh_pill(st) };
                     }
                 }
@@ -20159,6 +20182,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("update_avail_ver={}\r\n", st.update_avail_ver));
     out.push_str(&format!("update_seen_ver={}\r\n", st.update_seen_ver));
     out.push_str(&format!("update_seen_n={}\r\n", st.update_seen_n));
+    out.push_str(&format!("update_seen_day={}\r\n", st.update_seen_day));
     out.push_str(&format!("onb_drag={}\r\n", b(st.onb_drag)));
     out.push_str(&format!("onb_move={}\r\n", b(st.onb_move)));
     out.push_str(&format!("onb_edit={}\r\n", b(st.onb_edit)));
