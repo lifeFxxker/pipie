@@ -1279,6 +1279,8 @@ struct State {
     update_latest: String,
     /// 失败原因 / 提示文案（给人看）
     update_msg: String,
+    /// 这次的更新说明（release body / Gitee NOTES.txt，落在配置文件旁的 update_notes.txt）
+    update_notes: String,
     /// 后台检查发现「确实有更新」的那个版本号（ini `update_avail_ver`，空 = 没有）。
     /// ⚠️ 必须落盘：提醒是在**下一次呼出轮盘**时才发生的，中间可能已经重启过。
     update_avail_ver: String,
@@ -1703,6 +1705,7 @@ impl State {
             update_st: 0,
             update_latest: String::new(),
             update_msg: String::new(),
+            update_notes: String::new(),
             update_avail_ver: String::new(),
             upd_dismissed: false,
             upd_modal: false,
@@ -3005,6 +3008,16 @@ impl AvatarTex {
     fn animated(&self) -> bool {
         self.frames.len() > 1 && self.total_ms > 0
     }
+}
+
+/// 更新说明文件：与 `settings.ini` 同目录（沙箱/离屏图各自独立）
+fn update_notes_path(st: &State) -> String {
+    let dir = std::path::Path::new(&st.ini_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(config_dir);
+    format!("{dir}\\update_notes.txt")
 }
 
 /// 头像文件放在 `settings.ini` **同目录**（沙箱/离屏图各自独立，不串到真实配置）。
@@ -4599,7 +4612,7 @@ fn upd_open_modal(st: &mut State) {
 /// 第三次起不再出现（本轮版本），下次有新版本重新计数。
 /// 更新弹窗**不再自动弹出** —— 点更新条才展开。
 unsafe fn upd_refresh_pill(st: &mut State) {
-    if !upd_offer(st) {
+    if !upd_offer(st) || !matches!(st.update_st, 3 | 4) {
         st.upd_pill_vis = false;
         return;
     }
@@ -4744,15 +4757,27 @@ unsafe fn draw_upd_ui(st: &mut State, buf: &mut [u8]) {
                 rot_rrect(buf, sx + seg * 0.5, by, seg * 0.5, pxs(1.0), pxs(1.0), 0.0, pal.ink, 0.75);
             }
         }
-        for (i, t) in [
-            "· 修复已知问题，体验更稳定",
-            "· 重启后自动使用新版本",
-        ]
-        .iter()
-        .enumerate()
-        {
+        // 更新说明：优先用 release body / Gitee NOTES.txt 的前两行（去掉 Markdown 记号）
+        let mut notes: Vec<String> = st
+            .update_notes
+            .lines()
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | ' ' | '#'))
+                    .trim()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty() && !l.starts_with("Full Changelog"))
+            .take(2)
+            .collect();
+        if notes.is_empty() {
+            notes.push("修复已知问题，体验更稳定".to_string());
+            notes.push("重启后自动使用新版本".to_string());
+        }
+        for (i, t) in notes.iter().enumerate() {
+            let line = format!("· {t}");
             draw_text(st, buf, (x0 + pxs(26.0)) as i32, (y0 + pxs(92.0) + i as f32 * pxs(22.0)) as i32,
-                      t, 13, 500, up_bullet.0, up_bullet.1, up_bullet.2, 255, pxs(320.0) as i32, 0);
+                      &line, 13, 500, up_bullet.0, up_bullet.1, up_bullet.2, 255, pxs(320.0) as i32, 0);
         }
         draw_text(st, buf, (x1 - pxs(26.0)) as i32, (y0 + pxs(24.0)) as i32,
                   "×", 20, 700, up_muted.0, up_muted.1, up_muted.2, 255, 0, 0);
@@ -10919,6 +10944,7 @@ unsafe fn read_persistent(st: &mut State) {
         if ver_newer(&st.update_avail_ver, cur_version()) {
             st.update_latest = st.update_avail_ver.clone();
             st.update_st = 3;
+            st.update_notes = std::fs::read_to_string(update_notes_path(st)).unwrap_or_default();
         } else {
             st.update_avail_ver.clear();
         }
@@ -16174,9 +16200,24 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
                 st.update_msg = msg;
                 // s=2「已是最新」→ 清掉「可更新版本」记录（升级后别再拿旧版本提示）
-                if s == 2 && !st.update_avail_ver.is_empty() {
-                    st.update_avail_ver.clear();
-                    unsafe { save_settings(st) };
+                if s == 2 {
+                    st.update_notes.clear();
+                    let _ = std::fs::remove_file(update_notes_path(st));
+                    if !st.update_avail_ver.is_empty() {
+                        st.update_avail_ver.clear();
+                        unsafe { save_settings(st) };
+                    }
+                }
+                if s == 3 {
+                    st.update_notes = UPDATE_NOTES
+                        .lock()
+                        .map(|q| q.clone())
+                        .unwrap_or_default();
+                    if st.update_notes.is_empty() {
+                        let _ = std::fs::remove_file(update_notes_path(st));
+                    } else {
+                        let _ = std::fs::write(update_notes_path(st), &st.update_notes);
+                    }
                 }
                 // s=3「有新版本」→ 落盘版本号 + 重置「已展示次数」。
                 // ⚠️ 不再自动弹更新窗口：只在轮盘底部出更新条（每版前两次呼出），点它才展开。
@@ -18727,19 +18768,21 @@ fn s_update_btn_rect() -> RECT {
 }
 
 /// 关于页「位置」段标题的顶边
-fn about_loc_label_y() -> i32 {
-    s_update_btn_rect().bottom + ACT_GAP + 12
+fn about_loc_label_y(st: &State) -> i32 {
+    // 下载中在按钮下方多出「进度条 + 阶段文案」一块
+    let extra = if st.update_st == 6 { 28 } else { 0 };
+    s_update_btn_rect().bottom + ACT_GAP + 12 + extra
 }
 
 /// 关于页三行位置（程序 / 配置 / 日志）的行矩形
-fn about_loc_row(i: usize) -> RECT {
-    let top = about_loc_label_y() + ACT_LABEL_H + ACT_GAP - 4 + i as i32 * 42;
+fn about_loc_row(st: &State, i: usize) -> RECT {
+    let top = about_loc_label_y(st) + ACT_LABEL_H + ACT_GAP - 4 + i as i32 * 42;
     RECT { left: S_X0, top, right: S_X1, bottom: top + 34 }
 }
 
 /// 行尾的「↗」跳转按钮
-fn about_loc_btn(i: usize) -> RECT {
-    let r = about_loc_row(i);
+fn about_loc_btn(st: &State, i: usize) -> RECT {
+    let r = about_loc_row(st, i);
     RECT { left: r.right - 34, top: r.top + 3, right: r.right - 2, bottom: r.top + 31 }
 }
 
@@ -18810,18 +18853,45 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
         3 => ("更新".to_string(), mixc(pal.paper, pal.ink, 0.14)),
         4 => ("重试".to_string(), mixc(pal.paper, pal.ink, 0.04)),
         5 => ("重启并更新".to_string(), mixc(pal.paper, pal.ink, 0.14)),
-        6 => (update_dl_line(), mixc(pal.paper, pal.ink, 0.04)),
+        6 => ("更新中…".to_string(), mixc(pal.paper, pal.ink, 0.04)),
         _ => ("检查更新".to_string(), mixc(pal.paper, pal.ink, 0.06)),
     };
     g_rrect(dc, ub, 10, ufill, Some(pal.edge), 2);
     g_text(dc, &ulabel, ub, pal.ink, st.sf_small, true);
 
+    // 下载中：按钮下方一条真实进度（未知总长时游标来回），下面一行阶段文案
+    if st.update_st == 6 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bar = RECT { left: S_X0, top: ub.bottom + 10, right: S_X0 + 300, bottom: ub.bottom + 14 };
+        g_rrect(dc, bar, 2, mixc(pal.paper, pal.ink, 0.10), None, 0);
+        let total = UPDATE_TOTAL.load(Relaxed);
+        let pct = UPDATE_PROGRESS.load(Relaxed);
+        if total > 0 {
+            if pct > 0 {
+                let fr = bar.left + (((bar.right - bar.left) as u32 * pct / 100).max(2) as i32);
+                g_rrect(dc, RECT { left: bar.left, top: bar.top, right: fr.min(bar.right), bottom: bar.bottom },
+                    2, pal.ink, None, 0);
+            }
+        } else {
+            let span = (bar.right - bar.left) as f32;
+            let seg = (span * 0.28) as i32;
+            let ph = (now_s() * 0.9) % 2.0;
+            let k = (if ph > 1.0 { 2.0 - ph } else { ph }) as f32;
+            let sx = bar.left + ((span - seg as f32) * k) as i32;
+            g_rrect(dc, RECT { left: sx, top: bar.top, right: (sx + seg).min(bar.right), bottom: bar.bottom },
+                2, pal.ink, None, 0);
+        }
+        g_text(dc, &update_dl_line(),
+            RECT { left: S_X0, top: bar.bottom + 4, right: S_X1, bottom: bar.bottom + 22 },
+            mixc(pal.paper, pal.ink, 0.6), st.sf_small, false);
+    }
+
     // ── 位置：程序 / 配置 / 日志（行尾「↗」直接打开所在目录）──
-    let ly = about_loc_label_y();
+    let ly = about_loc_label_y(st);
     g_text(dc, "位置", RECT { left: S_X0, top: ly, right: S_X1, bottom: ly + ACT_LABEL_H },
         pal.ink, st.sf_bold, false);
     for i in 0..3usize {
-        let r = about_loc_row(i);
+        let r = about_loc_row(st, i);
         let (label, path) = about_loc_text(st, i);
         let hv = hov(st, Ctl::OpenDir(i as u8));
         if hv > 0.01 {
@@ -18833,7 +18903,7 @@ unsafe fn s_paint_adv(st: &mut State, dc: HDC, pal: &Pal) {
         g_text(dc, &path,
             RECT { left: r.left + 50, top: r.top, right: r.right - 44, bottom: r.bottom },
             mixc(pal.paper, pal.ink, 0.68), st.sf_small, false);
-        let br = about_loc_btn(i);
+        let br = about_loc_btn(st, i);
         let on = hv > 0.01;
         g_rrect(dc, br, 8,
             mixc(pal.paper, pal.ink, if on { 0.16 } else { 0.07 }), None, 0);
@@ -19025,7 +19095,7 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
                 return Ctl::UpdateCheck;
             }
             for i in 0..3usize {
-                if in_rect(about_loc_btn(i), x, y) {
+                if in_rect(about_loc_btn(st, i), x, y) {
                     return Ctl::OpenDir(i as u8);
                 }
             }
@@ -19771,6 +19841,10 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
     }
     // 动图头像：外观页的圆形预览 / 关于页的 logo 都要一直出帧，否则停在第一帧
     if matches!(st.set_page, 0 | 3) && st.avatar.as_ref().map_or(false, |a| a.animated()) {
+        busy = true;
+    }
+    // 下载中：进度条/阶段文案要持续刷新
+    if st.update_st == 6 {
         busy = true;
     }
 
@@ -21194,6 +21268,42 @@ fn http_get(url: &str) -> Result<(u32, String), String> {
     http_get_raw(url).map(|(s, b)| (s, String::from_utf8_lossy(&b).into_owned()))
 }
 
+/// 反转义 JSON 字符串（release body 里的换行 / 引号 / \uXXXX）。
+fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    if let Some(h) = it.next() {
+                        hex.push(h);
+                    }
+                }
+                if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(v) {
+                        out.push(ch);
+                    }
+                }
+            }
+            Some(o) => out.push(o),
+            None => break,
+        }
+    }
+    out
+}
+
+
 enum UpdateOutcome {
     /// 已是最新（带上 latest 便于显示）
     UpToDate { latest: String },
@@ -21202,6 +21312,8 @@ enum UpdateOutcome {
         latest: String,
         exe_url: String,
         sums_url: String,
+        /// release 说明（GitHub body / Gitee NOTES.txt；没有就空）
+        notes: String,
     },
     /// 检查失败（原因是给人看的）
     Failed(String),
@@ -21214,6 +21326,8 @@ static UPDATE_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 ///    必须靠阶段 + 已下字节数告诉用户「在动」（用户 2026-11-09 报卡 0% 半天）。
 static UPDATE_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static UPDATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 检查结果里的更新说明（UI 线程取走存 State / 落盘）
+static UPDATE_NOTES: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static UPDATE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 当前下载源：0 未知 / 1 GitHub / 2 Gitee（阶段文案要告诉用户在连哪）
 static UPDATE_SRC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -21231,14 +21345,13 @@ fn src_name(src: u8) -> &'static str {
 fn update_dl_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let phase = UPDATE_PHASE.load(Relaxed);
-    let src = src_name(UPDATE_SRC.load(Relaxed));
     match phase {
-        1 => format!("正在连接{src}…"),
+        1 => "正在查找更新源…".to_string(),
         2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
-            format!("{src} 下载中 {}%", UPDATE_PROGRESS.load(Relaxed))
+            format!("下载中 {}%", UPDATE_PROGRESS.load(Relaxed))
         }
         2 => format!(
-            "{src} 下载中 {:.1} MB",
+            "下载中 {:.1} MB",
             UPDATE_BYTES.load(Relaxed) as f64 / 1_048_576.0
         ),
         3 => "正在校验…".to_string(),
@@ -21252,7 +21365,7 @@ fn update_dl_short() -> (&'static str, String) {
     use std::sync::atomic::Ordering::Relaxed;
     let phase = UPDATE_PHASE.load(Relaxed);
     match phase {
-        1 => ("正在连接", src_name(UPDATE_SRC.load(Relaxed)).to_string()),
+        1 => ("正在查找", String::new()),
         2 if UPDATE_TOTAL.load(Relaxed) > 0 => {
             ("下载中", format!("{}%", UPDATE_PROGRESS.load(Relaxed)))
         }
@@ -21362,6 +21475,14 @@ fn sha256_hex(data: &[u8]) -> Option<String> {
     }
 }
 
+/// Gitee 版本目录下的 `NOTES.txt`（更新说明；没有就空，不影响检查）
+fn gitee_notes(latest: &str) -> String {
+    match http_get(&gitee_raw(&format!("v{latest}/NOTES.txt"))) {
+        Ok((200, body)) => body.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
 /// 同步检查更新（网络阻塞，**不要**在 UI 线程直接调；UI 走后台线程）。
 /// 备用源：Gitee 公开发布仓的 `version.txt` + 固定文件名
 fn check_gitee_update() -> UpdateOutcome {
@@ -21379,6 +21500,7 @@ fn check_gitee_update() -> UpdateOutcome {
                     // 每个版本一个目录：raw CDN 对同名文件的缓存不会串版本
                     exe_url: gitee_raw(&format!("v{latest}/PiPie.exe")),
                     sums_url: gitee_raw(&format!("v{latest}/SHA256SUMS")),
+                    notes: gitee_notes(&latest),
                 }
             } else {
                 UpdateOutcome::UpToDate { latest }
@@ -21410,6 +21532,9 @@ fn check_update_sync() -> UpdateOutcome {
                                 latest,
                                 exe_url,
                                 sums_url,
+                                notes: json_str_field(&body, "body")
+                                    .map(|s| json_unescape(&s))
+                                    .unwrap_or_default(),
                             },
                             _ => UpdateOutcome::Failed(
                                 "release 里缺 PiPie.exe 或 SHA256SUMS asset".into(),
@@ -28207,12 +28332,16 @@ fn start_update_check(st: &mut State, manual: bool) {
                 latest,
                 exe_url,
                 sums_url,
+                notes,
             } => {
                 if let Ok(mut q) = UPDATE_EXE_URL.lock() {
                     *q = exe_url;
                 }
                 if let Ok(mut q) = UPDATE_SUMS_URL.lock() {
                     *q = sums_url;
+                }
+                if let Ok(mut q) = UPDATE_NOTES.lock() {
+                    *q = notes;
                 }
                 (3u8, latest, String::new())
             }
@@ -28357,6 +28486,28 @@ fn download_with_fallback(
         .map_err(|e3| format!("GitHub：{e1}；Gitee：{e2}；GitHub 重试：{e3}"))
 }
 
+/// 开始下载后：收起轮盘 → 打开设置页「关于」看进度（用户 2026-11-12 要求）
+unsafe fn open_about_for_update(st: &mut State) {
+    st.upd_modal = false;
+    st.upd_only = false;
+    st.upd_pill_vis = false;
+    if MENU_OPEN.load(Ordering::Relaxed) {
+        close_menu_now(st);
+    }
+    st.set_page = 3;
+    st.set_page_a = 1.0;
+    let sh = SET_HWND.load(Ordering::Relaxed);
+    if sh != 0 && IsWindowVisible(HWND(sh as *mut c_void)).as_bool() {
+        setup_present(st);
+    } else {
+        open_settings(st);
+        // 首启引导可能抢页面 —— 再强制一次「关于」
+        st.set_page = 3;
+        st.set_page_a = 1.0;
+        setup_present(st);
+    }
+}
+
 fn start_download(st: &mut State) {
     if st.update_st == 1 || st.update_st == 6 {
         return; // 正在检查 / 下载
@@ -28370,10 +28521,16 @@ fn start_download(st: &mut State) {
     }
     st.update_st = 6;
     st.update_msg.clear();
+    // 先把阶段置成「查找更新源」，避免设置页第一帧闪一下「准备下载…」
+    UPDATE_PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
     UPDATE_PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
+    UPDATE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    UPDATE_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     let new_path = format!("{}\\.pipie-update.new", exe_dir());
     let latest = st.update_latest.clone();
     unsafe { save_settings(st) };
+    // 进度只在设置页「关于」展示：收起轮盘并切过去
+    unsafe { open_about_for_update(st) };
     std::thread::spawn(move || {
         let result = download_with_fallback(&latest, &exe_url, &sums_url, &new_path);
         let (s, msg) = match result {
@@ -28550,6 +28707,7 @@ fn main() {
                 latest,
                 exe_url,
                 sums_url,
+                ..
             } => {
                 println!("[update] 有新版本: v{latest}（当前 v{}）", cur_version());
                 println!("         exe={exe_url}");
@@ -28573,6 +28731,7 @@ fn main() {
                 latest,
                 exe_url,
                 sums_url,
+                ..
             } => {
                 let dest = format!("{dir}\\PiPie.exe");
                 match download_with_fallback(&latest, &exe_url, &sums_url, &dest) {
