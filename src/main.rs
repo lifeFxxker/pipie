@@ -33,6 +33,7 @@ use windows::core::PWSTR;
 use windows::core as windows_core;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Environment::SetEnvironmentVariableW;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, SetProcessWorkingSetSize};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
@@ -261,6 +262,7 @@ const WM_APP_EDITSIM: u32 = WM_APP + 17; // 仅测试：驱动改名状态机
 const WM_APP_EDCOMP: u32 = WM_APP + 50;  // 改名：IME 组字串更新（内容见 EDIT_COMP_NEXT）
 const WM_APP_EDRES: u32 = WM_APP + 51;   // 改名：IME 上屏（内容见 EDIT_RES_NEXT）
 const WM_APP_BUBTEXT: u32 = WM_APP + 52; // 仅测试：1=内环满 / 2=外环满 / 3=没接住 / 0=其它
+const WM_APP_RINGOFF: u32 = WM_APP + 53; // 仅测试：0=ring_off*100 / 1=ring_to*100
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
                                         // 返回值 = (y << 16) | x
                                         //（单击路径要靠真光标才能触发 update_hover，
@@ -307,7 +309,7 @@ const WM_APP_APPPOS: u32 = WM_APP + 32;
 /// 仅测试：直接把指定 hwnd 的缩略图弹在左上角，用来确认
 /// 「最小化窗口的 DWM 缩略图到底有没有画面」——不依赖任何 UI 定位。
 const WM_APP_THUMBSIM: u32 = WM_APP + 34;
-/// 滚轮一格（w = ±1）：内环**连续滚动**（超过一屏 `RING_SLOTS` 个应用时才生效）。
+/// 滚轮一格（w = ±1）：内环滚动/整页翻页（超过一屏 `RING_SLOTS` 个应用时才生效）。
 /// 只能从低级钩子来 —— 菜单不抢焦点，`WM_MOUSEWHEEL` 到不了我们的窗口过程。
 const WM_APP_WHEEL: u32 = WM_APP + 35;
 /// 仅测试：把滚动偏移**直接**设成 w（不动画），用于「滚到第 N 页后命中/绘制是否还对」的回归。
@@ -1178,6 +1180,8 @@ struct State {
     ring_off: f32,
     /// 滚轮累加出来的**目标**偏移。`on_timer` 每帧把 `ring_off` 追上来（指数跟随）。
     ring_to: f32,
+    /// 内环滚轮翻页方式（ini `ring_page=`）：false = 逐项滚动（默认）/ true = 整页翻页
+    ring_page: bool,
     // ── 松手落位动画：只有「被拖的那一个」需要动 ──
     /// 正在落位的应用下标（`usize::MAX` = 无）
     land_app: usize,
@@ -1643,6 +1647,7 @@ impl State {
             app_slot_s: [f32::NAN; MAX_APPS],
             ring_off: 0.0,
             ring_to: 0.0,
+            ring_page: false,
             land_app: usize::MAX,
             land_t0: 0.0,
             land_from: (0.0, 0.0),
@@ -5366,7 +5371,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     //    轨道 = 整环可滚的范围，滑块 = 当前这一页占的份数，位置 = 当前偏移。
     //    不写数字、不放箭头：这一条只负责表达「还有别的页」，其余交给气泡说明。
     {
-        let mx = ring_off_max(n);
+        let mx = if st.ring_page { ring_page_max(n) } else { ring_off_max(n) };
         if mx > 0.0 {
             let r = disc_r - 11.0;
             let half = 34.0; // 轨道半跨（度），以正下方 180° 为中心
@@ -7038,7 +7043,8 @@ fn onb_say(st: &mut State) {
         unsafe { save_settings(st) };
     } else if st.apps.len() > RING_SLOTS && !st.onb_scroll {
         // 只有**真的超过一屏**才提这条（否则提了也没东西可滚）
-        say(st, "超过一屏了", "滚轮可以连续滚", ONB_SECS);
+        say(st, "超过一屏了",
+            if st.ring_page { "滚轮可以整页翻" } else { "滚轮可以连续滚" }, ONB_SECS);
         st.onb_scroll = true;
         unsafe { save_settings(st) };
     }
@@ -11073,6 +11079,8 @@ unsafe fn read_persistent(st: &mut State) {
                 st.key_middle = v != "0";
             } else if let Some(v) = get("hover_name=") {
                 st.hover_name = v != "0";
+            } else if let Some(v) = get("ring_page=") {
+                st.ring_page = v != "0";
             } else if let Some(v) = get("glass=") {
                 // 缺省 = 关（纸面）—— 玻璃要看桌面，不是所有人的壁纸都撑得住
                 st.glass = v != "0";
@@ -11284,12 +11292,16 @@ unsafe fn load_ini(st: &mut State) {
                     continue;
                 }
                 if mode == 0 {
-                    // ⚠️ 这里只多认一个 `clip=`：环上那条「剪贴板」该补还是该摘，必须在
+                    // ⚠️ 这里只多认 `clip=` / `note=`：环上那两条内置图标该补还是该摘，必须在
                     // **本函数**就能判定 —— `read_persistent` 跑在 `load_ini` 之后，
-                    // 靠它的缺省值会先按「开」补错一次（2026-11-01 的坑：`clip=0` 重启后图标又回来了）。
+                    // 靠它的缺省值会先按「开」补错一次（2026-11-01 的坑：`clip=0` 重启后图标又回来了；
+                    // 便签 `note=0` 同理，2026-11-13 一并修）。
                     if let Some((k, v)) = line.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("clip") {
-                            st.cl_on = v.trim() != "0";
+                        let (k, v) = (k.trim(), v.trim());
+                        if k.eq_ignore_ascii_case("clip") {
+                            st.cl_on = v != "0";
+                        } else if k.eq_ignore_ascii_case("note") {
+                            st.note_on = v != "0";
                         }
                     }
                     continue;
@@ -12251,6 +12263,17 @@ fn ring_off_max(n: usize) -> f32 {
     n.saturating_sub(RING_SLOTS) as f32
 }
 
+/// 整页翻页的最大偏移：按**整页**算 —— 最后一页哪怕只剩一个应用也占满一页，
+/// 翻到它时后面的槽位是空的（用户 2026-11-13：「哪怕第三页就一个那也是占一页的」）。
+fn ring_page_max(n: usize) -> f32 {
+    let vis = ring_vis(n);
+    if n <= vis {
+        0.0
+    } else {
+        (((n + vis - 1) / vis) - 1) as f32 * vis as f32
+    }
+}
+
 /// 槽位下标 `i`（含幽灵槽 `apps.len()`）的**连续槽位** = 下标 − 滚动偏移。
 /// 小数是常态：滚动动画里偏移本身就是小数。
 #[inline]
@@ -12347,6 +12370,32 @@ fn ring_reveal(st: &mut State, i: usize) {
 
 /// 滚轮转 `d` 格（`d > 0` = 往后一页的方向）：只改**目标**偏移，动画归 `on_timer`。
 /// 返回 `false` = 没得滚（没超过一屏，或已经到头）。
+/// 整页翻页用的滚轮累计量（触摸板小增量攒满一格才翻页；换页/收菜单时清零）
+static PAGE_WHEEL_ACC: AtomicI32 = AtomicI32::new(0);
+
+/// 整页翻页：滚轮一格 = 翻一屏（`ring_vis` 个应用）。
+/// 以 `ring_to` 最近的整页为基准，夹在 `[0, ring_page_max]` —— 最后一页不满也占满一页
+/// （翻过去只显示剩下的几个，后面的槽位留空）。
+fn ring_page_step(st: &mut State, dir: i32) -> bool {
+    let n = eff_apps(st);
+    let mx = ring_page_max(n);
+    if mx <= 0.0 {
+        return false;
+    }
+    let page = ring_vis(n) as f32;
+    let cur = (st.ring_to / page).round() * page;
+    let to = (cur + dir as f32 * page).clamp(0.0, mx);
+    if (to - st.ring_to).abs() < 1e-3 {
+        return false;
+    }
+    st.ring_to = to;
+    st.last_input = now_s();
+    st.hit_app = None;
+    st.hover_now = None;
+    scroll_prune(st);
+    true
+}
+
 fn ring_scroll(st: &mut State, d: f32) -> bool {
     let mx = ring_off_max(eff_apps(st));
     if mx <= 0.0 {
@@ -15365,6 +15414,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     //    位置与命中判定会错开一格（`update_hover` 用的是偏移后的槽位）。
     st.ring_off = 0.0;
     st.ring_to = 0.0;
+    PAGE_WHEEL_ACC.store(0, Ordering::Relaxed);
     // 换次呼出 → UIA 探测结果作废（用户可能换了窗口/换了目录）
     st.wincap_failed.clear();
     st.land_app = usize::MAX;
@@ -15522,6 +15572,7 @@ unsafe fn close_menu_now(st: &mut State) {
     //    但常驻模式（`locked`）不重走 `show_menu`，漏在这里就会带着上一页的偏移继续用。
     st.ring_off = 0.0;
     st.ring_to = 0.0;
+    PAGE_WHEEL_ACC.store(0, Ordering::Relaxed);
     st.app_slot_s = [f32::NAN; MAX_APPS];
     // 窗口捕获随菜单一起清：没落盘的拖动作废（用户松手在环外 = 放弃）
     st.window_capture = None;
@@ -16449,6 +16500,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             };
             LRESULT(v as isize)
         }
+        WM_APP_RINGOFF => {
+            // 仅测试：滚动偏移 ×100（回归「整页翻页一次走一屏」）
+            let st = state_of(hwnd);
+            let v = if w.0 == 1 { st.ring_to } else { st.ring_off };
+            LRESULT((v * 100.0).round() as isize)
+        }
         WM_APP_BUBTEXT => {
             // 仅测试：拖放失败时到底提示了哪一句（上限 / 没接住），返回枚举不传字符串
             let st = state_of(hwnd);
@@ -16641,7 +16698,7 @@ WM_APP_DISMISS_FG => {
             LRESULT(0)
         }
         WM_APP_WHEEL => {
-            // 滚轮一格：内环**连续滚动**（只在一屏装不下时才生效）。
+            // 滚轮一格：内环滚动/整页翻页（只在一屏装不下时才生效，方式见 `st.ring_page`）。
             // `w` = 原始增量（钩子把 `mouseData` 高 16 位当 u16 传过来，这里还原成 i16）。
             let st = state_of(hwnd);
             let d = (w.0 as u16) as i16;
@@ -16681,8 +16738,21 @@ WM_APP_DISMISS_FG => {
                     }
                 }
             }
-            // 一格 = `WHEEL_DELTA`(120) = 正好转一个图标；触摸板的小增量自然变成连续滚。
-            ring_scroll(st, -(d as f32 / 120.0));
+            if st.ring_page {
+                // 整页翻页：小增量先攒着，攒满一格才翻（触摸板不会一路连翻好几页）
+                let mut acc = PAGE_WHEEL_ACC.load(Ordering::Relaxed) + d as i32;
+                while acc.abs() >= 120 {
+                    // 原始 delta：上滚为正 → 上一页（与连续滚动的方向一致）
+                    let dir = if acc > 0 { -1 } else { 1 };
+                    acc -= if acc > 0 { 120 } else { -120 };
+                    ring_page_step(st, dir);
+                }
+                PAGE_WHEEL_ACC.store(acc, Ordering::Relaxed);
+            } else {
+                // 一格 = `WHEEL_DELTA`(120) = 正好转一个图标；触摸板的小增量自然变成连续滚。
+                PAGE_WHEEL_ACC.store(0, Ordering::Relaxed);
+                ring_scroll(st, -(d as f32 / 120.0));
+            }
             LRESULT(0)
         }
         WM_APP_SCROLLSIM => {
@@ -17115,6 +17185,8 @@ enum Ctl {
     AddItem(usize, u8),
     /// 交互页行为区的「开机自启」（状态 = `st.autostart`，同步到注册表）
     Autostart,
+    /// 交互页「内环滚动」：0 逐项滚动 / 1 整页翻页（状态 = `st.ring_page`）
+    ScrollMode(u8),
     /// 标题栏「查看引导」入口（重播聚光灯引导）
     GuideEntry,
     // ── 交互页：黑白名单（二选一生效）──
@@ -17188,8 +17260,17 @@ fn look_live_tip_rect() -> RECT {
     RECT { left: S_X0 + 168, top: LOOK_LIVE_Y + 2, right: S_X0 + 186, bottom: LOOK_LIVE_Y + 20 }
 }
 
+/// 外观页「显示应用名称」开关行（从交互页移来，给「内环滚动」腾一行）
+const LOOK_NAME_Y: i32 = LOOK_LIVE_Y + 34 + ACT_GAP + 8;
+fn look_name_row() -> RECT {
+    RECT { left: S_X0, top: LOOK_NAME_Y - 8, right: S_X1, bottom: LOOK_NAME_Y + 34 }
+}
+fn look_name_tip_rect() -> RECT {
+    RECT { left: S_X0 + 104, top: LOOK_NAME_Y + 2, right: S_X0 + 122, bottom: LOOK_NAME_Y + 20 }
+}
+
 // ── 外观页「头像」：自定义中心头像（图片 / GIF）──
-const LOOK_AVATAR_LABEL_Y: i32 = LOOK_LIVE_Y + 34 + ACT_GAP + 4;
+const LOOK_AVATAR_LABEL_Y: i32 = LOOK_NAME_Y + 34 + ACT_GAP + 4;
 /// 头像区两颗按钮：0 选择图片 / 1 恢复默认
 fn avatar_btn_rect(i: usize) -> RECT {
     let y = LOOK_AVATAR_LABEL_Y + ACT_LABEL_H + ACT_GAP - 4;
@@ -17275,6 +17356,19 @@ fn act_tip_rect(i: usize) -> RECT {
     RECT { left: S_X0 + 132, top: y + 2, right: S_X0 + 150, bottom: y + 20 }
 }
 
+/// 交互页「内环滚动」的两颗迷你胶囊：0 逐项滚动 / 1 整页翻页
+fn act_scroll_chip(i: usize) -> RECT {
+    let w = 76;
+    let gap = 6;
+    let y = act_sw_y(4);
+    let x = S_X1 - (2 - i as i32) * w - (1 - i as i32) * gap;
+    RECT { left: x, top: y, right: x + w, bottom: y + 26 }
+}
+fn act_scroll_tip_rect() -> RECT {
+    let y = act_sw_y(4);
+    RECT { left: S_X0 + 76, top: y + 2, right: S_X0 + 94, bottom: y + 20 }
+}
+
 // ⚠️ 全部由 `ACT_*` 的节奏派生（别再写死）：标题顶 = 上一段底 + ACT_GAP；
 //    卡片顶 = 标题底 + ACT_GAP。卡片底贴到页面下沿内 14px。
 const EXC_CARDS_TITLE_Y: i32 = ACT_SW_LAST_BOT + ACT_GAP;
@@ -17336,6 +17430,7 @@ fn tip_lines(id: u8) -> &'static [&'static str] {
         7 => &["关掉后不再记录，轮盘上的「剪贴板」图标一起消失。", "密码管理器里的复制始终不记录。"],
         8 => &["关掉后轮盘上的「便签」图标一起消失。", "已经写下的便签不会丢，再打开接着写。"],
         9 => &["关着：玻璃实时透出桌面，但截图／录屏拍不到轮盘。", "开着：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘。"],
+        10 => &["逐项滚动：滚轮一格移动一个应用。", "整页翻页：滚轮一格翻一屏（12 个）。"],
         _ => &[],
     }
 }
@@ -17357,7 +17452,7 @@ fn tip_anchor(id: u8) -> (i32, i32, bool) {
             (r.left, r.bottom + 6, false)
         }
         6 => {
-            let r = act_tip_rect(4);
+            let r = look_name_tip_rect();
             (r.left, r.bottom + 6, false)
         }
         7 => {
@@ -17370,6 +17465,10 @@ fn tip_anchor(id: u8) -> (i32, i32, bool) {
         }
         9 => {
             let r = look_live_tip_rect();
+            (r.left, r.bottom + 6, false)
+        }
+        10 => {
+            let r = act_scroll_tip_rect();
             (r.left, r.bottom + 6, false)
         }
         _ => (0, 0, false),
@@ -18580,6 +18679,20 @@ unsafe fn s_paint_look(st: &mut State, dc: HDC, pal: &Pal) {
         g_switch(dc, pal, s_sw_rect_at(LOOK_LIVE_Y), st.sw_a[5]);
     }
 
+    // ── 显示应用名称（从交互页移来；悬停内环图标 → 头像气泡报名字，门控在 `bub_text`）──
+    {
+        let rr = look_name_row();
+        let hv = hov(st, Ctl::Sw(4));
+        if hv > 0.01 {
+            g_rrect(dc, rr, 10, mixc(pal.paper, pal.ink, 0.05 * hv), None, 0);
+        }
+        g_text(dc, "显示应用名称",
+            RECT { left: S_X0 + 8, top: rr.top + 12, right: S_X1 - 60, bottom: rr.top + 32 },
+            pal.ink, st.sf_body, false);
+        draw_tip_icon(st, dc, pal, look_name_tip_rect(), 6);
+        g_switch(dc, pal, s_sw_rect_at(LOOK_NAME_Y), st.sw_a[4]);
+    }
+
     // ── 头像：用户自己的图片 / GIF（圆形裁切后画在轮盘中心）──
     let ay = LOOK_AVATAR_LABEL_Y;
     g_text(dc, "头像", RECT { left: S_X0, top: ay, right: S_X1, bottom: ay + ACT_LABEL_H },
@@ -18706,18 +18819,30 @@ unsafe fn s_paint_act(st: &mut State, dc: HDC, pal: &Pal) {
         // 与其它开关一样走 `sw_a[2]` 动画量（在 `setup_tick` 里按 `st.autostart` 收敛）
         g_switch(dc, pal, act_sw_rect(3), st.sw_a[2]);
     }
-    // 显示应用名称（悬停内环图标 → 头像气泡报名字；门控在 `bub_text` 里）
+    // 内环滚动方式：逐项滚动 / 整页翻页（「显示应用名称」已移到外观页腾出这一行）
     {
         let rr = act_sw_row(4);
-        let hv = hov(st, Ctl::Sw(4));
+        let hv = hov(st, Ctl::ScrollMode(0)).max(hov(st, Ctl::ScrollMode(1)));
         if hv > 0.01 {
             g_rrect(dc, rr, 10, mixc(pal.paper, pal.ink, 0.05 * hv), None, 0);
         }
-        g_text(dc, "显示应用名称",
-            RECT { left: S_X0 + 8, top: rr.top + 12, right: S_X1 - 60, bottom: rr.top + 32 },
+        g_text(dc, "内环滚动",
+            RECT { left: S_X0 + 8, top: rr.top + 12, right: S_X1 - 190, bottom: rr.top + 32 },
             pal.ink, st.sf_body, false);
-        g_switch(dc, pal, act_sw_rect(4), act_sw_val(st, 4));
-        draw_tip_icon(st, dc, pal, act_tip_rect(4), 6);
+        draw_tip_icon(st, dc, pal, act_scroll_tip_rect(), 10);
+        for i in 0..2usize {
+            let r = act_scroll_chip(i);
+            let on = st.ring_page == (i == 1);
+            let chv = hov(st, Ctl::ScrollMode(i as u8));
+            if on {
+                g_rrect(dc, r, 8, pal.block, None, 0);
+            } else {
+                g_rrect(dc, r, 8, mixc(pal.paper, pal.ink, 0.03 + 0.06 * chv),
+                    Some(mixc(pal.edge, pal.ink, 0.22 + 0.40 * chv)), 1);
+            }
+            g_text(dc, if i == 0 { "逐项滚动" } else { "整页翻页" }, r,
+                if on { pal.paper } else { mixc(pal.paper, pal.ink, 0.72) }, st.sf_small, true);
+        }
     }
 
     // ── 黑白名单：两张卡片，**二选一**生效（点卡片标题切换当前生效方）──
@@ -19275,6 +19400,12 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             if in_rect(look_live_row(), x, y) {
                 return Ctl::GlassLive;
             }
+            if in_rect(look_name_tip_rect(), x, y) {
+                return Ctl::Tip(6);
+            }
+            if in_rect(look_name_row(), x, y) {
+                return Ctl::Sw(4);
+            }
             for i in 0..2usize {
                 if in_rect(avatar_btn_rect(i), x, y) {
                     return if i == 0 { Ctl::AvatarPick } else { Ctl::AvatarReset };
@@ -19299,13 +19430,22 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
             // ⚠️⚠️ 「?」必须**先于开关行**判：它就落在 `act_sw_row` 里面，
             //    原来先判开关行 → 永远返回 `Sw` → 悬停「?」出不了 tooltip
             //    （用户 2026-10-11：「那个问号 hover 后没有展示 tooltip」）。
-            for i in [0usize, 1, 2, 4] {
+            for i in [0usize, 1, 2] {
                 if in_rect(act_tip_rect(i), x, y) {
-                    // 行 0/1/2 → tip 1/2/3；行 4（显示应用名称）→ tip 6
-                    return Ctl::Tip(if i == 4 { 6 } else { i as u8 + 1 });
+                    // 行 0/1/2 → tip 1/2/3
+                    return Ctl::Tip(i as u8 + 1);
                 }
             }
-            for i in 0..5 {
+            if in_rect(act_scroll_tip_rect(), x, y) {
+                return Ctl::Tip(10);
+            }
+            for i in 0..2usize {
+                if in_rect(act_scroll_chip(i), x, y) {
+                    return Ctl::ScrollMode(i as u8);
+                }
+            }
+            // 行 4 是「内环滚动」的两颗胶囊（已在上方判过），不再是开关行
+            for i in 0..4 {
                 if in_rect(act_sw_row(i), x, y) {
                     return if i == 3 { Ctl::Autostart } else { Ctl::Sw(i) };
                 }
@@ -19888,6 +20028,25 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             autostart_set(st.autostart);
             save_settings(st);
         }
+        Ctl::ScrollMode(i) => {
+            let want = i == 1;
+            if st.ring_page != want {
+                st.ring_page = want;
+                PAGE_WHEEL_ACC.store(0, Ordering::Relaxed);
+                if want {
+                    // 切到整页模式：把当前偏移吸到最近的整页，别停在半页上
+                    let n = eff_apps(st);
+                    let page = ring_vis(n) as f32;
+                    let mx = ring_page_max(n);
+                    st.ring_to = ((st.ring_to / page).round() * page).clamp(0.0, mx);
+                } else {
+                    // 切回逐项：整页模式的末页偏移可能超过 `ring_off_max`，收回来
+                    st.ring_to = st.ring_to.clamp(0.0, ring_off_max(eff_apps(st)));
+                }
+                save_settings(st);
+            }
+            setup_kick(st, hwnd);
+        }
         Ctl::GuideEntry => {
             // 重播引导（跳过过的人也能找回来）
             guide_start(st);
@@ -20451,6 +20610,7 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("key_middle={}\r\n", b(st.key_middle)));
     out.push_str(&format!("key_side={}\r\n", b(st.key_side)));
     out.push_str(&format!("hover_name={}\r\n", b(st.hover_name)));
+    out.push_str(&format!("ring_page={}\r\n", b(st.ring_page)));
     out.push_str(&format!("glass={}\r\n", b(st.glass)));
     out.push_str(&format!("glass_live={}\r\n", b(st.glass_live)));
     out.push_str(&format!("key_rhold={}\r\n", b(st.key_rhold)));
@@ -21169,7 +21329,8 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
     // （tooltip 只在悬停时出现，离屏没法复现 hover，直接置位出图核对）
     for (page, tip, guide) in (0..S_PAGES.len())
         .map(|p| (p, 0u8, -1i32))
-        .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1)])
+        .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1), (1, 10, -1)])
+        .chain([(0usize, 6u8, -1)])
         // 应用页底部「剪贴板」卡那个「?」
         .chain([(2usize, 7u8, -1), (2, 8, -1)])
         // 外观页「录屏模式」的「?」
@@ -29724,6 +29885,13 @@ fn main() {
 
     unsafe {
         let _ = SetProcessDPIAware();
+        // ⚠️ 启动器绝不能把自己宿主终端的环境漏给被启动的应用：
+        //    从 VSCode / Qoder 这类 Electron 宿主的集成终端里启动 PiPie 时，环境里带着
+        //    `ELECTRON_RUN_AS_NODE=1`；被 ShellExecute 拉起的 Electron 应用（WorkBuddy 等）
+        //    会继承它 → 以 Node 模式运行、不开窗口直接退出 —— 用户看到的就是
+        //    「双击桌面快捷方式能开，从轮盘点没反应」（2026-11-13 实测复现）。
+        //    删掉这一条对 PiPie 自己（原生 Rust）无影响。
+        let _ = SetEnvironmentVariableW(PCWSTR(wide("ELECTRON_RUN_AS_NODE").as_ptr()), PCWSTR::null());
         // 轮盘 + 设置页都按系统 DPI 缩放：高分屏（150%/200%）上不再是一小块。
         init_ring_scale();
         init_ui_scale();
