@@ -263,6 +263,7 @@ const WM_APP_EDCOMP: u32 = WM_APP + 50;  // 改名：IME 组字串更新（内�
 const WM_APP_EDRES: u32 = WM_APP + 51;   // 改名：IME 上屏（内容见 EDIT_RES_NEXT）
 const WM_APP_BUBTEXT: u32 = WM_APP + 52; // 仅测试：1=内环满 / 2=外环满 / 3=没接住 / 0=其它
 const WM_APP_RINGOFF: u32 = WM_APP + 53; // 仅测试：0=ring_off*100 / 1=ring_to*100
+const WM_APP_SENDPOS: u32 = WM_APP + 54; // 仅测试：回报「发送」胶囊中心的屏幕坐标
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
                                         // 返回值 = (y << 16) | x
                                         //（单击路径要靠真光标才能触发 update_hover，
@@ -1019,6 +1020,9 @@ struct State {
     drop_mode: bool,
     /// 拖放悬停时高亮的目标应用（落到谁身上就加进谁的外环）
     drop_target_app: Option<usize>,
+    /// 拖拽中的「发送」目标：(应用下标, 目标 exe)。存在时外环末尾多一颗「发送」胶囊，
+    /// 拖进它 = 用该应用打开载荷（不加入外环）。
+    drop_send: Option<(usize, String)>,
     /// 拖入内容"认得出来的宿主内环"（>=0 时那个内环高亮，引导用户往上丢）
     drop_suggest: Option<usize>,
     /// 「拖进来的东西会加到外环末尾」那个幽灵胶囊的淡入（0..1）。
@@ -1573,6 +1577,7 @@ impl State {
             locked: false,
             drop_mode: false,
             drop_target_app: None,
+            drop_send: None,
             drop_suggest: None,
             chip_ghost_a: 0.0,
             drop_ghost: None,
@@ -5530,11 +5535,16 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 let gname = drop_ghost_chip_name(st, ai, m).unwrap_or_default();
                 draw_ghost_chip(st, buf, &pal, gs, &gname, st.chip_ghost_a);
             }
+            // 拖拽中：外环末尾的「发送」胶囊
+            if let Some(ss) = chip_send_seg(st, ai) {
+                draw_send_chip(st, buf, &pal, ss, 1.0, glass_arg(st, disc_r0));
+            }
 
             // 外环分页点：条目铺不下时，在环外沿画几个小点（当前页是墨色）
             {
                 let (names_all, ghost) = chip_layout_names(st, ai);
-                let (cap, page, _start) = chip_page_window(st, ai, &names_all, ghost.is_some());
+                let extra = ghost.is_some() || drop_send_app(st) == Some(ai);
+                let (cap, page, _start) = chip_page_window(st, ai, &names_all, extra);
                 let pages = (names_all.len() + cap - 1) / cap;
                 if pages > 1 {
                     let a0 = slot_angle(slot_of(st, ai), n);
@@ -6107,6 +6117,10 @@ unsafe fn draw_text_rot(
 // `WM_IME_SETCONTEXT` / `WM_IME_COMPOSITION`，合成结果最终以 `WM_CHAR` /
 // `WM_IME_CHAR` 形式进来 —— 照着追加就行。但**要主动把 IME 的候选窗挪到光标下面**
 // （`ImmSetCompositionWindow`），否则中文候选框会飘到屏幕中央。
+
+/// 拖拽发送（「发送」胶囊）总开关。2026-11-13 用户实测不好用，先关掉保留代码；
+/// 关掉后：外环不追加胶囊、不参与分页、拖放仍按原来的「加入外环 / 新建内环」走。
+const DRAG_SEND_ENABLED: bool = false;
 
 /// 双击的时间窗（毫秒）。取系统值但夹一下：太短会误触发，太长会跟「两次单击
 /// 分别执行」冲突（单击是执行应用/关闭菜单，这里必须区别对待）。
@@ -9243,6 +9257,43 @@ fn launch(target: &str) {
     open_target(target);
 }
 
+/// 「发送」胶囊：把拖放的载荷用指定应用打开（文件/文件夹/网址作为参数传给 exe）。
+/// 返回是否成功调用 ShellExecute（>32）。
+unsafe fn send_to_app(exe: &str, items: &[DropItem]) -> bool {
+    let mut args = String::new();
+    for it in items {
+        let t = it.target.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if it.is_url {
+            args.push_str(t);
+        } else {
+            args.push('"');
+            args.push_str(t);
+            args.push('"');
+        }
+        args.push(' ');
+    }
+    let args = args.trim().to_string();
+    if args.is_empty() {
+        return false;
+    }
+    let exe_w = wide(exe);
+    let args_w = wide(&args);
+    let dir = target_dir(exe);
+    let dir_w = wide(&dir);
+    let r = ShellExecuteW(
+        HWND(ptr::null_mut()),
+        PCWSTR::null(),
+        PCWSTR(exe_w.as_ptr()),
+        PCWSTR(args_w.as_ptr()),
+        if dir.is_empty() { PCWSTR::null() } else { PCWSTR(dir_w.as_ptr()) },
+        SW_SHOWNORMAL,
+    );
+    r.0 as usize > 32
+}
+
 /// 挂上 loading（任何"慢操作"开始时调）。
 ///
 /// ⚠️⚠️ **必须把帧定时器踢起来**：菜单空闲时它是停着的（省 CPU），不踢的话
@@ -10131,6 +10182,7 @@ unsafe fn dump_all(dir: &str) {
         st.editing = None;
         st.edit_buf.clear();
         st.edit_comp.clear();
+
 
         // 2c) 气泡：hover 内环 → 应用名（宽度按文字量收缩，这条只有 2 个字）
         st.bub_a = 1.0;
@@ -12355,13 +12407,25 @@ fn scroll_prune(st: &mut State) {
 /// ⚠️ 每帧都复查（`on_timer` 里调）：应用数和幽灵随时会变，算一次不够。
 fn ring_reveal(st: &mut State, i: usize) {
     let n = eff_apps(st);
+    let v = ring_vis(n) as f32;
+    if st.ring_page {
+        // 整页模式：只落在**页边界**上 —— 否则滚轮翻页会从半页起算，
+        // 拖入后偏移停在 `n - 12` 这种非页码位置，看着像「滚不动了」。
+        let page_max = ring_page_max(n);
+        if page_max <= 0.0 {
+            st.ring_to = 0.0;
+            return;
+        }
+        let page = (i as f32 / v).floor() * v;
+        st.ring_to = page.clamp(0.0, page_max);
+        return;
+    }
     let mx = ring_off_max(n);
     if mx <= 0.0 {
         st.ring_to = 0.0;
         return;
     }
     // 可见窗口 = [off, off+vis) → `i` 可见 ⇔ off ∈ [i-(vis-1), i]
-    let v = ring_vis(n) as f32;
     let f = i as f32;
     let lo = (f - v + 1.0).max(0.0);
     let hi = f.min(mx);
@@ -12772,6 +12836,23 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
         draw_text_rot(st, buf, tx, ty, &label, RING_NAME_PX, tang.to_radians(),
                       col.0, col.1, col.2, (255.0 * alpha).clamp(0.0, 255.0) as u8);
     }
+}
+
+/// 「发送」胶囊：实心墨底 + 居中「发送」，和虚线幽灵胶囊（＋ 添加）明确区分。
+unsafe fn draw_send_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32), alpha: f32,
+                         glass: Option<(&[u8], bool, f32)>) {
+    if alpha <= 0.02 {
+        return;
+    }
+    let (r_in, r_out) = ring_radii(st.apps.len());
+    let mid = (seg.0 + seg.1) * 0.5;
+    let seg3 = (mid, seg.0, seg.1);
+    draw_ring_sector(buf, pal, r_in, r_out, seg3, 0.6, alpha, 1, glass);
+    let (cx, cy) = polar((r_in + r_out) * 0.5, mid);
+    let rot = norm_rot(mid).to_radians();
+    draw_text_rot(st, buf, cx, cy, "发送", RING_NAME_PX, rot,
+                  pal.paper.0, pal.paper.1, pal.paper.2,
+                  (255.0 * alpha).clamp(0.0, 255.0) as u8);
 }
 
 /// 段内内容：**沿弧线排**（图标在左 + 名称在右），每个元素**各自**贴在弧上、
@@ -13479,7 +13560,74 @@ fn chip_layout_names(st: &State, ai: usize) -> (Vec<String>, Option<String>) {
     if let Some(g) = &ghost {
         names.push(g.clone());
     }
+    // 拖拽中且目标应用能接收 → 外环末尾追加一颗「发送」胶囊（也参与排版/分页）
+    if drop_send_app(st) == Some(ai) {
+        names.push("发送".to_string());
+    }
     (names, ghost)
+}
+
+/// 拖拽中的「发送」目标应用（没有 = 不显示发送胶囊）。
+fn drop_send_app(st: &State) -> Option<usize> {
+    if !DRAG_SEND_ENABLED {
+        return None;
+    }
+    st.drop_send.as_ref().map(|(ai, _)| *ai)
+}
+
+/// 载荷是否适合「发送」：文件 / 文件夹 / 网址；应用（exe/lnk）和窗口拖放不发送。
+fn drop_payload_sendable(items: &[DropItem]) -> bool {
+    !items.is_empty()
+        && items
+            .iter()
+            .all(|it| it.is_url || it.is_dir || exe_name_of(&it.target).is_none())
+}
+
+/// 「发送」胶囊的角范围（追加在幽灵之后；不在当前页 / 没有发送目标时 None）。
+fn chip_send_seg(st: &State, ai: usize) -> Option<(f32, f32)> {
+    if drop_send_app(st) != Some(ai) {
+        return None;
+    }
+    let m = st.apps.get(ai).map(|a| a.items.len()).unwrap_or(0);
+    let (names, ghost) = chip_layout_names(st, ai);
+    let idx = m + ghost.is_some() as usize;
+    let total = names.len();
+    if idx >= total {
+        return None;
+    }
+    let (cap, _page, start) = chip_page_window(st, ai, &names, true);
+    let end = (start + cap).min(total);
+    if idx < start || idx >= end {
+        return None;
+    }
+    chip_segs_of(st, ai, &names[start..end]).get(idx - start).copied()
+}
+
+/// 光标是否落在「发送」胶囊里（画布坐标）。落上 = 松手就发送。
+fn drop_send_hit(st: &State, px: f32, py: f32) -> Option<usize> {
+    let ai = drop_send_app(st)?;
+    let (a1, a2) = chip_send_seg(st, ai)?;
+    let (r_in, r_out) = ring_radii(st.apps.len());
+    let dx = px - cc();
+    let dy = py - cc();
+    let r = (dx * dx + dy * dy).sqrt();
+    let tol = 6.0;
+    if r < r_in - tol || r > r_out + tol {
+        return None;
+    }
+    let th = dx.atan2(-dy).to_degrees();
+    let mut d = th - (a1 + a2) * 0.5;
+    while d > 180.0 {
+        d -= 360.0;
+    }
+    while d < -180.0 {
+        d += 360.0;
+    }
+    if d.abs() <= (a2 - a1).abs() * 0.5 + 4.0 {
+        Some(ai)
+    } else {
+        None
+    }
 }
 
 /// 幽灵段（「即将新增」那一格）的角范围。没有幽灵就是 `None`。
@@ -13550,7 +13698,8 @@ fn chip_layout(st: &State, ai: usize) -> (Vec<(f32, f32)>, Vec<f32>, Vec<f32>) {
     }
     let (names_all, ghost) = chip_layout_names(st, ai);
     let total = names_all.len();
-    let (cap, _page, start) = chip_page_window(st, ai, &names_all, ghost.is_some());
+    let extra = ghost.is_some() || drop_send_app(st) == Some(ai);
+    let (cap, _page, start) = chip_page_window(st, ai, &names_all, extra);
     let end = (start + cap).min(total);
     let page_segs = chip_segs_of(st, ai, &names_all[start..end]);
     // 不在当前页的条目给 NaN：绘制/命中都会跳过（列表下标仍是**真实条目下标**）
@@ -14952,11 +15101,8 @@ unsafe fn on_timer(st: &mut State) {
             update_hover(st, p.x, p.y);
         }
     }
-    // 拖进来的幽灵磁贴站在**多出来的那一格**（满环时它在下一页）→ 自动滚过去露出它，
-    // 否则用户拖进来什么都看不见，只会以为「拖了没反应」。
-    if st.drop_ghost.is_some() {
-        ring_reveal(st, st.apps.len());
-    }
+    // 幽灵磁贴的自动露出改到拖放事件里**只做一次**（见 WM_APP_DRAGEVENT）：
+    // 以前这里每帧 ring_reveal → 拖文件时轮盘被死死钉在尾页、滚轮完全失效。
     // ── 窗口捕获：轮询「是否有窗口正被拖动」（hwndMoveSize），松手落盘 ──
     if poll_window_capture(st) {
         moving = true; // 捕获中保持持续重绘（预览 + 头像忙碌）
@@ -15572,6 +15718,7 @@ unsafe fn close_menu_now(st: &mut State) {
     //    但常驻模式（`locked`）不重走 `show_menu`，漏在这里就会带着上一页的偏移继续用。
     st.ring_off = 0.0;
     st.ring_to = 0.0;
+    st.drop_send = None;
     PAGE_WHEEL_ACC.store(0, Ordering::Relaxed);
     st.app_slot_s = [f32::NAN; MAX_APPS];
     // 窗口捕获随菜单一起清：没落盘的拖动作废（用户松手在环外 = 放弃）
@@ -15580,6 +15727,7 @@ unsafe fn close_menu_now(st: &mut State) {
     // 不启动应用**（用户 2026-10-12 实测）。
     st.drop_mode = false;
     st.drop_target_app = None;
+    st.drop_send = None;
     st.drop_suggest = None;
     st.drop_ghost = None;
     DROP_MODE_ARMED.store(false, Ordering::SeqCst);
@@ -15862,6 +16010,29 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         .filter(|&a| a < n_ap)
                         .or_else(|| drop_slot_app(st, px, py).filter(|&a| a < n_ap))
                         .or_else(|| drop_band_app(st, px, py));
+                    // 「发送」胶囊：拖到某个内环上且载荷能发送（文件/文件夹/网址）→
+                    // 外环末尾多一颗「发送」，拖进去 = 用该应用打开。
+                    if !DRAG_SEND_ENABLED {
+                        st.drop_send = None;
+                    } else if w.0 == 0
+                        || st.drop_send.as_ref().map(|(a, _)| *a) != st.drop_target_app
+                    {
+                        st.drop_send = None;
+                        if let Some(ai) = st.drop_target_app {
+                            if drop_payload_sendable(&items) {
+                                if let Some(exe) = st
+                                    .apps
+                                    .get(ai)
+                                    .and_then(|a| unsafe { resolve_target_exe(&a.target) })
+                                {
+                                    st.drop_send = Some((ai, exe));
+                                }
+                            }
+                        }
+                    }
+                    // ⚠️ 拖拽期间**绝不自动滚页**：以前为了让「新建内环」幽灵可见去 reveal，
+                    //    结果用户一拖进来轮盘就跳到尾页、滚轮还被拉回去（2026-11-13）。
+                    //    幽灵在当前页就画，不在就不画；落点逻辑不依赖它可见。
                     // 文件悬停在环上 = 收下前的「忙碌」；drag_step 在拖放开始时
                     // 可能设过「紧张」，进环就放松下来
                     set_mood(st, 0);
@@ -15869,6 +16040,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 // 离开环区域
                 2 => {
                     st.drop_target_app = None;
+                    st.drop_send = None;
                     st.drop_suggest = None;
                     st.drop_ghost = None;
                     drop_preview_invalidate();
@@ -15881,6 +16053,31 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         .lock()
                         .map(|mut q| std::mem::take(&mut *q))
                         .unwrap_or_default();
+                    // 「发送」胶囊优先：光标落在它上面 → 用目标应用打开，不加入外环
+                    let send_ai = drop_send_hit(st, px, py);
+                    if let Some(ai) = send_ai {
+                        let exe = st.drop_send.take().map(|(_, e)| e).unwrap_or_default();
+                        DRAG_ACTIVE.store(false, Ordering::SeqCst);
+                        DROP_MODE_ARMED.store(false, Ordering::SeqCst);
+                        st.drop_mode = false;
+                        st.drop_target_app = None;
+                        st.drop_suggest = None;
+                        st.drop_ghost = None;
+                        let app_name = st.apps.get(ai).map(|a| a.name.clone()).unwrap_or_default();
+                        let nm = drop_name(&items);
+                        if unsafe { send_to_app(&exe, &items) } {
+                            say(st, &format!("已发送到 {}", app_name), &nm, 1.8);
+                            println!("[drop] send -> {} · {}", app_name, nm);
+                        } else {
+                            say(st, "发送失败", &format!("{} → {}", nm, app_name), 2.5);
+                            println!("[drop] send FAILED -> {} · {}", app_name, nm);
+                        }
+                        if !(st.persistent && st.locked) {
+                            st.hide_at = now_s() + 2.0;
+                        }
+                        return LRESULT(0);
+                    }
+                    st.drop_send = None;
                     DRAG_ACTIVE.store(false, Ordering::SeqCst);
                     DROP_MODE_ARMED.store(false, Ordering::SeqCst);
                     st.drop_mode = false;
@@ -16738,6 +16935,15 @@ WM_APP_DISMISS_FG => {
                     }
                 }
             }
+            // 滚轮也是「输入」：先按**当前光标**重判一次 hover。拖放结束/滚动停稳后
+            // `hover_chip` 可能是上一轮留下的粘性值 —— 它会让滚轮误路由到外环翻页，
+            // 内环看起来就「怎么也滚不动」（用户 2026-11-13 实测：拖入内容后卡死）。
+            {
+                let mut p = POINT::default();
+                if GetCursorPos(&mut p).is_ok() {
+                    update_hover(st, p.x, p.y);
+                }
+            }
             if st.ring_page {
                 // 整页翻页：小增量先攒着，攒满一格才翻（触摸板不会一路连翻好几页）
                 let mut acc = PAGE_WHEEL_ACC.load(Ordering::Relaxed) + d as i32;
@@ -16793,6 +16999,21 @@ WM_APP_DISMISS_FG => {
             let sx = (st.win_x + dx as i32).clamp(0, 65535);
             let sy = (st.win_y + dy as i32).clamp(0, 65535);
             return LRESULT(((sy as isize) << 16) | (sx as isize));
+        }
+        WM_APP_SENDPOS => {
+            // 仅测试：拖拽发送胶囊中心（屏幕坐标）；没有发送胶囊返回 0
+            let st = state_of(hwnd);
+            let mut packed: usize = 0;
+            if let Some(ai) = drop_send_app(st) {
+                if let Some((a1, a2)) = chip_send_seg(st, ai) {
+                    let (r_in, r_out) = ring_radii(st.apps.len());
+                    let (cx, cy) = polar((r_in + r_out) * 0.5, (a1 + a2) * 0.5);
+                    let sx = (cx as i32 + st.win_x).clamp(0, 65535);
+                    let sy = (cy as i32 + st.win_y).clamp(0, 65535);
+                    packed = ((sy as usize) << 16) | (sx as usize);
+                }
+            }
+            LRESULT(packed as isize)
         }
         WM_APP_CHIPPOS => {
             // 仅测试：回报**第 `w` 号**胶囊中心的屏幕坐标。
@@ -24345,6 +24566,13 @@ unsafe fn card_render(st: &mut State, card: Card) {
     let lo_w = CL_WW as usize;
     let lo_h = CL_HH as usize;
 
+    // ⚠️ 卡片是**固定 1× 设计**：窗口/画布/字体/命中矩形全都按 480 逻辑像素写死。
+    //    但 `g_*` 画布工具会跟着设置页的 DPI 缩放（`set_scale`）走 —— 125%/150% 下
+    //    整张卡被放大后画出画布，右/下直接被裁掉（用户 2026-11-13 报「框显示不全」）。
+    //    这里临时按 1.0 画，画完还原；设置页/轮盘自己的缩放不受影响。
+    let saved_scale = set_scale();
+    set_ui_scale(1.0);
+
     let t_fill = std::time::Instant::now();
     if !st.card_bg_hi_dc.0.is_null() {
         // 毛玻璃底：一次 BitBlt（快）；整块画布连投影留白一起铺，最后按卡片形状裁 alpha
@@ -24445,6 +24673,7 @@ unsafe fn card_render(st: &mut State, card: Card) {
             !st.card_bg_hi_dc.0.is_null()
         );
     }
+    set_ui_scale(saved_scale);
 }
 
 unsafe fn clip_render(st: &mut State) {
@@ -29639,6 +29868,12 @@ fn main() {
     // 诊断：把剪贴板历史卡片离屏渲染成 BMP（配 bmp2png.py 核对排版）
     if args.len() >= 2 && args[1] == "--clip-dump" {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
+        // 离屏核对：允许模拟高 DPI 缩放（真实运行由 init_ui_scale 设，dump 分支走不到）
+        if let Ok(v) = std::env::var("PIPIE_UI_SCALE") {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                unsafe { set_ui_scale(f) };
+            }
+        }
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
                 None,
