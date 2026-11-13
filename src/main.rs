@@ -230,7 +230,9 @@ fn chip_gap_min() -> f32 { 2.0 * k() * KC }
 /// 一屏槽位数 = 盘面几何上限（`disc_r_max()` 封顶后再加就只能把图标压糊）。
 const RING_SLOTS: usize = 12;
 /// 内环**数据**上限。超过一屏（`RING_SLOTS`）的应用不裁掉，靠滚轮连续滚动看到。
-const MAX_APPS: usize = 24;
+/// ⚠️ 这是 `State` 里一批定长数组的长度，**不是**随便能去掉的数字（见 `app_running` 等）；
+/// 用户 2026-11-13 要求放宽到 50，数组与所有 `MAX_APPS` 门禁一起同步。
+const MAX_APPS: usize = 50;
 const MAX_ITEMS: usize = 12; // 外环可围满一整圈
 /// 滚动每帧向目标追赶的比例（与 `app_hot` 同一档手感：0.28 ≈ 130ms 收敛）。
 const RING_SCROLL_K: f32 = 0.28;
@@ -256,6 +258,9 @@ const WM_APP_DRAGEND: u32 = WM_APP + 14;  // 拖动松手（盘外 = 请求移�
 const WM_APP_DRAGSIM: u32 = WM_APP + 15;  // 仅测试：驱动拖出移除状态机
 const WM_APP_CHAR: u32 = WM_APP + 16;    // 改名模式：一个已转换好的字符（w = codepoint）
 const WM_APP_EDITSIM: u32 = WM_APP + 17; // 仅测试：驱动改名状态机
+const WM_APP_EDCOMP: u32 = WM_APP + 50;  // 改名：IME 组字串更新（内容见 EDIT_COMP_NEXT）
+const WM_APP_EDRES: u32 = WM_APP + 51;   // 改名：IME 上屏（内容见 EDIT_RES_NEXT）
+const WM_APP_BUBTEXT: u32 = WM_APP + 52; // 仅测试：1=内环满 / 2=外环满 / 3=没接住 / 0=其它
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
                                         // 返回值 = (y << 16) | x
                                         //（单击路径要靠真光标才能触发 update_hover，
@@ -1051,6 +1056,8 @@ struct State {
     editing: Option<(usize, usize)>,
     /// 输入缓冲（UTF-8）。中文经 IME 合成后由 WM_CHAR / WM_IME_CHAR 追加进来
     edit_buf: String,
+    /// IME 组字串（拼音还没上屏的部分），只用于预览，提交时不进缓冲
+    edit_comp: String,
     /// 光标闪烁的相位（now_s 口径）
     edit_caret: f64,
     /// 首次按键的时刻 —— 用来判「空缓冲时全选 vs 追加」
@@ -1579,6 +1586,7 @@ impl State {
             hit_app: None,
             editing: None,
             edit_buf: String::new(),
+            edit_comp: String::new(),
             edit_caret: 0.0,
             edit_started: 0.0,
             edit_last_click: -99.0,
@@ -4635,8 +4643,8 @@ fn upd_open_modal(st: &mut State) {
 
 /// 这次呼出要不要展示轮盘底部的更新条。
 ///
-/// 规则（用户 2026-11-12）：**同一个更新版本只在前两次打开轮盘时展示**更新条；
-/// 第三次起不再出现（本轮版本），下次有新版本重新计数。
+/// 规则（用户 2026-11-13）：**同一个更新版本每天只在第一次打开轮盘时展示**
+/// 更新条；之后再呼出不再出现，下次有新版本 / 跨天重新计数。
 /// 更新弹窗**不再自动弹出** —— 点更新条才展开。
 unsafe fn upd_refresh_pill(st: &mut State) {
     if !upd_offer(st) || !matches!(st.update_st, 3 | 4) {
@@ -4649,7 +4657,7 @@ unsafe fn upd_refresh_pill(st: &mut State) {
         st.update_seen_day = today;
         st.update_seen_n = 0;
     }
-    if st.update_seen_n < 2 {
+    if st.update_seen_n < 1 {
         st.update_seen_n += 1;
         st.upd_pill_vis = true;
         save_settings(st);
@@ -5477,11 +5485,20 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 // 窗口条目的图标 = 所属应用的图标（它自己没有图标）：
                 // 一排胶囊同一个图标，正好读成"这些都是这个应用开的"。
                 let chip_icon = it.icon.as_ref();
+                // 改名态把 IME 组字串（还没上屏的拼音）拼在已输入文本后面预览
+                let edit_text = if editing {
+                    let mut t = String::with_capacity(st.edit_buf.len() + st.edit_comp.len());
+                    t.push_str(&st.edit_buf);
+                    t.push_str(&st.edit_comp);
+                    t
+                } else {
+                    String::new()
+                };
                 draw_ring_content(
                     st, buf, &pal, seg, ring_in, ring_out,
                     chip_icon,
                     if editing {
-                        st.edit_buf.as_str()
+                        edit_text.as_str()
                     } else {
                         it.name.as_str()
                     },
@@ -6127,6 +6144,8 @@ fn chip_click(st: &mut State, ai: usize, j: usize, sx: i32, sy: i32) -> Option<C
         }
         st.edit_caret = now;
         EDIT_ARMED.store(true, Ordering::SeqCst);
+        // 让输入法能接管：轮盘临时可聚焦（中文/日文等组字全靠它）
+        unsafe { edit_grab_focus() };
         return Some(ChipClick::Double);
     }
     st.edit_last_click = now;
@@ -6135,7 +6154,9 @@ fn chip_click(st: &mut State, ai: usize, j: usize, sx: i32, sy: i32) -> Option<C
     if st.editing.is_some() {
         st.editing = None;
         st.edit_buf.clear();
+        st.edit_comp.clear();
         EDIT_ARMED.store(false, Ordering::SeqCst);
+        unsafe { edit_drop_focus() };
         return None;
     }
     Some(ChipClick::Defer)
@@ -6162,6 +6183,8 @@ fn clear_delayed_click(st: &mut State, hwnd: HWND) {
 /// 提交 / 取消编辑。落盘走 `save_settings`（它会先备份成 .bak）。
 unsafe fn edit_finish(st: &mut State, commit: bool) {
     EDIT_ARMED.store(false, Ordering::SeqCst);
+    st.edit_comp.clear();
+    edit_drop_focus();
     let Some((ai, j)) = st.editing.take() else {
         return;
     };
@@ -6202,6 +6225,82 @@ fn edit_push(st: &mut State, ch: char) {
         st.edit_buf.push(ch);
     }
     st.edit_caret = now_s();
+}
+
+/// 进入改名：临时让轮盘能拿键盘焦点。
+///
+/// 平时轮盘是 `WS_EX_NOACTIVATE`（点了绝不抢前台），但自绘输入框要支持中文，
+/// 就必须让输入法把组字串发到轮盘这个 HWND 上 —— 只有**真持有键盘焦点**的
+/// 窗口才有 IME 上下文。只去掉 `WS_EX_NOACTIVATE` 不够，还要 `focus_window`
+/// 绕过前台锁；改名结束由 `edit_drop_focus` 立刻装回去并把前台还给原窗口。
+unsafe fn edit_grab_focus() {
+    // 自动化探针不许抢用户焦点（见 `PIPIE_NO_IME_FOCUS`）
+    if std::env::var_os("PIPIE_NO_IME_FOCUS").is_some() {
+        return;
+    }
+    let h = RING_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    let hwnd = HWND(h as *mut c_void);
+    let prev = GetForegroundWindow();
+    if prev.0 != hwnd.0 {
+        EDIT_PREV_FG.store(prev.0 as isize, Ordering::SeqCst);
+    }
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    SetWindowLongW(hwnd, GWL_EXSTYLE, (ex & !WS_EX_NOACTIVATE.0) as i32);
+    focus_window(hwnd);
+    EDIT_FOCUS.store(GetForegroundWindow().0 == hwnd.0, Ordering::SeqCst);
+}
+
+/// 退出改名：恢复 `WS_EX_NOACTIVATE`，并把前台还给进改名前的窗口。
+/// 前台已经不是轮盘（用户点了别处）时**不要**往回抢。
+unsafe fn edit_drop_focus() {
+    let focused = EDIT_FOCUS.swap(false, Ordering::SeqCst);
+    let h = RING_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    let hwnd = HWND(h as *mut c_void);
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    SetWindowLongW(hwnd, GWL_EXSTYLE, (ex | WS_EX_NOACTIVATE.0) as i32);
+    let prev = EDIT_PREV_FG.swap(0, Ordering::SeqCst);
+    if focused && prev != 0 && GetForegroundWindow().0 == hwnd.0 {
+        let ph = HWND(prev as *mut c_void);
+        if IsWindow(ph).as_bool() {
+            let _ = SetForegroundWindow(ph);
+        }
+    }
+}
+
+/// 把 IME 组字窗 / 候选框贴到正在改名的那个胶囊中心，别让它飘到屏幕角落。
+unsafe fn edit_ime_place(st: &State, hwnd: HWND) {
+    let Some((ai, j)) = st.editing else {
+        return;
+    };
+    let (segs, _, _) = chip_layout(st, ai);
+    let Some(&(a1, a2)) = segs.get(j) else {
+        return;
+    };
+    if !a1.is_finite() {
+        return;
+    }
+    let (r_in, r_out) = ring_radii(st.apps.len());
+    let (cx, cy) = polar((r_in + r_out) * 0.5, (a1 + a2) * 0.5);
+    let himc = ImmGetContext(hwnd);
+    if himc.0.is_null() {
+        return;
+    }
+    let mut cf = COMPOSITIONFORM {
+        dwStyle: CFS_POINT,
+        ptCurrentPos: POINT {
+            x: st.win_x + cx as i32,
+            y: st.win_y + cy as i32,
+        },
+        rcArea: RECT::default(),
+    };
+    let _ = ImmSetCompositionWindow(himc, &mut cf);
+    let _ = ImmReleaseContext(hwnd, himc);
 }
 
 // ───────────────────── 拖放识别与入库 ─────────────────────
@@ -6470,12 +6569,15 @@ unsafe fn paste_add(st: &mut State) {
         return;
     }
     let force = focus_app(st); // 真的悬停在哪就加进谁；没悬停则自动识别
-    let n = process_drop(st, &items, force);
+    let res = process_drop(st, &items, force);
+    let n = res.added;
     if n > 0 {
         st.commit_pulse = 1.0;
         // 与拖放入环同款：消化新成员时短暂「忙碌」
         set_mood(st, 5);
         st.mood_hold = now_s() + 1.5;
+    } else {
+        drop_full_say(st, &res);
     }
     println!("[paste] 入环 {} 项", n);
 }
@@ -6721,46 +6823,58 @@ fn ghost_pos(st: &State) -> (f32, f32) {
 }
 
 
+/// 入库结果：`added` = 新增条数；后两个 = **为什么没进去**（调用方负责提示）。
+#[derive(Default, Clone, Copy)]
+struct DropResult {
+    added: usize,
+    /// 内环应用总数已到 `MAX_APPS`
+    full: bool,
+    /// 目标应用的**外环**已到 `MAX_ITEMS`
+    item_full: bool,
+}
+
 /// 丢在幽灵上 = 建这个内环：
 ///   `put_items` → 先建宿主应用，再把载荷放进它的外环；
 ///   否则 → 载荷自身成为顶层应用（逐个去重 + 上限）。
-fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> usize {
+fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> DropResult {
     if g.put_items {
         ini_insert_app(&st.ini_path, &g.name, &g.target);
         unsafe { load_ini(st) };
         match host_app_index(st, &g.target) {
             Some(ai) => process_drop(st, items, Some(ai)),
-            None => 0,
+            None => DropResult::default(),
         }
     } else {
-        let mut added = 0;
+        let mut res = DropResult::default();
         for it in items {
             if st.apps.iter().any(|a| a.target.eq_ignore_ascii_case(&it.target)) {
                 continue; // 去重
             }
             if st.apps.len() >= MAX_APPS {
+                res.full = true;
                 break;
             }
             if ini_insert_app(&st.ini_path, &it.name, &it.target) {
-                added += 1;
+                res.added += 1;
             }
         }
-        if added > 0 {
+        if res.added > 0 {
             unsafe { load_ini(st) };
         }
-        added
+        res
     }
 }
 
 /// 入环：URL → 浏览器外环（推荐）或落点应用；文件夹 → 资源管理器外环；
 /// exe/lnk/文件 → 新增进常用。落到哪个图标上 = 强制加进谁。
 /// 返回新增条数。入库即回写 ini 并全量热重载。
-fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) -> usize {
+fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) -> DropResult {
     let mut added = 0usize;
     // 落了新条目的应用 → 落完把它外环翻到**最后一页**，让用户看见刚加的东西
     let mut dests: Vec<usize> = Vec::new();
-    // 内环**数据**上限撞到了（一屏装不下的部分靠滚轮看，但总数不能再加）
+    // 撞上限的两个原因（内环总数 / 某个应用的外环条目数）—— 由调用方提示
     let mut full = false;
+    let mut item_full = false;
     for it in items {
         drag_log(&format!(
             "item [{}] target={} force={:?}",
@@ -6798,6 +6912,7 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
                         MAX_ITEMS,
                         app.name
                     ));
+                    item_full = true;
                     continue; // 外环满了
                 }
                 let app_name = app.name.clone();
@@ -6839,11 +6954,20 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
         // （不管是不是 force 的：命中即说明用户已经会往环里丢了）。
         onb_done_drag(st);
     }
-    if full {
-        // 撞上限必须说一声 —— 以前只是 `drag_log`，用户的观感是「拖进去没反应」
-        say(st, "内环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_APPS), 6.0);
+    DropResult { added, full, item_full }
+}
+
+/// 撞上限时说清是**哪种**上限。返回 true = 已经给出提示，调用方别再覆盖成「没接住」。
+fn drop_full_say(st: &mut State, res: &DropResult) -> bool {
+    if res.full {
+        say(st, "内环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_APPS), 3.0);
+        true
+    } else if res.item_full {
+        say(st, "外环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_ITEMS), 3.0);
+        true
+    } else {
+        false
     }
-    added
 }
 
 /// 出厂默认（读不到任务栏时的兜底）—— 只用**系统自带且一定存在**的东西。
@@ -6896,13 +7020,14 @@ fn onb_done_drag(st: &mut State) {
 
 /// onboarding 气泡：**每次呼出挑一条该说的**（`show_menu` 里调）。
 ///
-/// ⚠️ ① 不在这里置位 —— 它的完成条件是"用户**真的**拖入成功"（`onb_done_drag`），
-///    所以在他拖之前，每次呼出都会再说一遍（和虚线槽位一直挂着是同一件事的两面：
-///    槽位负责"看得见"，气泡负责"说得清"）。
-/// ⚠️ ③④ 没有对应的动作可等（等用户去拖 = 永远等不到），所以播过即完成并落盘。
+/// 用户 2026-11-13：每条引导**只出现一次**（以前 ① 会一直说到用户真拖入为止，
+/// 天天呼出天天弹，很烦）。所以这里改成「播过即完成」并立即落盘 —— 每个
+/// 气泡都是 one-shot；用户没照做也不再重复。
 fn onb_say(st: &mut State) {
     if !st.onb_drag && !st.onb_customized {
         say(st, "拖文件或窗口到这里", "应用 · 文件夹 · 网址都行", ONB_SECS);
+        st.onb_drag = true;
+        unsafe { save_settings(st) };
     } else if !st.onb_move {
         say(st, "松手换位", "拖到盘外 = 移除", ONB_SECS);
         st.onb_move = true;
@@ -7315,14 +7440,15 @@ unsafe fn restamp_window_hwnds(st: &mut State) {
     }
 }
 
-/// 确保宿主应用存在（内环有 → 返回索引；没有 → 内存+ini 新建一个），返回索引。
-fn ensure_host_app(st: &mut State, exe: &str) -> usize {
+/// 确保宿主应用存在（内环有 → 返回索引；没有 → 内存+ini 新建一个）。
+/// 返回 `None` = 宿主不在环上且内环已到 `MAX_APPS`（不能再建，否则会越界写定长数组）。
+fn ensure_host_app(st: &mut State, exe: &str) -> Option<usize> {
     // Explorer 文件夹窗口 → 优先归「文件夹」hub，而不是另开一个 explorer 内环。
     // ⚠️ 排在 `host_app_index` 之前：已有的 explorer 应用（历史 bug 建的）也要让位，
     //    否则新拖进来的文件夹窗口还会被塞回那个重复的 explorer 内环。
     if is_explorer_exe(exe) {
         if let Some(ai) = folder_hub_index(st) {
-            return ai;
+            return Some(ai);
         }
     }
     // 浏览器窗口同理 → 归「浏览器」hub，而不是另开一个 msedge/chrome 内环。
@@ -7330,11 +7456,14 @@ fn ensure_host_app(st: &mut State, exe: &str) -> usize {
     //    否则新拖进来的浏览器窗口会继续塞进那个重复环（默认环形同虚设）。
     if is_browser_exe(exe) {
         if let Some(ai) = browser_hub_index(st) {
-            return ai;
+            return Some(ai);
         }
     }
     if let Some(ai) = host_app_index(st, exe) {
-        return ai;
+        return Some(ai);
+    }
+    if st.apps.len() >= MAX_APPS {
+        return None;
     }
     let name = clamp_name(
         exe_name_of(exe)
@@ -7351,7 +7480,7 @@ fn ensure_host_app(st: &mut State, exe: &str) -> usize {
         grad: grad_for(&name),
     });
     ini_insert_app(&st.ini_path, &name, exe);
-    st.apps.len() - 1
+    Some(st.apps.len() - 1)
 }
 
 /// 往 [app.X] 段追加一条窗口条目（`target|@win|<relaunch>`）
@@ -7395,7 +7524,10 @@ unsafe fn capture_window(
     title: &str,
     relaunch: &str,
 ) -> usize {
-    let ai = ensure_host_app(st, exe);
+    let Some(ai) = ensure_host_app(st, exe) else {
+        say(st, "内环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_APPS), 3.0);
+        return 0;
+    };
     let item = ItemEntry {
         name: clamp_name(title),
         target: exe.to_string(),
@@ -7434,10 +7566,11 @@ unsafe fn capture_window(
             "refresh name={} old={} new={}",
             item.name, old, item.relaunch
         ));
-        return 0;
+        return 1; // 刷新已有条目也算成功（调用方据此给反馈）
     }
     if st.apps[ai].items.len() >= MAX_ITEMS {
         println!("[wincap] 外环已满，跳过 · {}", title);
+        say(st, "外环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_ITEMS), 3.0);
         return 0;
     }
     st.apps[ai].items.push(item);
@@ -7662,16 +7795,18 @@ unsafe fn poll_window_capture(st: &mut State) -> bool {
         let (rx, ry) = release_point().unwrap_or_else(|| unsafe { cursor_now() });
         let over = in_disc(st, rx, ry);
         if over {
-            capture_window(
+            let added = capture_window(
                 st,
                 HWND(wc.hwnd as *mut c_void),
                 &wc.exe,
                 &wc.title,
                 &wc.relaunch,
             );
-            st.commit_pulse = 1.0;
-            // 落盘成功 = 这条要存了，**这时**才去 UIA 问路径/网址（后台线程，不卡 UI）
-            wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
+            if added > 0 {
+                st.commit_pulse = 1.0;
+                // 落盘成功 = 这条要存了，**这时**才去 UIA 问路径/网址（后台线程，不卡 UI）
+                wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
+            }
         }
         st.drop_suggest = None;
         st.drop_ghost = None;
@@ -9717,7 +9852,7 @@ unsafe fn thumb_tick(st: &mut State) {
     thumb_apply(src, (px as i32, py as i32));
 }
 
-unsafe extern "system" fn ring_proc(hwnd: HWND, msg: u32, _w: WPARAM, _l: LPARAM) -> LRESULT {
+unsafe extern "system" fn ring_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_SETCURSOR => {
             // 窗口接收鼠标后必须自设光标：拖放期间系统可能留下忙碌指针，
@@ -9737,8 +9872,73 @@ unsafe extern "system" fn ring_proc(hwnd: HWND, msg: u32, _w: WPARAM, _l: LPARAM
             }
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // ── 改名：轮盘临时持有焦点，键盘/IME 走原生路径 ──
+        WM_KEYDOWN if EDIT_ARMED.load(Ordering::Relaxed) => {
+            let act = match w.0 as u32 {
+                0x1B => Some(KA_EDIT_CANCEL),
+                0x0D => Some(KA_EDIT_COMMIT),
+                0x08 => Some(KA_EDIT_BACK),
+                0x2E => Some(KA_EDIT_DEL),
+                _ => None,
+            };
+            match act {
+                Some(a) => {
+                    post(WM_APP_KEY, a, 0);
+                    LRESULT(0)
+                }
+                None => DefWindowProcW(hwnd, msg, w, l),
+            }
+        }
+        WM_CHAR if EDIT_ARMED.load(Ordering::Relaxed) => {
+            let cp = w.0 as u32;
+            // 代理对（emoji 等）分两条 WM_CHAR 过来，单独一半不是合法字符 —— 丢
+            if !(0xD800..=0xDFFF).contains(&cp) && cp >= 0x20 && cp != 0x7F {
+                post(WM_APP_CHAR, cp as usize, 0);
+            }
+            LRESULT(0)
+        }
+        WM_IME_CHAR if EDIT_ARMED.load(Ordering::Relaxed) => {
+            // 某些输入法（或 TSF 兼容模式）直接把上屏字符发成 WM_IME_CHAR，不经过 WM_CHAR
+            let cp = (w.0 as u32) & 0xFFFF;
+            if !(0xD800..=0xDFFF).contains(&cp) && cp >= 0x20 {
+                post(WM_APP_CHAR, cp as usize, 0);
+            }
+            LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION if EDIT_ARMED.load(Ordering::Relaxed) => {
+            edit_ime_place(state_of(hwnd), hwnd);
+            LRESULT(0)
+        }
+        WM_IME_COMPOSITION if EDIT_ARMED.load(Ordering::Relaxed) => {
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                let flags = l.0 as u32;
+                if flags & GCS_RESULTSTR.0 != 0 {
+                    let s = imm_string(himc, GCS_RESULTSTR);
+                    if !s.is_empty() {
+                        EDIT_RES_NEXT
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(s);
+                        post(WM_APP_EDRES, 0, 0);
+                    }
+                }
+                if flags & GCS_COMPSTR.0 != 0 {
+                    let s = imm_string(himc, GCS_COMPSTR);
+                    *EDIT_COMP_NEXT.lock().unwrap_or_else(|e| e.into_inner()) = s;
+                    post(WM_APP_EDCOMP, 0, 0);
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+            LRESULT(0)
+        }
+        WM_IME_ENDCOMPOSITION if EDIT_ARMED.load(Ordering::Relaxed) => {
+            *EDIT_COMP_NEXT.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
+            post(WM_APP_EDCOMP, 0, 0);
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
-        _ => DefWindowProcW(hwnd, msg, _w, _l),
+        _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
 
@@ -9924,6 +10124,7 @@ unsafe fn dump_all(dir: &str) {
         save_bmp(&edit_path, &buf, canvas(), canvas());
         st.editing = None;
         st.edit_buf.clear();
+        st.edit_comp.clear();
 
         // 2c) 气泡：hover 内环 → 应用名（宽度按文字量收缩，这条只有 2 个字）
         st.bub_a = 1.0;
@@ -12620,14 +12821,22 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
         if blink {
             let textw = est_text_w(&label, cjk, lat);
             let cw = est_text_w("0", cjk, lat).max(4.0);
-            let (bx, by, tang) = place(
-                -half + chip_pad_l() + chip_icon() + chip_gap() + textw + 1.5 + cw * 0.5,
+            // ⚠️ 不能再用 `place(起点 + 字宽)`：`norm_rot` 会把下半圈的段旋转 180°
+            //    来保证文字不倒着读，此时弧上的 +lx 与**文字阅读方向相反** ——
+            //    光标就画到字头去了（用户 2026-11-13 截图「光标为什么在最前面」）。
+            //    文字是按切线方向**直线**渲染的，所以从文字中心沿 `tang` 推进才是真正的字尾。
+            let (tx, ty, tang) = place(
+                -half + chip_pad_l() + chip_icon() + chip_gap() + textw * 0.5,
                 0.0,
             );
+            let tr = tang.to_radians();
+            let adv = textw * 0.5 + 1.5 + cw * 0.5;
+            let bx = tx + tr.cos() * adv;
+            let by = ty + tr.sin() * adv;
             // 高度按**文字实际高度**取（原来是 7K ≈ 9.2px，比文字 11.5px 矮一截，
             // 看着像个小点）
             let chh = (RING_NAME_PX as f32 * k() * KC) * 0.5;
-            rot_rrect(buf, bx, by, cw * 0.5, chh, 1.0, tang.to_radians(), fg, alpha);
+            rot_rrect(buf, bx, by, cw * 0.5, chh, 1.0, tr, fg, alpha);
         }
     }
 }
@@ -14014,6 +14223,12 @@ unsafe extern "system" fn key_hook_impl(code: i32, w: WPARAM, l: LPARAM) -> LRES
             return CallNextHookEx(None, code, w, l);
         }
     }
+    // 改名期间轮盘真的持有键盘焦点 → 一个键都不要吞：让输入法组字（中文拼音）、
+    // `WM_CHAR`、`WM_KEYDOWN` 全走原生路径进 `ring_proc`。一旦在这里吞掉，
+    // IME 根本收不到按键 —— 用户就只能在胶囊里打英文（2026-11-13 报的 bug）。
+    if EDIT_FOCUS.load(Ordering::Relaxed) {
+        return CallNextHookEx(None, code, w, l);
+    }
     if code >= 0 && MENU_OPEN.load(Ordering::Relaxed) {
         // 改名模式下先拦编辑键 —— Esc/Enter/Backspace 语义全变了
         if m == 0x0100 && EDIT_ARMED.load(Ordering::Relaxed) {
@@ -14224,6 +14439,14 @@ static CTX_OPEN: AtomicBool = AtomicBool::new(false);
 /// 改名模式是否激活。键盘钩子在**别的线程**上跑，必须靠这个原子量才知道
 /// 该不该把字符吞掉（读 st.editing 会跨线程，是 UB）。
 static EDIT_ARMED: AtomicBool = AtomicBool::new(false);
+/// 改名期间轮盘是否真的拿到了键盘焦点（= IME 可以接管中文组字）。
+/// 平时轮盘是 `WS_EX_NOACTIVATE`，从不抢前台；只在改名时临时激活。
+static EDIT_FOCUS: AtomicBool = AtomicBool::new(false);
+/// 进改名前的那个前台窗口 —— 改名结束要还回去
+static EDIT_PREV_FG: AtomicIsize = AtomicIsize::new(0);
+/// IME 组字串 / 上屏结果的中转（`ring_proc` 拿不到 `State`，只能先放这里再投递）
+static EDIT_COMP_NEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static EDIT_RES_NEXT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 // ── 右键菜单 / 原生输入框：**已按用户要求删除** ──
 // 2026-10-07：用户明确「去掉换色去掉菜单，双击直接就在胶囊里改名」。
 // 原 chip_ctx_menu()（右键 -> 改名/换色 TrackPopupMenu）+ input_dialog() + dlg_proc()
@@ -15202,13 +15425,13 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     );
     // 窗口已经显示 → 从这一刻起后台线程每 33ms 重抓一次背景（首帧快照仍是上面那张）
     glass_live_start(st, hwnd);
-    // 更新条：每天前两次「真正的呼出」展示（启动亮相只展示、不消耗次数）
+    // 更新条：每天第一次「真正的呼出」展示（启动亮相只展示、不消耗次数）
     if count_update {
         unsafe { upd_refresh_pill(st) };
     } else {
         st.upd_pill_vis = upd_offer(st)
             && matches!(st.update_st, 3 | 4)
-            && st.update_seen_n < 2;
+            && st.update_seen_n < 1;
     }
     let mh = MAIN_HWND.load(Ordering::Relaxed);
     if mh != 0 {
@@ -15320,7 +15543,9 @@ unsafe fn close_menu_now(st: &mut State) {
     // 改名态必须一起清：否则 EDIT_ARMED 残留，键盘钩子会一直吞字符
     st.editing = None;
     st.edit_buf.clear();
+    st.edit_comp.clear();
     EDIT_ARMED.store(false, Ordering::SeqCst);
+    edit_drop_focus();
     set_mood(st, 0);
     diag_push(DK_MENU_CLOSE, 0);
     let mh = MAIN_HWND.load(Ordering::Relaxed);
@@ -15630,8 +15855,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         items.first().map(|i| i.target.clone()).unwrap_or_default(),
                         px as i32, py as i32, n_ap, over_slot, over_app, ghost.is_some(), suggest
                     ));
-                    let n = if items.is_empty() {
-                        0
+                    let res = if items.is_empty() {
+                        DropResult::default()
                     } else if let Some(g) = ghost {
                         match over_app {
                             Some(ai) if over_slot != Some(n_ap) => {
@@ -15655,9 +15880,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         if is_app && !dup {
                             process_drop(st, &items, None)
                         } else {
-                            0
+                            DropResult::default()
                         }
                     };
+                    let n = res.added;
                     if n > 0 {
                         drag_log(&format!("Drop processed, added={}", n));
                         println!("[drop] 入环 {} 项", n);
@@ -15677,10 +15903,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                             .and_then(|it| unsafe { resolve_host_exe(it) })
                             .and_then(|exe| host_app_index(st, &exe))
                             .is_some();
-                        if dup {
+                        if drop_full_say(st, &res) {
+                            // 已经说清是哪个上限，别再覆盖成含糊的「没接住」
+                        } else if dup {
                             say(st, &format!("已经在环上了：{}", nm), "", 1.7);
                         } else {
-                            say(st, &format!("没接住：{}", nm), "稍后重试", 1.7);
+                            say(st, &format!("没接住：{}", nm), "换个位置再试试", 1.7);
                         }
                     }
                     // 常驻模式：保持打开，让用户亲眼看到新成员出现；
@@ -15716,17 +15944,19 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     let (cx, cy) = cursor_now();
                     let over = in_disc(st, cx, cy);
                     if over {
-                        capture_window(
+                        let added = capture_window(
                             st,
                             HWND(wc.hwnd as *mut c_void),
                             &wc.exe,
                             &wc.title,
                             &wc.relaunch,
                         );
-                        wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
-                        st.commit_pulse = 1.0;
-                        set_mood(st, 5);
-                        st.mood_hold = now_s() + 1.5;
+                        if added > 0 {
+                            wincap_probe_start(st, HWND(wc.hwnd as *mut c_void), &wc.exe);
+                            st.commit_pulse = 1.0;
+                            set_mood(st, 5);
+                            st.mood_hold = now_s() + 1.5;
+                        }
                     }
                     st.drop_suggest = None;
                     st.drop_ghost = None;
@@ -15751,6 +15981,29 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     frame(st, 255);
                 }
             }
+            LRESULT(0)
+        }
+        WM_APP_EDCOMP => {
+            let st = state_of(hwnd);
+            st.edit_comp = EDIT_COMP_NEXT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            frame(st, 255);
+            LRESULT(0)
+        }
+        WM_APP_EDRES => {
+            let st = state_of(hwnd);
+            let parts = std::mem::take(
+                &mut *EDIT_RES_NEXT.lock().unwrap_or_else(|e| e.into_inner()),
+            );
+            for s in parts {
+                for c in s.chars() {
+                    edit_push(st, c);
+                }
+            }
+            st.edit_comp.clear();
+            frame(st, 255);
             LRESULT(0)
         }
         // 仅自动化测试：双击改名要真鼠标 + 中文 IME，自动化跑不了。
@@ -15782,6 +16035,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             if w.0 == 9 {
                 st.editing = None;
                 st.edit_buf.clear();
+                st.edit_comp.clear();
                 EDIT_ARMED.store(false, Ordering::SeqCst);
                 st.active_app = Some(ai);
                 let has_items = st.apps.get(ai).map(|a| !a.items.is_empty()).unwrap_or(false);
@@ -15821,6 +16075,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     }
                     5 => {
                         st.edit_buf.clear();
+                        st.edit_comp.clear();
                         unsafe { edit_finish(st, true) };
                     }
                     // 仅测试：**只设** active_app / hover_chip，不进编辑态。
@@ -15830,6 +16085,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     9 => {
                         st.editing = None;
                         st.edit_buf.clear();
+                        st.edit_comp.clear();
                         EDIT_ARMED.store(false, Ordering::SeqCst);
                         st.active_app = Some(ai);
                         st.hover_chip = Some(j);
@@ -16192,6 +16448,20 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 _ => 0,
             };
             LRESULT(v as isize)
+        }
+        WM_APP_BUBTEXT => {
+            // 仅测试：拖放失败时到底提示了哪一句（上限 / 没接住），返回枚举不传字符串
+            let st = state_of(hwnd);
+            let v = if st.bub_main == "内环装不下了" {
+                1
+            } else if st.bub_main == "外环装不下了" {
+                2
+            } else if st.bub_main.starts_with("没接住") {
+                3
+            } else {
+                0
+            };
+            LRESULT(v)
         }
         WM_APP_CHIPINFO => {
             let st = state_of(hwnd);
