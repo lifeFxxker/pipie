@@ -108,8 +108,8 @@ def main():
     if subsys != 2:
         print('⚠️ 警告：release 应该是 GUI 子系统。检查 main.rs 顶部的')
         print('   `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`')
-    if size > 2 * 1024 * 1024:
-        print('⚠️ 警告：体积超过 2MB，可能链接了不该有的东西')
+    if size > 3 * 1024 * 1024:
+        print('⚠️ 警告：体积超过 3MB，可能链接了不该有的东西')
 
     print('=== 3/4 生成 dist/ ===', flush=True)
     kill_running()

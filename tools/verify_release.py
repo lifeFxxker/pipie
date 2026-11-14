@@ -7,7 +7,7 @@
   3. LICENSE.txt 是 MIT
   4. exe 是 GUI 子系统（PE subsystem == 2），不是 Console
   5. SHA256SUMS 与 zip 内的 exe 一致（在线更新依赖它）
-  6. exe 体积 < 2 MB
+  6. exe 体积 < 3 MB（拼音词典让二进制涨到 ~2.06MB）
 
 单独成文件是为了让 CI 的"发布前校验"和本地判断用同一套规则：
 package.py 负责生产，这里负责验收，两边不共用同一段判断逻辑。
@@ -52,7 +52,7 @@ def main():
         lic = z.read('LICENSE.txt').decode('utf-8', 'replace')
         check(lic.lstrip().startswith('MIT License'), 'LICENSE.txt 首行是 MIT License')
         exe = z.read(NAME)
-        check(len(exe) < 2 * 1024 * 1024, 'exe 体积 %.1f KB' % (len(exe) / 1024))
+        check(len(exe) < 3 * 1024 * 1024, 'exe 体积 %.1f KB' % (len(exe) / 1024))
 
     pe = struct.unpack_from('<I', exe, 0x3c)[0]
     if exe[pe:pe + 4] != b'PE\x00\x00':
