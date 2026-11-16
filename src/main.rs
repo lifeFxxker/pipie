@@ -569,6 +569,7 @@ fn drag_log(msg: &str) {
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = format!("{}\\draglog.txt", dir);
+    log_rotate(std::path::Path::new(&path));
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
@@ -702,6 +703,7 @@ fn diag_now() -> String {
 /// 看门狗线程用它落盘（带时间戳）
 fn diag_line(path: &str, s: &str) {
     use std::io::Write;
+    log_rotate(std::path::Path::new(path));
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{}] {}", diag_now(), s);
     }
@@ -764,6 +766,11 @@ struct GhostApp {
     /// 幽灵磁贴上显示的**真图标**（宿主 exe / 载荷的图标）。
     /// ⚠️ 必须画真图标：只画首字母（如 Edge 画个 "M"）用户根本看不懂这是啥。
     icon: Option<IconTex>,
+    /// 幽灵站在哪一格：`None` = 末尾多出来的那一格（新建应用的老路径）；
+    /// `Some(i)` = 叠在第 i 个**已有图标**上（目录拖到某个应用上 = 就插在它这一格）。
+    /// 带 `Some` 的幽灵**不参与**排布（`eff_apps` 不 +1），否则图标会整体重排、
+    /// 光标下的落点跟着跳，幽灵一闪一闪。
+    at: Option<usize>,
 }
 
 /// 抓取中（用户正把某个窗口标题栏拖向环）的窗口快照。
@@ -1047,6 +1054,8 @@ struct State {
     chip_ghost_a: f32,
     /// 拖入内容"认不出宿主"→ 内环要新建的幽灵磁贴（半透明，丢上去才建）
     drop_ghost: Option<GhostApp>,
+    /// 上一帧看到的幽灵签名（格位 + 名字）：幽灵不参与 slot 动画，出现/换格时要补画一帧。
+    last_ghost_sig: Option<(Option<usize>, String)>,
     /// 拖窗口进环：当前正被拖动、等待落盘的窗口（None = 没有窗口在拖）
     window_capture: Option<WindowCapture>,
     /// 已穿上的装饰（`DECORS` 的 id；存 ini `decor=`，可多件叠加）
@@ -1608,6 +1617,7 @@ impl State {
             drop_suggest: None,
             chip_ghost_a: 0.0,
             drop_ghost: None,
+            last_ghost_sig: None,
             window_capture: None,
             decor: Vec::new(),
             decor_mode: false,
@@ -4986,7 +4996,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     let n_ap = st.apps.len();
     // 虚线教学槽位已取消（用户 2026-10-18：它常驻、且位置与真实图标重叠）。
     // 现在「拖进来会多一格」只在**真正拖动时**由 `drop_ghost` 幽灵磁贴体现。
-    let n = n_ap + if st.drop_ghost.is_some() { 1 } else { 0 };
+    let n = n_ap + usize::from(ghost_new_slot(st));
     if n == 0 {
         return;
     }
@@ -5411,9 +5421,8 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
     // ── 3a. 幽灵磁贴：拖入内容"认不出宿主 / 宿主不在内环"→ 在空位上浮一个**半透明磁贴**。
     //     丢到它上面才真正新建内环。⚠️ 不参与 `ring_layout(n)`，只是叠上去，已有磁贴不动。──
     if let Some(g) = &st.drop_ghost {
-        // 满环时幽灵站在**多出来的那一格**（`apps.len()`）→ 不滚出来就看不见。
-        // 可见度与真实磁贴走同一份 `slot_appear`，`on_timer` 会在拖动时自动滚到它那一页。
-        let ga = slot_appear(slot_of(st, n_ap), n);
+        // 末尾幽灵（老路径）要滚到多出来的那一格才看得见；叠在已有格上的幽灵跟着那一格。
+        let ga = slot_appear(ghost_slot(st), n);
         if ga > 0.01 {
             let (gx, gy) = ghost_pos(st);
             let half = icon_draw * 0.5;
@@ -5422,12 +5431,12 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             // 用户根本找不到落点 → 拖进来"没反应"。描边必须够实。
             flat_round_rect(
                 buf, gx, gy, half, half, rad,
-                mixc(pal.paper, pal.ink, 0.06),
+                mixc(pal.paper, pal.ink, if g.at.is_some() { 0.10 } else { 0.06 }),
                 1.8 * k(),
                 pal.ink,
                 0.85,
                 0.0, 0.0, 0.0,
-                0.62 * ga,
+                (if g.at.is_some() { 0.82 } else { 0.62 }) * ga,
             );
             // 优先画**真图标**（一眼就知道要加的是哪个应用）；实在没有才退回首字母 ——
             // 只画首字母（Edge → "M"）用户根本看不懂「这是啥」。
@@ -6757,7 +6766,7 @@ fn hit_chip_at(st: &State, ai: usize, px: f32, py: f32) -> Option<usize> {
 /// **有效槽位数**：有幽灵时按 `n+1` 排布 —— 幽灵占一个**真实槽位**，其它图标整体让位。
 /// （用户 2026-10-12：幽灵必须是"真实占位"，不能硬塞在两个图标中间。）
 fn eff_apps(st: &State) -> usize {
-    st.apps.len() + if st.drop_ghost.is_some() { 1 } else { 0 }
+    st.apps.len() + usize::from(ghost_new_slot(st))
 }
 
 /// 画布坐标 → 最近的应用磁贴（拖放落点识别）
@@ -6985,7 +6994,7 @@ unsafe fn paste_add(st: &mut State) {
         return;
     }
     let force = focus_app(st); // 真的悬停在哪就加进谁；没悬停则自动识别
-    let res = process_drop(st, &items, force);
+    let res = process_drop(st, &items, force, false);
     let n = res.added;
     if n > 0 {
         st.commit_pulse = 1.0;
@@ -7061,6 +7070,17 @@ fn folder_hub_index(st: &State) -> Option<usize> {
 /// 拖这种窗口进环应归「文件夹」hub，而不是另开一个 explorer 内环。
 fn is_explorer_exe(exe: &str) -> bool {
     exe_name_of(exe).as_deref() == Some("explorer.exe")
+}
+
+/// 「文件夹类」应用：内置文件夹 hub / explorer / 目标或条目本身就是目录。
+/// 目录拖到这类应用上 = 收进它的外环；拖到**其它**内环应用上 = 目录自己占一个内环位
+/// （用户 2026-11-15 定：目录不该被塞进 Chrome/编辑器这类应用的外环）。
+fn app_is_folder_like(st: &State, ai: usize) -> bool {
+    let Some(a) = st.apps.get(ai) else { return false };
+    folder_hub_index(st) == Some(ai)
+        || target_opens_folder(&a.target)
+        || is_explorer_exe(&a.target)
+        || a.items.iter().any(|it| target_opens_folder(&it.target))
 }
 
 /// 内环里的「浏览器 hub」索引 —— 拖进来的**网址**和**浏览器窗口**应归它，
@@ -7144,6 +7164,7 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
                 target: it.target.clone(),
                 put_items: false,
                 icon,
+                at: None,
             });
         }
         return;
@@ -7176,6 +7197,7 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
                     target: it.target.clone(),
                     put_items: false,
                     icon,
+                    at: None,
                 });
             }
         } else if st.apps.len() < MAX_APPS {
@@ -7187,6 +7209,7 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
                 target: it.target.clone(),
                 put_items: false,
                 icon,
+                at: None,
             });
         }
         return;
@@ -7209,7 +7232,7 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
                     .map(|b| clamp_name(b.trim_end_matches(".exe")))
                     .unwrap_or_else(|| it.name.clone());
                 let icon = unsafe { decode_icon(&exe) }.map(|(px, d)| IconTex::from_base(px, d));
-                st.drop_ghost = Some(GhostApp { name, target: exe, put_items: true, icon });
+                st.drop_ghost = Some(GhostApp { name, target: exe, put_items: true, icon, at: None });
             }
         }
         None => {
@@ -7222,6 +7245,7 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
                     target: it.target.clone(),
                     put_items: false,
                     icon,
+                    at: None,
                 });
             }
         }
@@ -7230,11 +7254,25 @@ fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
 
 /// 幽灵磁贴的位置（画布坐标）：**它就是"多出来的那个槽位"** ——
 /// 整个环按 `n+1` 排布，幽灵站在索引 `n` 的位置，其它图标各自让位到新角度上。
-fn ghost_pos(st: &State) -> (f32, f32) {
+/// 幽灵要不要**多占一格**（末尾新建应用的老路径）。
+/// 叠在已有图标上的幽灵（`at=Some`）不多占格 —— 否则图标整体重排、光标落点跳动。
+fn ghost_new_slot(st: &State) -> bool {
+    st.drop_ghost.as_ref().map(|g| g.at.is_none()).unwrap_or(false)
+}
+
+/// 幽灵当前的槽位（可能是末尾多出来那格，也可能是某个已有格）。
+fn ghost_slot(st: &State) -> f32 {
     let n_ap = st.apps.len();
-    let n = n_ap + 1; // 画幽灵时必然按 n+1 排
+    match st.drop_ghost.as_ref().and_then(|g| g.at) {
+        Some(i) => slot_of(st, i.min(n_ap.saturating_sub(1))),
+        None => slot_of(st, n_ap),
+    }
+}
+
+fn ghost_pos(st: &State) -> (f32, f32) {
+    let n = st.apps.len() + usize::from(ghost_new_slot(st));
     let (r_icon, _sz) = ring_layout(n);
-    let s = slot_of(st, n_ap);
+    let s = ghost_slot(st);
     polar(r_icon - scroll_sink() * (1.0 - slot_appear(s, n)), slot_angle(s, n))
 }
 
@@ -7257,7 +7295,7 @@ fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> DropRe
         ini_insert_app(&st.ini_path, &g.name, &g.target);
         unsafe { load_ini(st) };
         match host_app_index(st, &g.target) {
-            Some(ai) => process_drop(st, items, Some(ai)),
+            Some(ai) => process_drop(st, items, Some(ai), false),
             None => DropResult::default(),
         }
     } else {
@@ -7281,10 +7319,16 @@ fn create_from_ghost(st: &mut State, items: &[DropItem], g: &GhostApp) -> DropRe
     }
 }
 
-/// 入环：URL → 浏览器外环（推荐）或落点应用；文件夹 → 资源管理器外环；
+/// 入环：URL → 浏览器外环（推荐）或落点应用；文件夹 → 默认归文件夹 hub 外环，
+/// 但 `dir_top=true`（光标压在内环的**非文件夹**应用上）时目录自己进内环；
 /// exe/lnk/文件 → 新增进常用。落到哪个图标上 = 强制加进谁。
 /// 返回新增条数。入库即回写 ini 并全量热重载。
-fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) -> DropResult {
+fn process_drop(
+    st: &mut State,
+    items: &[DropItem],
+    force_app: Option<usize>,
+    dir_top: bool,
+) -> DropResult {
     let mut added = 0usize;
     // 落了新条目的应用 → 落完把它外环翻到**最后一页**，让用户看见刚加的东西
     let mut dests: Vec<usize> = Vec::new();
@@ -7296,7 +7340,10 @@ fn process_drop(st: &mut State, items: &[DropItem], force_app: Option<usize>) ->
             "item [{}] target={} force={:?}",
             it.name, it.target, force_app
         ));
-        let dest: Option<usize> = if let Some(ai) = force_app {
+        let dest: Option<usize> = if dir_top && it.is_dir {
+            // 目录拖到内环的非文件夹应用上 → 不挂到它外环，目录自己进内环
+            None
+        } else if let Some(ai) = force_app {
             if ai < st.apps.len() { Some(ai) } else { None }
         } else if it.is_url {
             // 推荐：目标本身是 URL 或已有 URL 条目的应用（= 浏览器）
@@ -7820,15 +7867,14 @@ unsafe fn find_window_for_capture(exe: &str, title: &str) -> Option<HWND> {
                 return BOOL(0);
             }
             if IsWindowVisible(hwnd).as_bool() {
-                let mut pid = 0u32;
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                if let Some(pe) = process_image(pid) {
-                    if pe == s.want_exe {
-                        let t = window_title(hwnd).to_ascii_lowercase();
-                        if t.contains(s.want_title.as_str()) {
-                            s.found = Some(hwnd);
-                            return BOOL(0);
-                        }
+                // 路径必须按「同一目录树下的同名 exe」比：Qoder 是
+                // `D:\Qoder\Qoder.exe` 启动器 + `.qoder-versions\<ver>\Qoder.exe` 实体，
+                // 只比全路径会让已开的窗口匹配不到（条目永远没有 live_hwnd）。
+                if exe_matches_target(hwnd, &s.want_exe) {
+                    let t = window_title(hwnd).to_ascii_lowercase();
+                    if t.contains(s.want_title.as_str()) {
+                        s.found = Some(hwnd);
+                        return BOOL(0);
                     }
                 }
             }
@@ -7844,14 +7890,20 @@ unsafe fn find_window_for_capture(exe: &str, title: &str) -> Option<HWND> {
     s.found
 }
 
-/// 重启后给窗口条目重新匹配 live_hwnd（按 exe+标题）；匹配不到（已关）留 0。
+/// 窗口条目（`kind==1`）的 live_hwnd 不持久化：重启后、或窗口是开着 PiPie 之后才打开的，
+/// 这里按「exe + 标题」重新匹配一个还活着的窗口；匹配不到（已关）就置 0。
+/// ⚠️ 每次呼出都会调，**只补空/失效的**（`IsWindow` 一次，便宜），别每回都全量 EnumWindows。
 unsafe fn restamp_window_hwnds(st: &mut State) {
     for a in st.apps.iter_mut() {
         for it in a.items.iter_mut() {
             if it.kind == 1 {
-                it.live_hwnd = find_window_for_capture(&it.target, &it.name)
-                    .map(|h| h.0 as isize)
-                    .unwrap_or(0);
+                let alive = it.live_hwnd != 0
+                    && IsWindow(HWND(it.live_hwnd as *mut c_void)).as_bool();
+                if !alive {
+                    it.live_hwnd = find_window_for_capture(&it.target, &it.name)
+                        .map(|h| h.0 as isize)
+                        .unwrap_or(0);
+                }
             }
         }
     }
@@ -8046,6 +8098,7 @@ fn wlog(line: &str) {
     let _ = std::fs::create_dir_all(&dir);
     let mut p = std::path::PathBuf::from(dir);
     p.push("wincap.log");
+    log_rotate(&p);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(f, "[{:.2}] {}", now_s(), line);
     }
@@ -8158,6 +8211,7 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
                 target: exe.clone(),
                 put_items: true,
                 icon,
+                at: None,
             });
         }
         _ => {}
@@ -10217,8 +10271,9 @@ unsafe fn thumb_tick(st: &mut State) {
         _ => None,
     };
     // ② 悬停内环一个**正在运行**的应用 → 预览它最前面的窗口（合并后默认屏的功能）
-    // ⚠️ **有外环的应用不弹内环预览**（用户 2026-10-17 定）：它的窗口已经一条条
-    //    摊在外环上了，内环再弹一张「最前面的窗口」既重复、又会把外环胶囊压住。
+    // ⚠️ **有外环的应用不弹内环预览**（用户 2026-10-17 定，2026-11-15 再次明确）：
+    //    有外环 = 窗口已经一条条摊在胶囊上，缩略图跟着胶囊弹；内环图标再弹一张
+    //    「最前面的窗口」既重复、又会把外环胶囊压住。没外环的应用才走这条。
     let want_app = if want_chip.is_none() {
         if let Some(ai) = st.hover_now {
             let has_ring = st.apps.get(ai).map(|a| !a.items.is_empty()).unwrap_or(true);
@@ -11179,6 +11234,7 @@ unsafe fn dump_all(dir: &str) {
             target: gexe.clone(),
             put_items: true,
             icon: unsafe { decode_icon(&gexe) }.map(|(px, d)| IconTex::from_base(px, d)),
+            at: None,
         });
         let buf = draw_to_buf(&mut st);
         save_bmp(&format!("{}\\dump_drop_ghost.bmp", dir), &buf, canvas(), canvas());
@@ -11470,6 +11526,38 @@ fn log_dir() -> String {
             format!("{}\\PiPie\\logs", a.trim().trim_end_matches('\\'))
         }
         _ => config_dir(),
+    }
+}
+
+/// 单个日志文件的滚动上限：到点就把当前文件改名为 `.old`（上一代删掉），再从空文件写。
+/// 每个文件名最多占 2×上限（`x.txt` + `x.txt.old`），排障要的"最近一段"都还在。
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// 写日志前的体积检查。`.old` 只保留尾部 `LOG_MAX_BYTES`（按整行切），
+/// 所以老版本留下的几 MB 巨无霸也会在第一次滚动时被裁掉。
+fn log_rotate(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() < LOG_MAX_BYTES {
+        return;
+    }
+    let mut old = path.as_os_str().to_os_string();
+    old.push(".old");
+    let old = std::path::PathBuf::from(old);
+    let _ = std::fs::remove_file(&old);
+    if std::fs::rename(path, &old).is_err() {
+        return;
+    }
+    if let Ok(data) = std::fs::read(&old) {
+        if data.len() as u64 > LOG_MAX_BYTES {
+            let keep = &data[data.len() - LOG_MAX_BYTES as usize..];
+            let keep = match keep.iter().position(|&b| b == b'\n') {
+                Some(i) => &keep[i + 1..],
+                None => keep,
+            };
+            let _ = std::fs::write(&old, keep);
+        }
     }
 }
 
@@ -15706,6 +15794,16 @@ unsafe fn on_timer(st: &mut State) {
     }
 
     let mut moving = false;
+    // 幽灵不参与 slot 动画：它出现 / 换格 / 消失时没有别的动画替它触发重绘，
+    // 这里按签名变化补一帧（只补一帧，不是拖拽期间持续重绘）。
+    let gsig = st
+        .drop_ghost
+        .as_ref()
+        .map(|g| (g.at, g.name.clone()));
+    if gsig != st.last_ghost_sig {
+        st.last_ghost_sig = gsig;
+        moving = true;
+    }
     // ── 内环连续滚动：每帧把 `ring_off` 追向 `ring_to`（指数跟随，≈130ms 收敛）──
     // ⚠️ 这是滚动**唯一的动画源**：绘制 / 命中 / 外环锚点全都现读 `ring_off`，
     //    所以偏移一到位画面就静止 —— 别再给磁贴叠第二层「跟随」，那会变成双重拖影。
@@ -16175,6 +16273,9 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
 
     // 呼出时刷新「哪些应用正在运行」+ 每个应用最前面的窗口（圆点 + 悬停预览的数据源）
     refresh_running(st);
+    // 窗口条目的 live_hwnd 也重新匹配：应用是 PiPie 启动之后才打开的，
+    // 只有启动那一次 restamp 会让胶囊悬停预览一直是空的。
+    restamp_window_hwnds(st);
 
     st.active_app = None;
     st.hover_chip = None;
@@ -16656,6 +16757,33 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         .filter(|&a| a < n_ap)
                         .or_else(|| drop_slot_app(st, px, py).filter(|&a| a < n_ap))
                         .or_else(|| drop_band_app(st, px, py));
+                    // 目录拖到内环的**非文件夹**应用上 → 目录会自立一个内环位、不进那个
+                    // 应用的外环；预览改成「新应用」幽灵，别高亮一个它并不会去的应用。
+                    // 只认内环图标/缝，不认外环胶囊（胶囊仍然是把目录收进该应用的外环）。
+                    if items.iter().any(|it| it.is_dir) {
+                        let on_chip = (0..n_ap.min(MAX_APPS))
+                            .any(|ai| hit_chip_at(st, ai, px, py).is_some());
+                        let inner_dir_target = st
+                            .drop_target_app
+                            .filter(|&a| a < n_ap)
+                            .filter(|&a| !app_is_folder_like(st, a));
+                        if !on_chip && inner_dir_target.is_some() {
+                            st.drop_suggest = None;
+                            if st.drop_ghost.is_none() && st.apps.len() < MAX_APPS {
+                                if let Some(it) = items.iter().find(|it| it.is_dir) {
+                                    // 幽灵叠在光标压着的这一格上：松手后新格子就落在这里，
+                                    // 而不是飞到内环末尾（27 个应用时分页外根本看不见）。
+                                    st.drop_ghost = Some(GhostApp {
+                                        name: it.name.clone(),
+                                        target: it.target.clone(),
+                                        put_items: false,
+                                        icon: None,
+                                        at: inner_dir_target,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     // 「发送」胶囊：拖到某个内环上且载荷能发送（文件/文件夹/网址）→
                     // 外环末尾多一颗「发送」，拖进去 = 用该应用打开。
                     if !DRAG_SEND_ENABLED {
@@ -16738,6 +16866,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         .filter(|&a| a < n_ap)
                         .or_else(|| over_slot.filter(|&a| a < n_ap))
                         .or_else(|| drop_band_app(st, px, py));
+                    // 目录压在内环的非文件夹应用上（且不在它的外环胶囊上）→ 目录自己进内环
+                    let dir_top = items.iter().any(|it| it.is_dir)
+                        && (0..n_ap.min(MAX_APPS))
+                            .all(|ai| hit_chip_at(st, ai, px, py).is_none())
+                        && over_app
+                            .map(|a| !app_is_folder_like(st, a))
+                            .unwrap_or(false);
                     let ghost = st.drop_ghost.take();
                     let suggest = st.drop_suggest.take();
                     // 落点优先级：**正好压在幽灵槽上 → 建幽灵**；压在某个已有内环上 → 进它外环；
@@ -16751,15 +16886,17 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     ));
                     let res = if items.is_empty() {
                         DropResult::default()
+                    } else if dir_top {
+                        process_drop(st, &items, None, true)
                     } else if let Some(g) = ghost {
                         match over_app {
                             Some(ai) if over_slot != Some(n_ap) => {
-                                process_drop(st, &items, Some(ai))
+                                process_drop(st, &items, Some(ai), false)
                             }
                             _ => create_from_ghost(st, &items, &g),
                         }
                     } else if let Some(sai) = suggest {
-                        process_drop(st, &items, Some(over_app.unwrap_or(sai)))
+                        process_drop(st, &items, Some(over_app.unwrap_or(sai)), false)
                     } else {
                         // 载荷本身是应用（exe/lnk）→ 经典「拖进来加个内环」；已在环里则去重跳过
                         let is_app = items
@@ -16772,11 +16909,35 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                             .and_then(|exe| host_app_index(st, &exe))
                             .is_some();
                         if is_app && !dup {
-                            process_drop(st, &items, None)
+                            process_drop(st, &items, None, false)
                         } else {
                             DropResult::default()
                         }
                     };
+                    // 目录拖到某个应用上 = 「插在这一格」：process_drop 先追加到末尾，
+                    // 这里再挪到光标压着的位置（幽灵也画在那儿），所见即所得。
+                    if dir_top && res.added > 0 {
+                        if let Some(ai) = over_app.filter(|&a| a < n_ap) {
+                            let tgt = items
+                                .iter()
+                                .find(|it| it.is_dir)
+                                .map(|it| it.target.clone())
+                                .unwrap_or_default();
+                            if let Some(pi) = st
+                                .apps
+                                .iter()
+                                .rposition(|a| a.target.eq_ignore_ascii_case(&tgt))
+                            {
+                                if pi != ai {
+                                    let entry = st.apps.remove(pi);
+                                    st.apps.insert(ai, entry);
+                                    // 下标数组全部作废：下一次呼出会整体重置
+                                    st.app_slot_s = [f32::NAN; MAX_APPS];
+                                    unsafe { save_settings(st) };
+                                }
+                            }
+                        }
+                    }
                     let n = res.added;
                     if n > 0 {
                         drag_log(&format!("Drop processed, added={}", n));
@@ -17822,14 +17983,15 @@ WM_APP_DISMISS_FG => {
         WM_APP_DUMP => {
             let st = state_of(hwnd);
             println!(
-                "[dump] open={} active={:?} chip={:?} loading={:?} mood={} win=({},{})",
+                "[dump] open={} active={:?} chip={:?} loading={:?} mood={} win=({},{}) ghost={:?}",
                 MENU_OPEN.load(Ordering::Relaxed),
                 st.active_app,
                 st.hover_chip,
                 st.loading,
                 st.mood,
                 st.win_x,
-                st.win_y
+                st.win_y,
+                st.drop_ghost.as_ref().map(|g| (g.at, g.name.clone()))
             );
             if !st.dbi_bits.is_null() {
                 let n = (canvas() * canvas() * 4) as usize;
@@ -23307,6 +23469,7 @@ fn clip_log(line: &str) {
     let _ = std::fs::create_dir_all(&dir);
     let mut p = std::path::PathBuf::from(dir);
     p.push("cliplog.txt");
+    log_rotate(&p);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(f, "[{:.2}] {}", now_s(), line);
     }
@@ -30822,12 +30985,7 @@ fn main() {
             let dir = log_dir();
             let _ = std::fs::create_dir_all(&dir);
             let path = format!("{}\\radial_log.txt", dir);
-            // 超 8MB 重建，防止无限膨胀
-            if let Ok(m) = std::fs::metadata(&path) {
-                if m.len() > 8_000_000 {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
+            // 体积回收由 `diag_line` → `log_rotate` 按 1MB 滚动，这里不用再做整文件删除
             let build = std::fs::metadata(std::env::current_exe().unwrap_or_default())
                 .and_then(|m| m.modified())
                 .ok()
