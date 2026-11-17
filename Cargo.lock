@@ -26,7 +26,7 @@ checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
 
 [[package]]
 name = "pipie"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "gif",
  "pinyin",
