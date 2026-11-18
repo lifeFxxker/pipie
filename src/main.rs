@@ -274,7 +274,8 @@ const WM_APP_SEARCH_COMP: u32 = WM_APP + 61;  // 筛选：IME 组字串更新
 const WM_APP_SEARCH_RES: u32 = WM_APP + 62;   // 筛选：IME 上屏
 const WM_APP_SEARCHINFO: u32 = WM_APP + 63;   // 仅测试：筛选状态/命中数/首项
 const WM_APP_SEARCHPOS: u32 = WM_APP + 64;    // 仅测试：0=内环第 w 个命中 / 1=外环第 w 个的屏幕坐标
-const WM_APP_DROPINFO: u32 = WM_APP + 65;     // 仅测试：拖放预览状态（ghost/active/suggest/target/应用数）
+const WM_APP_DROPINFO: u32 = WM_APP + 65;
+const WM_APP_POSTSHOW: u32 = WM_APP + 66;      // 呼出后的"重活"：运行状态/窗口条目匹配     // 仅测试：拖放预览状态（ghost/active/suggest/target/应用数）
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
                                         // 返回值 = (y << 16) | x
                                         //（单击路径要靠真光标才能触发 update_hover，
@@ -1051,6 +1052,9 @@ struct State {
     /// 拖入内容"认不出宿主"→ 内环要新建的幽灵磁贴（半透明，丢上去才建）
     drop_ghost: Option<GhostApp>,
     ghost_a: f32,
+    /// 上一帧画面的入场缩放（0.62→1）。慢机器上画面会落后于时间——
+    /// 命中判定必须按**画出来的**半径算，否则早期点击会打空。
+    pop_drawn: f32,
     /// 目录拖入已经进入「内环占位」模式：光标在图标环带里时保持住，避免图标让位后
     /// 命中跳到隔壁应用 → 占位一闪一闪（实测 [1,0,1,0,1]）。
     dir_inner_lock: bool,
@@ -1616,6 +1620,7 @@ impl State {
             chip_ghost_a: 0.0,
             drop_ghost: None,
             ghost_a: 0.0,
+            pop_drawn: 1.0,
             dir_inner_lock: false,
             window_capture: None,
             decor: Vec::new(),
@@ -3948,7 +3953,7 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
     let ms = t0.elapsed().as_millis();
     if ms > CAP_SLOW_MS {
         let n = SLOW_HITS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= 2 {
+        if n >= 2 || ms > 400 {
             // 连续两次都慢（DLP / 审计钩住 GDI）→ 本次运行不再抓，轮盘用纸面
             CAP_SLOW.store(true, Ordering::Relaxed);
             perf_line(&format!("PERF snap_glass {ms}ms（连续 {n} 次超过 {CAP_SLOW_MS}ms）→ 本次运行退回纸面 {}", glass_where(x, y)));
@@ -5019,6 +5024,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
         1.0
     };
     let pop = lerp(0.62, 1.0, ease_out(pop_k));
+    st.pop_drawn = pop;
     let disc_r = disc_r0 * pop;
 
     // ── 1. 盘面：白纸 + 1.5px 细描边 + 向下偏移的贴身柔和投影 ──
@@ -5368,11 +5374,11 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
             continue;
         }
         let maxw = (icon_draw * 2.2).max(44.0);
-        // 22 → font_bub_s（12px / 400）：比 10px 大一档，仍然不加粗、无底色
         let label = fit_chip_label(nm, maxw, 11.0 * k() * KC, 6.2 * k() * KC);
         let py = ly + icon_draw * 0.58 + 8.0 * k();
-        draw_text(st, buf, *lx as i32, py as i32, &label, 22, 400,
-            pal.ink.0, pal.ink.1, pal.ink.2, (255.0 * la) as u8, 0, 0);
+        if let Some(tex) = label_tex(&*st, &label) {
+            blit_label(buf, *lx, py, &tex, pal.ink, *la);
+        }
     }
 
     // ── 3-移除区：拖着东西时，整圈虚线 = 「出了这圈松手就删」 ──
@@ -6797,6 +6803,101 @@ fn eff_apps(st: &State) -> usize {
     st.apps.len() + if st.drop_ghost.is_some() { 1 } else { 0 }
 }
 
+/// 内环目录名的一小块 alpha 遮罩（渲染一次、之后纯内存贴图）。
+/// ⚠️ 每帧直接 `draw_text` 在企业机器上会被 GDI/安全软件拖到 100ms+/帧（实测日志
+/// UI_SLOW 平均 443ms），名字必须缓存。
+struct LabelTex {
+    w: usize,
+    h: usize,
+    alpha: Vec<u8>,
+}
+
+static LABEL_CACHE: std::sync::Mutex<Vec<(String, LabelTex)>> = std::sync::Mutex::new(Vec::new());
+
+unsafe fn label_tex(st: &State, text: &str) -> Option<LabelTex> {
+    let key = text.to_string();
+    if let Ok(c) = LABEL_CACHE.lock() {
+        if let Some((_, t)) = c.iter().rev().find(|(k, _)| *k == key) {
+            let t = LabelTex { w: t.w, h: t.h, alpha: t.alpha.clone() };
+            return Some(t);
+        }
+    }
+    let n = (canvas() * canvas() * 4) as usize;
+    // ⚠️ `draw_text` 只在「目标 alpha != 0」的像素上落笔，所以先用**不透明黑底**渲染，
+    //    再把文字亮度当成遮罩（白字黑底 → R 通道就是覆盖率）。
+    let mut tmp = vec![0u8; n];
+    for px in tmp.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    let c = (canvas() / 2) as i32;
+    draw_text(st, &mut tmp, c, c, text, 22, 400, 255, 255, 255, 255, 0, 0);
+    let w = canvas() as usize;
+    let (mut x0, mut y0, mut x1, mut y1) = (w, w, 0usize, 0usize);
+    for y in 0..w {
+        for x in 0..w {
+            if tmp[(y * w + x) * 4] != 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    let (tw, th) = (x1 - x0 + 1, y1 - y0 + 1);
+    let mut alpha = Vec::with_capacity(tw * th);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            alpha.push(tmp[(y * w + x) * 4]);
+        }
+    }
+    let tex = LabelTex { w: tw, h: th, alpha };
+    if let Ok(mut c) = LABEL_CACHE.lock() {
+        if c.len() >= 64 {
+            c.remove(0);
+        }
+        c.push((key, LabelTex { w: tex.w, h: tex.h, alpha: tex.alpha.clone() }));
+    }
+    Some(tex)
+}
+
+fn blit_label(buf: &mut [u8], cx: f32, cy: f32, tex: &LabelTex, tint: (u8, u8, u8), alpha: f32) {
+    let w = canvas() as i32;
+    let x0 = (cx - tex.w as f32 * 0.5).round() as i32;
+    let y0 = (cy - tex.h as f32 * 0.5).round() as i32;
+    for ty in 0..tex.h as i32 {
+        let y = y0 + ty;
+        if !(0..w).contains(&y) {
+            continue;
+        }
+        for tx in 0..tex.w as i32 {
+            let x = x0 + tx;
+            if !(0..w).contains(&x) {
+                continue;
+            }
+            let sa = tex.alpha[(ty as usize) * tex.w + tx as usize] as f32 / 255.0 * alpha;
+            if sa <= 0.001 {
+                continue;
+            }
+            let o = ((y as usize) * w as usize + x as usize) * 4;
+            let da = buf[o + 3] as f32 / 255.0;
+            let oa = sa + da * (1.0 - sa);
+            if oa <= 0.0 {
+                continue;
+            }
+            let mix = |sc: u8, dc: u8| -> u8 {
+                (((sc as f32 * sa + dc as f32 * da * (1.0 - sa)) / oa).clamp(0.0, 255.0)) as u8
+            };
+            buf[o] = mix(tint.0, buf[o]);
+            buf[o + 1] = mix(tint.1, buf[o + 1]);
+            buf[o + 2] = mix(tint.2, buf[o + 2]);
+            buf[o + 3] = (oa * 255.0) as u8;
+        }
+    }
+}
+
 /// 画布坐标 → 最近的应用磁贴（拖放落点识别）
 fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     let n = eff_apps(st);
@@ -6805,7 +6906,9 @@ fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     }
     let dx = px - cc();
     let dy = py - cc();
-    let (r_icon, icon_sz) = ring_layout(n);
+    let (r_icon0, icon_sz0) = ring_layout(n);
+    let pop = st.pop_drawn.clamp(0.3, 1.0);
+    let (r_icon, icon_sz) = (r_icon0 * pop, icon_sz0 * pop);
     let hit_half = icon_sz * 0.5 + 7.0;
     if (dx * dx + dy * dy).sqrt() > r_icon + hit_half + slack + 4.0 {
         return None;
@@ -9985,6 +10088,11 @@ unsafe fn open_start_menu() {
     if std::env::var_os("RL_STARTDBG").is_some() {
         eprintln!("[start] SendInput -> {}", n);
     }
+}
+
+/// 入场动画还没结束（图标在缩小状态、命中区和画面对不上）→ 点击落空不算"点空白"。
+fn entry_not_settled(st: &State) -> bool {
+    st.entering || unsafe { now_s() } - st.ent0 < 0.34
 }
 
 fn commit(st: &mut State) {
@@ -15629,7 +15737,9 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     st.hit_app = None;
     st.hover_now = None;
     if n > 0 {
-        let (r_icon, icon_sz) = ring_layout(n);
+        let (r_icon0, icon_sz0) = ring_layout(n);
+        let pop = st.pop_drawn.clamp(0.3, 1.0);
+        let (r_icon, icon_sz) = (r_icon0 * pop, icon_sz0 * pop);
         let hit_half = icon_sz * 0.5 + 7.0;
         let rr = (dx * dx + dy * dy).sqrt();
         let mut hit: Option<usize> = None;
@@ -16340,11 +16450,9 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     st.win_x = (sx - canvas() / 2).clamp(vx, vx + vw - canvas());
     st.win_y = (sy - canvas() / 2).clamp(vy, vy + vh - canvas());
 
-    // 呼出时刷新「哪些应用正在运行」+ 每个应用最前面的窗口（圆点 + 悬停预览的数据源）
-    refresh_running(st);
-    // 窗口条目的 live_hwnd 也重新匹配：应用是 PiPie 启动之后才打开的，
-    // 只有启动那一次 restamp 会让胶囊悬停预览一直是空的。
-    restamp_window_hwnds(st);
+    // ⚠️ 运行状态 / 窗口条目匹配都可能枚举窗口 + 解析 .lnk（企业机上 COM 很慢），
+    //    放在呼出前会把"按下到出画面"拖到几百毫秒。先出画面，再补这些重活
+    //    （见 `WM_APP_POSTSHOW`）。
 
     st.active_app = None;
     st.hover_chip = None;
@@ -16417,6 +16525,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     }
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, st.win_x, st.win_y, canvas(), canvas(), SWP_NOACTIVATE);
     frame(st, 255);
+    post(WM_APP_POSTSHOW, 0, 0);
     let _ = SetWindowPos(
         hwnd,
         HWND_TOPMOST,
@@ -16786,6 +16895,15 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         close_menu_now(st);
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_POSTSHOW => {
+            let st = state_of(hwnd);
+            if MENU_OPEN.load(Ordering::Relaxed) && !st.hiding {
+                refresh_running(st);
+                restamp_window_hwnds(st);
+                frame(st, 255);
             }
             LRESULT(0)
         }
@@ -17694,10 +17812,17 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         // 旧逻辑用 st.active_app.is_some() 判定，但 active_app 是粘性的
                         // （移向外环时不丢），结果点屏幕任意位置都会启动当前应用。
                         commit(st);
+                    } else if entry_not_settled(st) {
+                        // 入场动画（图标还在由小变大）期间点空：多半是没打中缩小的图标，
+                        // 不能当成"点空白收菜单"——用户 2026-11-18 报「没完全呼出时
+                        // 点便签/粘贴板打不开」。
+                        st.last_input = unsafe { now_s() };
                     } else {
                         unlock(st);
                         close_menu_now(st);
                     }
+                } else if entry_not_settled(st) {
+                    st.last_input = unsafe { now_s() };
                 } else {
                     unlock(st);
                     close_menu_now(st);
