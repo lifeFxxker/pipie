@@ -275,7 +275,8 @@ const WM_APP_SEARCH_RES: u32 = WM_APP + 62;   // 筛选：IME 上屏
 const WM_APP_SEARCHINFO: u32 = WM_APP + 63;   // 仅测试：筛选状态/命中数/首项
 const WM_APP_SEARCHPOS: u32 = WM_APP + 64;    // 仅测试：0=内环第 w 个命中 / 1=外环第 w 个的屏幕坐标
 const WM_APP_DROPINFO: u32 = WM_APP + 65;
-const WM_APP_POSTSHOW: u32 = WM_APP + 66;      // 呼出后的"重活"：运行状态/窗口条目匹配     // 仅测试：拖放预览状态（ghost/active/suggest/target/应用数）
+const WM_APP_POSTSHOW: u32 = WM_APP + 66;      // 呼出后的"重活"：运行状态/窗口条目匹配
+const WM_APP_SNAPBG: u32 = WM_APP + 67;        // 后台抓桌面完成（玻璃背景）     // 仅测试：拖放预览状态（ghost/active/suggest/target/应用数）
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
                                         // 返回值 = (y << 16) | x
                                         //（单击路径要靠真光标才能触发 update_hover，
@@ -849,6 +850,10 @@ static FORCE_CHIP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::
 /// UI 线程私有状态的**跨线程镜像**。看门狗要定期落状态快照，但不能碰
 /// `&mut State`（跨线程可变引用 = UB），所以 UI 线程每帧把几个关键值推到这里。
 /// `usize::MAX` 表示 None（与 Option<usize> 的判别一致）。
+/// 抓屏慢过一次 → 以后呼出都把抓屏放后台线程（界面先出，玻璃稍后补），
+/// 不再因为"慢"自动退回纸面（用户 2026-11-18：不能随意降级样式）。
+static SNAP_SLOW_MODE: AtomicBool = AtomicBool::new(false);
+static ONESHOT_SNAP: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 static SNAP_HIDING: AtomicBool = AtomicBool::new(false);
 static SNAP_ENTERING: AtomicBool = AtomicBool::new(false);
 static SNAP_PENDING_RM: AtomicBool = AtomicBool::new(false);
@@ -1049,8 +1054,16 @@ struct State {
     /// 「拖进来的东西会加到外环末尾」那个幽灵胶囊的淡入（0..1）。
     /// 没有它 = 幽灵在拖动开始时**瞬间**冒出来，和胶囊的平滑让位对不上。
     chip_ghost_a: f32,
-    /// 拖入内容"认不出宿主"→ 内环要新建的幽灵磁贴（半透明，丢上去才建）
+    /// 拖入内容"认不出宿主"→ 内环要新建的幽灵磁贴（半透明，丢上去才建）。
+    /// ⚠️ 拖拽期间**一直保留**（占住首位槽），只有真正落下/离开才清 —— 见 `drop_outer`。
     drop_ghost: Option<GhostApp>,
+    /// 当前要展示"外环占位"的应用。和 `drop_ghost` **可以同时存在**：
+    /// 幽灵继续占着首位槽（图标不重排），只是**不画**那块磁贴，改成画目标外环的幽灵胶囊。
+    /// 以前是直接清掉 `drop_ghost` → 图标整体让回一格，光标下的图标瞬间换成隔壁，
+    /// 外环跟着一跳一跳（用户 2026-11-18 录像里的"识别不准"就是这个）。
+    drop_outer: Option<usize>,
+    /// 上一次拖放预览的光标位置（窗口坐标）。
+    drop_last_pt: (f32, f32),
     ghost_a: f32,
     /// 上一帧画面的入场缩放（0.62→1）。慢机器上画面会落后于时间——
     /// 命中判定必须按**画出来的**半径算，否则早期点击会打空。
@@ -1619,6 +1632,8 @@ impl State {
             drop_suggest: None,
             chip_ghost_a: 0.0,
             drop_ghost: None,
+            drop_outer: None,
+            drop_last_pt: (-1e9, -1e9),
             ghost_a: 0.0,
             pop_drawn: 1.0,
             dir_inner_lock: false,
@@ -3951,23 +3966,45 @@ unsafe fn snap_glass(st: &mut State, x: i32, y: i32) {
         return;
     }
     let ms = t0.elapsed().as_millis();
-    if ms > CAP_SLOW_MS {
-        let n = SLOW_HITS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= 2 || ms > 400 {
-            // 连续两次都慢（DLP / 审计钩住 GDI）→ 本次运行不再抓，轮盘用纸面
-            CAP_SLOW.store(true, Ordering::Relaxed);
-            perf_line(&format!("PERF snap_glass {ms}ms（连续 {n} 次超过 {CAP_SLOW_MS}ms）→ 本次运行退回纸面 {}", glass_where(x, y)));
-        } else {
-            perf_line(&format!("PERF snap_glass {ms}ms（慢 #1，先不降级）{}", glass_where(x, y)));
-        }
-        return;
+    if ms > 150 {
+        // 只切"后台抓屏"模式，不降级样式：下次呼出先出纸面，玻璃在后台补上
+        SNAP_SLOW_MODE.store(true, Ordering::Relaxed);
+        perf_line(&format!("PERF snap_glass {ms}ms（慢 → 后续改后台抓屏，样式保持玻璃）{}", glass_where(x, y)));
     }
-    SLOW_HITS.store(0, Ordering::Relaxed);
     set_glass_bg(st, build_glass(&raw));
     // 抓屏 + 模糊一共多久（菜单是"按下就出"，这段延迟用户能感觉到）
     if std::env::var_os("RL_GLASSDBG").is_some() || ms > 40 {
         perf_line(&format!("PERF snap_glass {ms}ms {}", glass_where(x, y)));
     }
+}
+
+/// 后台线程抓桌面做玻璃底（不碰 State）。
+/// ⚠️ BitBlt **不带 CAPTUREBLT**：轮盘此时已经显示，带 CAPTUREBLT 会把自己的分层窗口
+/// 一起拍进玻璃里；不带则分层窗口天然被排除。
+unsafe fn capture_glass_bg_async(x: i32, y: i32) -> Option<Vec<u8>> {
+    let (bits, mdc, bmp) = make_dib(canvas(), canvas());
+    if bits.is_null() || mdc.is_invalid() || bmp.is_invalid() {
+        return None;
+    }
+    let sdc = GetDC(None);
+    let mut ok = false;
+    if !sdc.is_invalid() {
+        if BitBlt(mdc, 0, 0, canvas(), canvas(), sdc, x, y, SRCCOPY).is_ok() {
+            ok = true;
+        }
+        let _ = ReleaseDC(None, sdc);
+    }
+    let n = (canvas() * canvas() * 4) as usize;
+    let mut raw = Vec::new();
+    if ok {
+        raw.extend_from_slice(std::slice::from_raw_parts(bits, n));
+    }
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mdc);
+    if !ok || mostly_black(&raw) {
+        return None;
+    }
+    Some(build_glass(&raw))
 }
 
 /// 全黑（平均亮度 ≈ 0）→ 判失败。受保护窗口（DRM 视频 / 银行客户端）就这样，
@@ -6765,6 +6802,72 @@ unsafe fn edit_ime_place(st: &State, hwnd: HWND) {
 // ───────────────────── 拖放识别与入库 ─────────────────────
 
 /// 画布坐标 → 命中 ai 应用的外环胶囊（返回 chip 序号）
+/// 拖放预览/落下专用：外环带里按**角度最近的应用**认"压在它的胶囊上"。
+/// 不走 `chip_layout`：拖放预览会临时把"待添加"幽灵算进胶囊排版，布局一变判定就漂，
+/// 用户看到的就是"指的这颗、亮的是隔壁那颗"。这里只用槽位角度，稳定且够用。
+fn chip_band_app(st: &State, px: f32, py: f32) -> Option<usize> {
+    let n = st.apps.len();
+    if n == 0 {
+        return None;
+    }
+    let (r_in, r_out) = ring_radii(n);
+    let dx = px - cc();
+    let dy = py - cc();
+    let r = (dx * dx + dy * dy).sqrt();
+    if r < r_in - 8.0 || r > r_out + 8.0 {
+        return None;
+    }
+    let step = ring_step(n);
+    if step <= 0.0 {
+        return None;
+    }
+    let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
+    // 应用 ai 的胶囊锚角 = slot_angle(slot_of(ai), n) = ai*step - ring_off*step
+    let off = st.ring_off * step;
+    let k = ((deg + off) / step).round() as i64;
+    let ai = k.rem_euclid(n as i64) as usize;
+    let mut d = deg - (k as f32 * step - off);
+    d = ((d + 180.0).rem_euclid(360.0)) - 180.0;
+    if d.abs() > step * 0.5 + 3.0 {
+        return None;
+    }
+    (!st.apps[ai].items.is_empty()).then_some(ai)
+}
+
+/// 只按**真实条目**排的胶囊命中（不含"待添加"幽灵）。
+/// 拖放预览里判断「光标在不在胶囊上」必须用它：`chip_layout` 会临时把幽灵算进去，
+/// 幽灵一出现胶囊整体重排，判定会把用户正指着的那颗胶囊判空 → 内环/外环来回闪。
+fn hit_chip_at_plain(st: &State, ai: usize, px: f32, py: f32) -> Option<usize> {
+    if ai >= st.apps.len() {
+        return None;
+    }
+    let m = st.apps[ai].items.len();
+    if m == 0 {
+        return None;
+    }
+    let names: Vec<String> = (0..m).map(|j| chip_name_of(st, ai, j)).collect();
+    let (cap, _page, start) = chip_page_window(st, ai, &names, false);
+    let end = (start + cap).min(m);
+    let segs = chip_segs_of(st, ai, &names[start..end]);
+    let (r_in, r_out) = ring_radii(st.apps.len());
+    let dx = px - cc();
+    let dy = py - cc();
+    let r = (dx * dx + dy * dy).sqrt();
+    let tol = 6.0;
+    if r < r_in - tol || r > r_out + tol {
+        return None;
+    }
+    let th = dx.atan2(-dy).to_degrees();
+    for (j, (a1, a2)) in segs.iter().enumerate() {
+        let mut d = th - (a1 + a2) * 0.5;
+        d = ((d + 180.0).rem_euclid(360.0)) - 180.0;
+        if d.abs() <= (a2 - a1) * 0.5 + 4.0 {
+            return Some(start + j);
+        }
+    }
+    None
+}
+
 fn hit_chip_at(st: &State, ai: usize, px: f32, py: f32) -> Option<usize> {
     // 与绘制共用同一套几何：**极坐标判定**（半径落在环带内、角度落在该段内）。
     // 梯形段是「两条直的径向边 + 内外弧」，极坐标判定与它天然吻合，
@@ -6907,24 +7010,30 @@ fn nearest_app(st: &State, px: f32, py: f32, slack: f32) -> Option<usize> {
     let dx = px - cc();
     let dy = py - cc();
     let (r_icon0, icon_sz0) = ring_layout(n);
+    // ⚠️ 命中**不能只绑"上一帧画出来的缩放"**：企业机掉帧时 pop_drawn 会停在小的值，
+    //    之后所有命中都打空（用户 2026-11-18 报「拖到哪个图标都只出同一个外环、
+    //    目录占位要晃好几次才出来」）。这里全尺寸与实际缩放**两者取其一**都算命中。
     let pop = st.pop_drawn.clamp(0.3, 1.0);
-    let (r_icon, icon_sz) = (r_icon0 * pop, icon_sz0 * pop);
-    let hit_half = icon_sz * 0.5 + 7.0;
-    if (dx * dx + dy * dy).sqrt() > r_icon + hit_half + slack + 4.0 {
+    let reach = |scale: f32| -> f32 {
+        let r = r_icon0 * scale;
+        r + (icon_sz0 * scale * 0.5 + 7.0) + slack + 4.0
+    };
+    let rr = (dx * dx + dy * dy).sqrt();
+    if rr > reach(1.0).max(reach(pop)) {
         return None;
     }
     let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
     let slot = slot_at_deg(st, deg, n)?;
     let i = app_of_slot(st, slot)?;
-    // 中心距按**显示槽位**算（滚动 / 幽灵让位后图标并不在自己的下标角度上）
-    let (ix, iy) = polar(r_icon - scroll_sink() * (1.0 - slot_appear(slot_of(st, slot), n)),
+    let (ix, iy) = polar(r_icon0 - scroll_sink() * (1.0 - slot_appear(slot_of(st, slot), n)),
         slot_angle(slot_of(st, slot), n));
-    let d = ((px - ix) * (px - ix) + (py - iy) * (py - iy)).sqrt();
-    if d <= hit_half + slack {
-        Some(i)
-    } else {
-        None
-    }
+    let (px2, py2) = polar((r_icon0 * pop) - scroll_sink() * (1.0 - slot_appear(slot_of(st, slot), n)),
+        slot_angle(slot_of(st, slot), n));
+    let d_full = ((px - ix) * (px - ix) + (py - iy) * (py - iy)).sqrt();
+    let d_pop = ((px - px2) * (px - px2) + (py - py2) * (py - py2)).sqrt();
+    let ok = d_full <= (icon_sz0 * 0.5 + 7.0) + slack
+        || d_pop <= (icon_sz0 * pop * 0.5 + 7.0) + slack;
+    ok.then_some(i)
 }
 
 /// 拖拽落点（内环）＝按**角度吸附**到最近的应用槽位。
@@ -7227,7 +7336,11 @@ fn move_app_to_front(st: &mut State, target: &str) {
     if target.is_empty() {
         return;
     }
-    if let Some(pi) = st.apps.iter().position(|a| a.target.eq_ignore_ascii_case(target)) {
+    let want_exe = exe_name_of(target);
+    if let Some(pi) = st.apps.iter().position(|a| {
+        a.target.eq_ignore_ascii_case(target)
+            || (want_exe.is_some() && exe_name_of(&a.target) == want_exe)
+    }) {
         if pi > 0 {
             let e = st.apps.remove(pi);
             st.apps.insert(0, e);
@@ -7293,6 +7406,87 @@ fn compute_drop_preview(st: &mut State, items: &[DropItem]) {
 /// 拖拽会话边界（进入/离开/落下）→ 失效预览缓存。
 fn drop_preview_invalidate() {
     *PREVIEW_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 按**当前** OLE 坐标刷新拖放预览：内环占位 / 目标应用的外环占位 / 「发送」胶囊。
+///
+/// 调用点两处：`WM_APP_DRAGEVENT`（真实事件）和每帧动画。
+/// ⚠️ 为什么每帧也要调：OLE 的 `DragOver` **只在鼠标移动时**回调。光标停在图标上不动时，
+/// 状态就永远停在"进入前那一格" —— 用户看到的就是"停在图标上却还是内环占位 = 没识别到"
+/// （2026-11-19 录像）。这里只做几次浮点运算 + 一次 3px 命中，不是性能瓶颈。
+fn drop_preview_refresh(st: &mut State) {
+    if !st.drop_mode {
+        return;
+    }
+    let (sx, sy) = unpack_pt(DROP_PT.load(Ordering::Relaxed));
+    let px = (sx - st.win_x) as f32;
+    let py = (sy - st.win_y) as f32;
+    let items = DROP_PAYLOAD.lock().map(|q| q.clone()).unwrap_or_default();
+    // 认得宿主 / 文件夹 hub / 浏览器 hub → 高亮它（同会话内走缓存）
+    compute_drop_preview(st, &items);
+    // ── 占位规则（用户 2026-11-18/19 最终口径）────────────────────────────
+    //   · 进盘默认：**内环占位**（不论拖的是应用还是文件夹）
+    //   · 压到内环**应用图标**（或它的外环胶囊）→ 那个应用的外环占位
+    //   · 回到头像 / 盘内其它位置 → 回到内环占位
+    // 纯按当前光标算，不保存任何"上一格"状态 —— 识别必须即时。
+    let band_ai = chip_band_app(st, px, py);
+    // 图标命中 = **贴住图标本体**（图标半径 + 15px 容差）。
+    // ⚠️ 别在"有内环占位"时再收紧（以前收到 0.42×图标边长，比图标本体还小，
+    //    光标压在图标边缘/上下沿全判空 —— 2026-11-19 录像里"贴着图标拖半天没反应"）。
+    //    图标之间的缝仍然不算（缝留给"新建内环"占位）。
+    let icon_ai = nearest_app(st, px, py, 8.0);
+    let outer_target = band_ai.or(icon_ai);
+    if let Some(ai) = outer_target {
+        // 幽灵**不清**：它继续占着首位槽，环内图标不重排 —— 光标下的图标不会因为
+        // 一次识别就换成隔壁（那就是"识别不准"的体感来源）。只是这一帧起不画那块
+        // 磁贴，改画目标外环的幽灵胶囊。
+        st.drop_outer = Some(ai);
+        st.drop_target_app = Some(ai);
+        st.drop_suggest = Some(ai);
+        st.active_app = Some(ai);
+    } else {
+        st.drop_outer = None;
+        st.drop_suggest = None;
+        st.drop_target_app = None;
+        st.active_app = None;
+        // 内环占位：应用 → 宿主/载荷自身；文件夹 → 目录自身（都在首位）
+        if st.drop_ghost.is_none() && st.apps.len() < MAX_APPS {
+            if let Some(it) = items.iter().find(|it| !it.is_url) {
+                let (nm, tg, icon) = if it.is_dir {
+                    (it.name.clone(), it.target.clone(), drop_icon_cached(&it.target))
+                } else if let Some(exe) = unsafe { resolve_host_exe(it) } {
+                    let nm = host_app_index(st, &exe)
+                        .and_then(|ai| st.apps.get(ai))
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| clamp_name(&it.name));
+                    (nm, exe.clone(), drop_icon_cached(&exe))
+                } else {
+                    (it.name.clone(), it.target.clone(), drop_icon_cached(&it.target))
+                };
+                st.drop_ghost = Some(GhostApp { name: nm, target: tg, put_items: false, icon });
+            }
+        }
+    }
+    // 「发送」胶囊：拖到某个内环上且载荷能发送（文件/文件夹/网址）→
+    // 外环末尾多一颗「发送」，拖进去 = 用该应用打开。
+    if !DRAG_SEND_ENABLED {
+        st.drop_send = None;
+    } else if st.drop_send.as_ref().map(|(a, _)| *a) != st.drop_target_app {
+        st.drop_send = None;
+        if let Some(ai) = st.drop_target_app {
+            if drop_payload_sendable(&items) {
+                if let Some(exe) = st
+                    .apps
+                    .get(ai)
+                    .and_then(|a| unsafe { resolve_target_exe(&a.target) })
+                {
+                    st.drop_send = Some((ai, exe));
+                }
+            }
+        }
+    }
+    // 文件悬停在环上 = 收下前的「忙碌」；drag_step 在拖放开始时可能设过「紧张」
+    set_mood(st, 0);
 }
 
 fn compute_drop_preview_body(st: &mut State, items: &[DropItem]) {
@@ -8336,6 +8530,7 @@ unsafe fn arm_window_capture(st: &mut State, hw: HWND) {
     });
     st.drop_suggest = None;
     st.drop_ghost = None;
+    st.drop_outer = None;
     // Explorer 文件夹窗口 → 预览就高亮「文件夹」hub（别再浮 explorer 幽灵）。
     let hub = if is_explorer_exe(&exe) { folder_hub_index(st) } else { None };
     match hub.or_else(|| host_app_index(st, &exe)) {
@@ -13581,23 +13776,26 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
     let (r_in, r_out) = ring_radii(st.apps.len());
     let (a1, a2) = seg;
     let mid = (a1 + a2) * 0.5;
-    let col = mixc(pal.paper, pal.ink, 0.50);
+    // ① 半透明胶囊底：跟真胶囊同形。只画虚线时在粉色盘面上几乎看不见，
+    //    用户 2026-11-19 录像里"外环占位"根本认不出来 = 等于没反馈。
+    draw_ring_sector(buf, pal, r_in, r_out, (mid, a1, a2), 0.0, 0.62 * alpha, 0, None);
+    let col = mixc(pal.paper, pal.ink, 0.72);
     let lt = 1.5 * k();
-    // ① 内外弧虚线
+    // ② 内外弧虚线
     let dashes = (((a2 - a1) / 7.0).round() as usize).clamp(3, 7);
-    dashed_arc(buf, r_in, a1, a2, dashes, col, 0.95 * alpha, lt);
-    dashed_arc(buf, r_out, a1, a2, dashes, col, 0.95 * alpha, lt);
-    // ② 两条径向直边虚线（沿半径方向摆小条）
+    dashed_arc(buf, r_in, a1, a2, dashes, col, alpha, lt);
+    dashed_arc(buf, r_out, a1, a2, dashes, col, alpha, lt);
+    // ③ 两条径向直边虚线（沿半径方向摆小条）
     let nd = 4usize;
     let dr = (r_out - r_in) / nd as f32;
     for side in [a1, a2] {
         for k in 0..nd {
             let t = r_in + dr * (k as f32 + 0.5);
             let (x, y) = polar(t, side);
-            rot_rrect(buf, x, y, dr * 0.26, lt * 0.5, lt * 0.5, side.to_radians(), col, 0.95 * alpha);
+            rot_rrect(buf, x, y, dr * 0.26, lt * 0.5, lt * 0.5, side.to_radians(), col, alpha);
         }
     }
-    // ③ 段内：＋（占图标位）+ 名字（沿弧排，与真胶囊同一套排版与截断）
+    // ④ 段内：＋（占图标位）+ 名字（沿弧排，与真胶囊同一套排版与截断）
     let r_mid = (r_in + r_out) * 0.5;
     let half = ((a2 - a1).to_radians() * 0.5 * r_mid).max(6.0);
     let place = |lx: f32| -> (f32, f32, f32) {
@@ -13607,9 +13805,18 @@ unsafe fn draw_ghost_chip(st: &State, buf: &mut [u8], pal: &Pal, seg: (f32, f32)
     };
     let (ppx, ppy, pang) = place(-half + chip_pad_l() + chip_icon() * 0.5);
     let arm = chip_icon() * 0.36;
-    rot_rrect(buf, ppx, ppy, arm, lt, lt, pang.to_radians(), col, 0.95 * alpha);
-    rot_rrect(buf, ppx, ppy, lt, arm, lt, pang.to_radians(), col, 0.95 * alpha);
-
+    rot_rrect(buf, ppx, ppy, arm, lt, lt, pang.to_radians(), col, alpha);
+    rot_rrect(buf, ppx, ppy, lt, arm, lt, pang.to_radians(), col, alpha);
+    let (cjk, lat) = (14.0 * k() * KC, 7.5 * k() * KC);
+    let avail = (2.0 * half - chip_pad_l() - chip_icon() - chip_gap() - chip_pad_r() + 1.0).max(10.0);
+    let label = fit_chip_label(name, avail, cjk, lat);
+    if !label.is_empty() {
+        let textw = est_text_w(&label, cjk, lat);
+        let (tx, ty, tang) = place(-half + chip_pad_l() + chip_icon() + chip_gap() + textw * 0.5);
+        let a8 = (255.0 * alpha).clamp(0.0, 255.0) as u8;
+        draw_text_rot(st, buf, tx, ty, &label, RING_NAME_PX, tang.to_radians(),
+                      pal.ink.0, pal.ink.1, pal.ink.2, a8);
+    }
 }
 
 /// 「发送」胶囊：实心墨底 + 居中「发送」，和虚线幽灵胶囊（＋ 添加）明确区分。
@@ -15673,6 +15880,11 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     if st.hiding {
         return;
     }
+    // 拖放期间外环/高亮**只由拖放预览决定**。否则鼠标钩子的 hover 会和预览互相覆盖，
+    // 表现就是「拖到哪都闪上一格的外环」（用户 2026-11-18 录像）。
+    if st.drop_mode {
+        return;
+    }
     let px = sx - st.win_x;
     let py = sy - st.win_y;
     // 更新条 / 弹窗优先级最高：命中它们时不要再高亮/启动下面的应用
@@ -15739,22 +15951,19 @@ fn update_hover(st: &mut State, sx: i32, sy: i32) {
     if n > 0 {
         let (r_icon0, icon_sz0) = ring_layout(n);
         let pop = st.pop_drawn.clamp(0.3, 1.0);
-        let (r_icon, icon_sz) = (r_icon0 * pop, icon_sz0 * pop);
-        let hit_half = icon_sz * 0.5 + 7.0;
+        let hit_half = icon_sz0 * 0.5 + 7.0;
         let rr = (dx * dx + dy * dy).sqrt();
         let mut hit: Option<usize> = None;
-        if rr <= r_icon + hit_half + 4.0 * k() {
+        if rr <= r_icon0 + hit_half * pop.max(1.0) + 4.0 * k() {
             let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
-            // 只认真正显示出来的那一格（`app_at_deg` 与绘制共用同一份槽位换算）
             if let Some(i) = app_at_deg(st, deg, n) {
                 let s = display_slot_of_app(st, i);
-                let (ix, iy) = polar(
-                    r_icon - scroll_sink() * (1.0 - slot_appear(s, n)),
-                    slot_angle(s, n),
-                );
-                let ddx = px as f32 - ix;
-                let ddy = py as f32 - iy;
-                if (ddx * ddx + ddy * ddy).sqrt() <= hit_half {
+                let sink = scroll_sink() * (1.0 - slot_appear(s, n));
+                let (fx, fy) = polar(r_icon0 - sink, slot_angle(s, n));
+                let (qx, qy) = polar(r_icon0 * pop - sink, slot_angle(s, n));
+                let df = ((px as f32 - fx).powi(2) + (py as f32 - fy).powi(2)).sqrt();
+                let dq = ((px as f32 - qx).powi(2) + (py as f32 - qy).powi(2)).sqrt();
+                if df <= hit_half || dq <= icon_sz0 * pop * 0.5 + 7.0 {
                     hit = Some(i);
                 }
             }
@@ -15937,6 +16146,13 @@ unsafe fn on_timer(st: &mut State) {
         }
     }
 
+    // ── 拖拽中：每帧按最新 OLE 坐标重算预览 ──
+    // DragOver 只在鼠标移动时回调；光标停在图标上不动时状态会永远停在上一格
+    // → 用户看到"明明压在图标上却没切外环"。这里每帧重算一次（几次浮点运算）。
+    if st.drop_mode {
+        drop_preview_refresh(st);
+    }
+
     // ── 闲置自动收起（安全阀）──
     // 菜单开着却没有关闭路径时，它会一直悬着：此后每个鼠标事件都要先穿过
     // 我们的钩子判断一遍，用户感觉像「鼠标被什么吸住了」。
@@ -15971,7 +16187,7 @@ unsafe fn on_timer(st: &mut State) {
     let mut moving = false;
     // ── 幽灵磁贴淡入/淡出（位置跟光标，不需要插值）──
     {
-        let ga_t = if st.drop_ghost.is_some() { 1.0 } else { 0.0 };
+        let ga_t = if st.drop_ghost.is_some() && st.drop_outer.is_none() { 1.0 } else { 0.0 };
         let d = ga_t - st.ghost_a;
         if d.abs() > 0.004 {
             st.ghost_a += d * 0.26;
@@ -16458,8 +16674,10 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     st.hover_chip = None;
     // 呼出时清掉上一轮拖放预览（正常流程 DragLeave/Drop 已清，这里是兜底）
     st.drop_ghost = None;
+    st.drop_outer = None;
     st.drop_suggest = None;
     st.drop_target_app = None;
+    st.drop_last_pt = (-1e9, -1e9);
     st.drop_mode = false;
     st.ghost_a = 0.0;
     st.dir_inner_lock = false;
@@ -16518,8 +16736,21 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     //    真正从屏幕上撤下去要等 DWM 下一次合成 —— 不等就会抓到自己的残影，
     //    玻璃里套着一圈盘（这种 bug 很难从截图上看出来）。
     if st.glass && !st.upd_only {
-        let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-        snap_glass(st, st.win_x, st.win_y);
+        if SNAP_SLOW_MODE.load(Ordering::Relaxed) || glass_env("RL_GLASS_ASYNC") {
+            // 慢机器：先出画面，玻璃底后台补（不降级样式）
+            let (gx, gy) = (st.win_x, st.win_y);
+            std::thread::spawn(move || unsafe {
+                if let Some(buf) = capture_glass_bg_async(gx, gy) {
+                    if let Ok(mut s) = ONESHOT_SNAP.lock() {
+                        *s = Some(buf);
+                    }
+                    post(WM_APP_SNAPBG, 0, 0);
+                }
+            });
+        } else {
+            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            snap_glass(st, st.win_x, st.win_y);
+        }
     } else if !st.glass_bg.is_empty() {
         set_glass_bg(st, Vec::new());
     }
@@ -16650,6 +16881,7 @@ unsafe fn close_menu_now(st: &mut State) {
     // 不启动应用**（用户 2026-10-12 实测）。
     st.drop_mode = false;
     st.drop_target_app = None;
+    st.drop_outer = None;
     st.drop_send = None;
     st.drop_suggest = None;
     st.drop_ghost = None;
@@ -16898,6 +17130,17 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_APP_SNAPBG => {
+            let st = state_of(hwnd);
+            let buf = ONESHOT_SNAP.lock().ok().and_then(|mut g| g.take());
+            if let Some(buf) = buf {
+                if MENU_OPEN.load(Ordering::Relaxed) && !st.hiding && st.glass {
+                    set_glass_bg(st, buf);
+                    frame(st, 255);
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_POSTSHOW => {
             let st = state_of(hwnd);
             if MENU_OPEN.load(Ordering::Relaxed) && !st.hiding {
@@ -16910,23 +17153,61 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_APP_DROPINFO => {
             let st = state_of(hwnd);
             let v = match w.0 as u32 {
-                0 => st.drop_ghost.is_some() as usize,
+                // 0 = **可见的**内环占位（幽灵在、且没切到外环占位）
+                0 => (st.drop_ghost.is_some() && st.drop_outer.is_none()) as usize,
                 1 => st.active_app.map(|a| a + 1).unwrap_or(0),
                 2 => st.drop_suggest.map(|a| a + 1).unwrap_or(0),
                 3 => st.drop_target_app.map(|a| a + 1).unwrap_or(0),
                 4 => st.apps.len(),
-                6 => {
-                    let n = eff_apps(st);
-                    let (r_icon, _) = ring_layout(n);
-                    r_icon as usize
+                6 => st.dir_inner_lock as usize,
+                9 => st.drop_outer.map(|a| a + 1).unwrap_or(0),
+                8 => {
+                    // 测试：用最近一次拖放坐标重算「压在哪颗胶囊上」
+                    let (sx, sy) = unpack_pt(DROP_PT.load(Ordering::Relaxed));
+                    let px = (sx - st.win_x) as f32;
+                    let py = (sy - st.win_y) as f32;
+                    (0..st.apps.len().min(256))
+                        .find(|&ai| hit_chip_at(st, ai, px, py).is_some())
+                        .map(|ai| ai + 1)
+                        .unwrap_or(0)
                 }
+                7 => (st.pop_drawn * 100.0) as usize,
                 // 5 = 幽灵/应用在屏幕上的**显示位置**（按画出来的槽位算，含幽灵让位）
                 5 => {
                     let (cx, cy) = ghost_pos(st);
                     ((((cy + st.win_y as f32) as i32) << 16)
                         | (((cx + st.win_x as f32) as i32) & 0xFFFF)) as usize
                 }
+                x if x >= 300 => {
+                    // 300+ai = 第 ai 与 ai+1 个图标之间的**角缝**（图标半径上）屏幕坐标
+                    let ai = (x - 300) as usize;
+                    let n = st.apps.len();
+                    if n == 0 {
+                        0
+                    } else {
+                        let (r, _) = ring_layout(n);
+                        let a = slot_angle(slot_of(st, ai % n) + 0.5, n);
+                        let (cx, cy) = polar(r, a);
+                        ((((cy + st.win_y as f32) as i32) << 16)
+                            | (((cx + st.win_x as f32) as i32) & 0xFFFF)) as usize
+                    }
+                }
+                x if x >= 200 => {
+                    // 200+ai = 该应用**外环胶囊环带中线**的屏幕坐标（测试点胶囊用）
+                    let ai = (x - 200) as usize;
+                    if ai >= st.apps.len() {
+                        0
+                    } else {
+                        // ⚠️ 槽距/半径都按**真实应用数**（和 chip_layout 同源），不受幽灵影响
+                        let n = st.apps.len();
+                        let (r_in, r_out) = ring_radii(n);
+                        let (cx, cy) = polar((r_in + r_out) * 0.5, slot_angle(slot_of(st, ai), n));
+                        ((((cy + st.win_y as f32) as i32) << 16)
+                            | (((cx + st.win_x as f32) as i32) & 0xFFFF)) as usize
+                    }
+                }
                 x if x >= 100 => {
+                    // 100+ai = 应用**显示槽位**的屏幕坐标（含幽灵让位）
                     let ai = (x - 100) as usize;
                     if ai >= st.apps.len() {
                         0
@@ -16981,154 +17262,21 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         drop_preview_invalidate();
                         st.dir_inner_lock = false;
                     }
-                    let items = DROP_PAYLOAD.lock().map(|q| q.clone()).unwrap_or_default();
-                    // ⚠️ 命中必须在 `compute_drop_preview` **之前**算：它可能当场塞一个
-                    // 幽灵，幽灵占首位会让槽位整体 +1，之后再算命中就错一格。
-                    let n_ap = st.apps.len();
-                    let over_hit = drop_force_app(st, sx, sy).filter(|&a| a < n_ap);
-                    st.drop_target_app = over_hit
-                        .or_else(|| drop_slot_app(st, px, py).filter(|&a| a < n_ap))
-                        .or_else(|| drop_band_app(st, px, py));
-                    compute_drop_preview(st, &items);
-                    // 应用（exe/lnk）载荷：**只有压在图标/胶囊上**才算"进它外环"；
-                    // 盘内空白（含图标之间的缝）一律当作"新建内环" → 要出内环占位。
-                    // 文件/网址保留原来的"扇区归属"。
-                    let payload_app = items
-                        .first()
-                        .map(|it| exe_name_of(&it.target).is_some())
-                        .unwrap_or(false);
-                    if payload_app {
-                        st.drop_target_app = over_hit;
-                    }
-                    // ── 内环占位 vs 外环占位：**同一时刻只画一个**（用户 2026-11-17 定）──
-                    //   压在外环胶囊 / 内环应用上 → 画那个应用的外环插入占位，隐藏内环占位；
-                    //   回到内环空白处 → 画内环占位（固定在首位）。
-                    //   目录默认归「文件夹」hub 的外环；压在**非文件夹**应用上才自己进内环首位。
-                    let (r_in, r_out) = ring_radii(n_ap);
-                    let dx = px - cc();
-                    let dy = py - cc();
-                    let rad = (dx * dx + dy * dy).sqrt();
-                    let on_chip = if rad >= r_in - 8.0 && rad <= r_out + 8.0 {
-                        st.apps
-                            .iter()
-                            .enumerate()
-                            .take(n_ap.min(MAX_APPS))
-                            .filter(|(_, a)| !a.items.is_empty())
-                            .any(|(ai, _)| hit_chip_at(st, ai, px, py).is_some())
-                    } else {
-                        false
-                    };
-                    let payload_dir = items.iter().any(|it| it.is_dir);
-                    let over = st.drop_target_app.filter(|&a| a < n_ap);
-                    let hub = folder_hub_index(st);
-                    // 光标正压在**幽灵自己那一格**上（幽灵占首位）→ 不能把它切走，
-                    // 否则"新建"占位会一闪一闪。
-                    let on_ghost = if st.drop_ghost.is_some() {
-                        let n = eff_apps(st);
-                        let (r_icon, icon_sz) = ring_layout(n);
-                        let rr = (dx * dx + dy * dy).sqrt();
-                        let deg = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
-                        let s = slot_of(st, 0);
-                        let mut d = slot_angle(s, n) - deg;
-                        d = (d + 180.0).rem_euclid(360.0) - 180.0;
-                        rr <= r_icon + icon_sz * 0.5 + 10.0
-                            && d.abs() <= ring_step(n) * 0.5 + 2.0
-                    } else {
-                        false
-                    };
-                    // 目录：进了内环占位模式就锁住（on_chip 才解锁），否则让位后
-                    // 命中会在隔壁应用之间来回跳，占位闪烁。
-                    if on_chip {
-                        st.dir_inner_lock = false;
-                    } else if payload_dir && !on_ghost {
-                        if !st.dir_inner_lock {
-                            let (r_icon, icon_sz) = ring_layout(eff_apps(st));
-                            let off_band = rad < (r_icon - icon_sz * 0.5 - 10.0)
-                                || rad > r_out + 8.0;
-                            let non_folder = over.map(|a| !app_is_folder_like(st, a)).unwrap_or(false);
-                            // 只在「压在内环非文件夹应用上」时进入内环模式；
-                            // 盘心/外环带保持默认（文件夹 hub 外环）
-                            if non_folder && !off_band {
-                                st.dir_inner_lock = true;
-                            }
-                        } else {
-                            // 已经锁定：只要还在盘内（没到外环带）就保持
-                            if rad > r_out + 8.0 {
-                                st.dir_inner_lock = false;
-                            }
-                        }
-                    }
-                    let dir_inner = payload_dir && !on_chip && !on_ghost && st.dir_inner_lock;
-                    // 外环占位目标：Some(ai) = 显示 ai 的外环插入插槽、隐藏内环占位
-                    let outer_target: Option<usize> = if on_chip {
-                        over
-                    } else if payload_dir {
-                        if dir_inner { None } else { hub }
-                    } else {
-                        over
-                    };
-                    if on_ghost {
-                        // 就在幽灵上：保持内环占位，外环占位收起
-                        st.drop_suggest = None;
-                        st.active_app = None;
-                    } else if dir_inner {
-                        // 目录压在内环非文件夹应用上 → 自己进内环首位
-                        st.drop_suggest = None;
-                        if st.apps.len() < MAX_APPS {
-                            if let Some(it) = items.iter().find(|it| it.is_dir) {
-                                st.drop_ghost = Some(GhostApp {
-                                    name: it.name.clone(),
-                                    target: it.target.clone(),
-                                    put_items: false,
-                                    icon: drop_icon_cached(&it.target),
-                                });
-                            }
-                        }
-                        st.active_app = None;
-                    } else if let Some(ai) = outer_target {
-                        // 显示该应用的外环插槽：内环占位隐藏
-                        st.drop_ghost = None;
-                        st.drop_suggest = Some(ai);
-                        st.active_app = Some(ai);
-                    } else {
-                        // 内环空白/盘心：应用类载荷保留 compute 决定的「新建」幽灵（固定画在首位）
-                        st.drop_suggest = None;
-                        st.active_app = None;
-                    }
-                    // 「发送」胶囊：拖到某个内环上且载荷能发送（文件/文件夹/网址）→
-                    // 外环末尾多一颗「发送」，拖进去 = 用该应用打开。
-                    if !DRAG_SEND_ENABLED {
-                        st.drop_send = None;
-                    } else if w.0 == 0
-                        || st.drop_send.as_ref().map(|(a, _)| *a) != st.drop_target_app
-                    {
-                        st.drop_send = None;
-                        if let Some(ai) = st.drop_target_app {
-                            if drop_payload_sendable(&items) {
-                                if let Some(exe) = st
-                                    .apps
-                                    .get(ai)
-                                    .and_then(|a| unsafe { resolve_target_exe(&a.target) })
-                                {
-                                    st.drop_send = Some((ai, exe));
-                                }
-                            }
-                        }
-                    }
                     // ⚠️ 拖拽期间**绝不自动滚页**：以前为了让「新建内环」幽灵可见去 reveal，
                     //    结果用户一拖进来轮盘就跳到尾页、滚轮还被拉回去（2026-11-13）。
                     //    幽灵在当前页就画，不在就不画；落点逻辑不依赖它可见。
-                    // 文件悬停在环上 = 收下前的「忙碌」；drag_step 在拖放开始时
-                    // 可能设过「紧张」，进环就放松下来
-                    set_mood(st, 0);
-
+                    drop_preview_refresh(st);
                 }
                 // 离开环区域
                 2 => {
                     st.drop_target_app = None;
+                    st.drop_outer = None;
                     st.drop_send = None;
                     st.drop_suggest = None;
                     st.drop_ghost = None;
+                    // 离开就结束预览态：否则每帧刷新会按**旧坐标**把占位重新画出来
+                    // （光标已经出环了，占位还赖在环上 = 幽灵收不掉）。
+                    st.drop_mode = false;
                     st.dir_inner_lock = false;
                     drop_preview_invalidate();
                     set_mood(st, 0);
@@ -17169,13 +17317,20 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     DROP_MODE_ARMED.store(false, Ordering::SeqCst);
                     st.drop_mode = false;
                     st.drop_target_app = None;
+                    let preview_outer = st.drop_outer.take();
                     // ⚠️ 必须在 take 幽灵**之前**算落点：幽灵在场时按 n+1 排布，
                     //    幽灵槽的索引 = apps.len()。take 之后再算就退回 n 排布、永远命中不到。
                     let n_ap = st.apps.len();
                     let over_slot = drop_slot_app(st, px, py);
                     // 归属优先看**光标下是谁**：内环图标 / 它的外环胶囊 / 图标缝；
                     // 都没有才按识别结果（文件夹/浏览器宿主）落地。
-                    let over_hit = drop_force_app(st, sx, sy).filter(|&a| a < n_ap);
+                    let band_ai_d = chip_band_app(st, px, py);
+                    // 应用载荷只认**图标本体 / 胶囊**（缝里 = 新建），和预览同一条判定；
+                    // 预览已经识别到谁，落下就归谁（坐标抖动也不至于落空）。
+                    let over_hit = band_ai_d
+                        .or_else(|| nearest_app(st, px, py, 8.0))
+                        .or(preview_outer)
+                        .filter(|&a| a < n_ap);
                     let payload_app = items
                         .first()
                         .map(|it| exe_name_of(&it.target).is_some())
@@ -17188,17 +17343,14 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                             .or_else(|| over_slot.filter(|&a| a < n_ap))
                             .or_else(|| drop_band_app(st, px, py))
                     };
-                    // 目录压在内环的非文件夹应用上（且不在它的外环胶囊上）→ 目录自己进内环首位
+                    let ghost = st.drop_ghost.take();
+                    let suggest = st.drop_suggest.take();
+                    // 目录压在内环的**非文件夹**应用上（且不在外环胶囊上）→ 目录自己进内环首位
+                    // （用户 2026-11-05 定；和预览的"此时保持内环占位"是同一条规则）。
                     let dir_top = items.iter().any(|it| it.is_dir)
                         && (0..n_ap.min(MAX_APPS))
                             .all(|ai| hit_chip_at(st, ai, px, py).is_none())
-                        && (st.dir_inner_lock
-                            || over_app
-                                .map(|a| !app_is_folder_like(st, a))
-                                .unwrap_or(false));
-                    let ghost = st.drop_ghost.take();
-                    st.dir_inner_lock = false;
-                    let suggest = st.drop_suggest.take();
+                        && over_app.map(|a| !app_is_folder_like(st, a)).unwrap_or(false);
                     // 落点优先级：**正好压在幽灵槽上 → 建幽灵**；压在某个已有内环上 → 进它外环；
                     // 其余任何位置（含盘心头像/空白）→ 按识别结果落地（有幽灵就建、否则归宿主）。
                     // ⚠️ 曾经要求"必须精确丢到幽灵/高亮磁贴上"，结果用户丢到头像上 = 无操作，
@@ -17222,8 +17374,20 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         // 认得出的宿主 / 文件夹 hub → 进它外环
                         process_drop(st, &items, Some(sai), false)
                     } else if let Some(g) = ghost {
-                        created = Some(g.target.clone());
-                        create_from_ghost(st, &items, &g)
+                        if payload_app && host_app_index(st, &g.target).is_some() {
+                            // 已在环上的应用：把它挪到首位（和新建一样给用户"落在最前"
+                            // 的确定结果），不再重复落一条。
+                            let name = host_app_index(st, &g.target)
+                                .and_then(|ai| st.apps.get(ai))
+                                .map(|a| a.name.clone())
+                                .unwrap_or_default();
+                            move_app_to_front(st, &g.target);
+                            say(st, &format!("已移到首位：{}", name), "", 1.6);
+                            DropResult { added: 1, full: false, item_full: false }
+                        } else {
+                            created = Some(g.target.clone());
+                            create_from_ghost(st, &items, &g)
+                        }
                     } else {
                         // 载荷本身是应用（exe/lnk）→ 经典「拖进来加个内环」；已在环里则去重跳过
                         let is_app = items
