@@ -275,6 +275,19 @@ const WM_APP_SEARCH_RES: u32 = WM_APP + 62;   // 筛选：IME 上屏
 const WM_APP_SEARCHINFO: u32 = WM_APP + 63;   // 仅测试：筛选状态/命中数/首项
 const WM_APP_SEARCHPOS: u32 = WM_APP + 64;    // 仅测试：0=内环第 w 个命中 / 1=外环第 w 个的屏幕坐标
 const WM_APP_DROPINFO: u32 = WM_APP + 65;
+/// 仅测试：检索卡片状态（0=命中数 1=选中 2=查询长度 3=索引就绪 4=索引条数 5=窗口可见）
+const WM_APP_SRINFO: u32 = WM_APP + 71;
+/// 仅测试：打开检索卡片（等价于点轮盘上的「检索」入口）
+const WM_APP_SROPEN: u32 = WM_APP + 72;
+/// 仅测试：预览卡片状态（0 显示 1 kind 2 文本行数 3 图宽 4 图高）
+const WM_APP_PVINFO: u32 = WM_APP + 78;
+/// 仅测试：打开当前结果的第 w 行预览
+const WM_APP_SRPREVIEW: u32 = WM_APP + 79;
+const WM_APP_SRTYPE: u32 = WM_APP + 81;
+/// 仅测试：强制悬停到应用 w（外环展开），不注入真实鼠标
+const WM_APP_HOVERSIM: u32 = WM_APP + 75;
+/// 仅测试：网址条目的图标状态（w=app 下标；每位 3bit：has_host / cache / icon）
+const WM_APP_FAVSTAT: u32 = WM_APP + 76;
 const WM_APP_POSTSHOW: u32 = WM_APP + 66;      // 呼出后的"重活"：运行状态/窗口条目匹配
 const WM_APP_SNAPBG: u32 = WM_APP + 67;        // 后台抓桌面完成（玻璃背景）     // 仅测试：拖放预览状态（ghost/active/suggest/target/应用数）
 const WM_APP_CHIPPOS: u32 = WM_APP + 22; // 仅测试：回报 0 号胶囊的**屏幕**坐标
@@ -1054,6 +1067,68 @@ struct State {
     /// 「拖进来的东西会加到外环末尾」那个幽灵胶囊的淡入（0..1）。
     /// 没有它 = 幽灵在拖动开始时**瞬间**冒出来，和胶囊的平滑让位对不上。
     chip_ghost_a: f32,
+    // ── 检索卡片（RLSearch）──
+    sr_shown: bool,
+    sr_fg0: f64,
+    sr_x: i32,
+    sr_y: i32,
+    sr_q: String,
+    sr_comp: String,
+    /// 检索总开关（设置页「应用」页底部）：关 = 轮盘上摘掉「检索」图标
+    sr_on: bool,
+    sr_ring_pos: usize,
+    /// 单击结果行是否自动在右侧预览（设置页「检索」页；Ctrl+Enter 仍可手动预览）
+    sr_click_preview: bool,
+    /// 输入框光标/选区（字符下标；anchor==caret 表示没有选区）
+    sr_caret: usize,
+    sr_anchor: usize,
+    sr_drag: bool,
+    /// 类型筛选：0=全部，其余见 SR_TYPES
+    sr_type: u8,
+    sr_type_open: bool,
+    sr_type_hover: Option<usize>,
+    sr_hits: Vec<FileHit>,
+    sr_rows: Vec<SrRow>,
+    sr_sort: u8,
+    /// 目录聚合里展开的目录（路径）；None = 全部折叠
+    sr_dir_open: Option<String>,
+    // ── 预览卡片（RLPreview）──
+    pv_shown: bool,
+    pv_fg0: f64,
+    pv_x: i32,
+    pv_y: i32,
+    pv_path: String,
+    pv_name: String,
+    pv_lines: Vec<MLine>,
+    pv_md: bool,
+    /// 纯文本里的代码/数据文件 → 用等宽字体排
+    pv_mono: bool,
+    pv_img: Option<(u32, u32, Vec<u8>)>,
+    pv_kind: u8,
+    /// 右上角「×」是否悬停
+    pv_close_hover: bool,
+    /// 预览正文的估算总高与"要不要画滚动条"
+    pv_total_h: i32,
+    pv_overflow: bool,
+    /// 预览卡自己的毛玻璃底（1× 物理像素；和 card_bg 分开，互不覆盖）
+    pv_bg: Vec<u8>,
+    /// 预览正文的滚动量（逻辑像素）与"是否还有下文"
+    pv_scroll: i32,
+    pv_more: bool,
+    pv_content_bottom: i32,
+    pv_body_bottom: i32,
+    /// 预览卡自己的 DIB（不走卡片共享画布：尺寸不一样）
+    pv_w: i32,
+    pv_h: i32,
+    pv_dc: isize,
+    pv_bmp: isize,
+    pv_bits: isize,
+    sr_sel: usize,
+    sr_scroll: usize,
+    sr_blink: bool,
+    sr_note: String,
+    /// 用户从设置页删过「检索」入口 → 2（不再自动补回）
+    sr_app: u8,
     /// 拖入内容"认不出宿主"→ 内环要新建的幽灵磁贴（半透明，丢上去才建）。
     /// ⚠️ 拖拽期间**一直保留**（占住首位槽），只有真正落下/离开才清 —— 见 `drop_outer`。
     drop_ghost: Option<GhostApp>,
@@ -1313,7 +1388,7 @@ struct State {
     /// 开关的滑动动画值（0 关 / 1 开；中间态用于圆钮滑动过渡）。按序号：
     /// 0 常驻 / 1 监听 / 2 开机自启（交互页）/ 3 全屏放行(游戏模式)（交互页）
     /// / 4 显示应用名称（交互页）/ 5 录屏模式（外观页）/ 6 剪贴板总开关（应用页）
-    sw_a: [f32; 8],
+    sw_a: [f32; 10],
     /// 悬停中的「?」tooltip id（0 = 不显示）；见 `tip_lines`
     tip: u8,
     /// 开机自启（ini `autostart`；**缺失视为开** → 默认勾选）。
@@ -1630,6 +1705,54 @@ impl State {
             search_hits_outer: Vec::new(),
             search_hover: None,
             drop_suggest: None,
+            sr_shown: false,
+            sr_fg0: 0.0,
+            sr_x: 0,
+            sr_y: 0,
+            sr_q: String::new(),
+            sr_comp: String::new(),
+            sr_on: true,
+            sr_ring_pos: usize::MAX,
+            sr_click_preview: true,
+            sr_caret: 0,
+            sr_anchor: 0,
+            sr_drag: false,
+            sr_type: 0,
+            sr_type_open: false,
+            sr_type_hover: None,
+            sr_hits: Vec::new(),
+            sr_rows: Vec::new(),
+            sr_sort: 0,
+            sr_dir_open: None,
+            pv_shown: false,
+            pv_fg0: 0.0,
+            pv_x: 0,
+            pv_y: 0,
+            pv_path: String::new(),
+            pv_name: String::new(),
+            pv_lines: Vec::new(),
+            pv_md: false,
+            pv_mono: false,
+            pv_img: None,
+            pv_kind: 0,
+            pv_bg: Vec::new(),
+            pv_close_hover: false,
+            pv_total_h: 0,
+            pv_overflow: false,
+            pv_scroll: 0,
+            pv_more: false,
+            pv_content_bottom: 0,
+            pv_body_bottom: 0,
+            pv_w: 0,
+            pv_h: 0,
+            pv_dc: 0,
+            pv_bmp: 0,
+            pv_bits: 0,
+            sr_sel: 0,
+            sr_scroll: 0,
+            sr_blink: true,
+            sr_note: String::new(),
+            sr_app: 0,
             chip_ghost_a: 0.0,
             drop_ghost: None,
             drop_outer: None,
@@ -1771,7 +1894,7 @@ impl State {
             set_page_a: 1.0,
             // `sw_a[5]` = 录屏模式 = `!glass_live`，而 glass_live 缺省开 → 初值 0；
             // `sw_a[6]` = 剪贴板总开关，`cl_on` 缺省开 → 初值 1
-            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+            sw_a: [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
             tip: 0,
             // 默认开：ini 里没有 `autostart=` 时就是它（用户主动关才变 false）
             autostart: true,
@@ -4376,6 +4499,94 @@ fn blur_glass(src: &[u8]) -> Vec<u8> {
 /// `blur_glass` 的边长参数版：轮盘的缓冲是 `CANVAS²`，剪贴板卡片是 `CL_WW²`，
 /// 算法一个字节都不该有两份（缩 1/2 → 三次 1px 盒式 → 双线性放回）。
 /// ⚠️ 只支持**正方**缓冲 —— 两处用都是方的，`cw` 同时当宽和高用。
+/// 非方形版：预览卡比卡片矮一截，不能直接用只认方图的 `blur_glass_sq`
+fn blur_glass_rect(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    if w < GLASS_DN * 4 || h < GLASS_DN * 4 {
+        return src.to_vec();
+    }
+    let (dw, dh) = (w / GLASS_DN, h / GLASS_DN);
+    let mut small: Vec<[f32; 3]> = vec![[0.0; 3]; dw * dh];
+    for dy in 0..dh {
+        for dx in 0..dw {
+            let mut acc = [0f32; 3];
+            for y in 0..GLASS_DN {
+                let row = (dy * GLASS_DN + y) * w;
+                for x in 0..GLASS_DN {
+                    let o = (row + dx * GLASS_DN + x) * 4;
+                    acc[0] += src[o + 2] as f32;
+                    acc[1] += src[o + 1] as f32;
+                    acc[2] += src[o] as f32;
+                }
+            }
+            let k = (GLASS_DN * GLASS_DN) as f32;
+            small[dy * dw + dx] = [acc[0] / k, acc[1] / k, acc[2] / k];
+        }
+    }
+    let r = GLASS_BR as isize;
+    let mut tmp: Vec<[f32; 3]> = vec![[0.0; 3]; dw * dh];
+    for _ in 0..3 {
+        for y in 0..dh {
+            for x in 0..dw {
+                let mut acc = [0f32; 3];
+                for k in -r..=r {
+                    let sx = (x as isize + k).clamp(0, dw as isize - 1) as usize;
+                    let c = small[y * dw + sx];
+                    acc[0] += c[0];
+                    acc[1] += c[1];
+                    acc[2] += c[2];
+                }
+                let n = (2 * r + 1) as f32;
+                tmp[y * dw + x] = [acc[0] / n, acc[1] / n, acc[2] / n];
+            }
+        }
+        for y in 0..dh {
+            for x in 0..dw {
+                let mut acc = [0f32; 3];
+                for k in -r..=r {
+                    let sy = (y as isize + k).clamp(0, dh as isize - 1) as usize;
+                    let c = tmp[sy * dw + x];
+                    acc[0] += c[0];
+                    acc[1] += c[1];
+                    acc[2] += c[2];
+                }
+                let n = (2 * r + 1) as f32;
+                small[y * dw + x] = [acc[0] / n, acc[1] / n, acc[2] / n];
+            }
+        }
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) / GLASS_DN as f32 - 0.5).max(0.0);
+        let y0 = (fy.floor() as usize).min(dh - 1);
+        let y1 = (y0 + 1).min(dh - 1);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) / GLASS_DN as f32 - 0.5).max(0.0);
+            let x0 = (fx.floor() as usize).min(dw - 1);
+            let x1 = (x0 + 1).min(dw - 1);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            let a0 = small[y0 * dw + x0];
+            let a1 = small[y0 * dw + x1];
+            let b0 = small[y1 * dw + x0];
+            let b1 = small[y1 * dw + x1];
+            let o = (y * w + x) * 4;
+            for c in 0..3 {
+                let top = a0[c] + (a1[c] - a0[c]) * tx;
+                let bot = b0[c] + (b1[c] - b0[c]) * tx;
+                let v = (top + (bot - top) * ty).clamp(0.0, 255.0);
+                let dst = match c {
+                    0 => 2,
+                    1 => 1,
+                    _ => 0,
+                };
+                out[o + dst] = v as u8;
+            }
+            out[o + 3] = 255;
+        }
+    }
+    out
+}
+
 fn blur_glass_sq(src: &[u8], cw: usize) -> Vec<u8> {
     let dw = cw / GLASS_DN;
     let mut small: Vec<[f32; 3]> = vec![[0.0; 3]; dw * dw];
@@ -5332,6 +5543,17 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                     pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, icon_a,
                 );
             }
+        } else if st.apps[i].target == "@act:search" {
+            // 检索：放大镜（圆环 + 45° 细柄）—— 和剪贴板/便签在 28px 上区分得开
+            let r = icon_side * 0.24;
+            let t = (icon_side * 0.075).max(1.5);
+            let (lx, ly) = (cx - icon_side * 0.07, cy - icon_side * 0.07);
+            flat_circle(buf, lx, ly, r + t * 0.5, pal.ink, 0.0, pal.ink, 0.0, 0.0, 0.0, 0.0, icon_a);
+            flat_circle(buf, lx, ly, r - t * 0.5, pal.paper, 0.0, pal.paper, 0.0, 0.0, 0.0, 0.0, icon_a);
+            let ang = std::f32::consts::FRAC_PI_4;
+            let hx = lx + (r + t * 1.2) * ang.cos();
+            let hy = ly + (r + t * 1.2) * ang.sin();
+            rot_rrect(buf, hx, hy, t * 2.0, t * 0.55, t * 0.4, ang, pal.ink, icon_a);
         } else if st.apps[i].target == "@act:note" {
             // 便签：一支斜放的**铅笔**。
             // 为什么不用纸/本子：折角纸和剪贴板那颗「板 + 两行字」在 28px 上几乎一样
@@ -5667,6 +5889,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                     },
                     fg,
                     hot_k, editing, am, loading,
+                    item_site_host(it).is_some(),
                 );
 
                 // ⚠️ 窗口条目的「小窗框」标记**已删**（用户 2026-10-15：「外环胶囊外面有个
@@ -5743,6 +5966,7 @@ unsafe fn draw_scene(st: &mut State, buf: &mut [u8]) {
                 st, buf, &pal, seg, r_in, r_out,
                 st.apps[ai].icon.as_ref(), item.name.as_str(),
                 pal.ink, hot, false, 1.0, false,
+                item_site_host(item).is_some(),
             );
         }
     }
@@ -6066,6 +6290,101 @@ fn draw_bgra_icon_rot(buf: &mut [u8], cx: f32, cy: f32, size: f32,
 
 // ───────────────────── 文字（遮罩法：白字黑底 → 亮度作覆盖率） ─────────────────────
 
+/// 一张**裁好的**文字亮度遮罩（白字黑底，亮度=覆盖率）。
+///
+/// 为什么要缓存：企业机上 GDI 的 `DrawText`（3× 字号）单次能到 10~100ms。
+/// 外环一展开，每帧要画 5~6 颗胶囊的名字 → 整帧 100~700ms（2026-11-20 日志的 UI_SLOW）。
+/// 字形是确定的 → 渲染一次存下来，之后每帧只做贴图 / 旋转双线性采样。
+/// 键 = (画布边长, 字号档, 限宽, 文本)：缩放变了画布边长也变，自然分桶。
+struct TextMask {
+    canvas: i32,
+    px: i32,
+    max_w: i32,
+    text: String,
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+    tw: i32,  // 对外报告的宽度（= 原 `TXT_W`）
+    tw3: f32, // 3× 遮罩宽度（旋转用；直立文字为 0）
+    alpha: Vec<u8>,
+}
+
+const TEXT_MASK_MAX: usize = 96;
+/// 排障开关：`RL_TEXCACHE=0` 关掉文字遮罩缓存（对比渲染结果是否逐像素一致）。
+fn text_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("RL_TEXCACHE").map(|v| v != "0").unwrap_or(true)
+    })
+}
+static TEXT_MASKS: std::sync::Mutex<Vec<TextMask>> = std::sync::Mutex::new(Vec::new());
+static TEXT_HIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static TEXT_MISS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 从共享遮罩 DC 的 `[0,rw)×[0,rh)` 区域裁出非零包围盒（亮度 -> alpha）。
+unsafe fn mask_bbox(st: &State, rw: i32, rh: i32) -> Option<(i32, i32, i32, i32, Vec<u8>)> {
+    let cw = canvas() as i32;
+    let (mut minx, mut maxx, mut miny, mut maxy) = (rw, -1, rh, -1);
+    let mut lum_at = |x: i32, y: i32| -> u32 {
+        let o = (y as usize * cw as usize + x as usize) * 4;
+        let t = st.txt_bits.add(o);
+        ((*t.add(2)) as u32 + (*t.add(1)) as u32 + (*t.add(0)) as u32) / 3
+    };
+    for y in 0..rh {
+        for x in 0..rw {
+            if lum_at(x, y) > 0 {
+                if x < minx { minx = x; }
+                if x > maxx { maxx = x; }
+                if y < miny { miny = y; }
+                if y > maxy { maxy = y; }
+            }
+        }
+    }
+    if maxx < minx || maxy < miny {
+        return None;
+    }
+    let (w, h) = (maxx - minx + 1, maxy - miny + 1);
+    let mut alpha = vec![0u8; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            alpha[(y * w + x) as usize] = lum_at(minx + x, miny + y) as u8;
+        }
+    }
+    Some((minx, miny, w, h, alpha))
+}
+
+/// 把裁好的遮罩贴到画布（左/上端 = `bx,by`）。与旧内联循环逐像素同语义。
+unsafe fn blend_mask(
+    buf: &mut [u8], mask: &[u8], mw: i32, mh: i32, bx: i32, by: i32,
+    cr: u8, cg: u8, cb: u8, alpha: u8,
+) {
+    let cw = canvas() as i32;
+    let af = alpha as f32 / 255.0;
+    for yy in 0..mh {
+        let py = by + yy;
+        if py < 0 || py >= cw {
+            continue;
+        }
+        let row = (yy * mw) as usize;
+        for xx in 0..mw {
+            let px = bx + xx;
+            if px < 0 || px >= cw {
+                continue;
+            }
+            let a = mask[row + xx as usize];
+            if a == 0 {
+                continue;
+            }
+            let bo = (py as usize * cw as usize + px as usize) * 4;
+            if buf[bo + 3] == 0 {
+                continue;
+            }
+            blend_over(buf, bo, cr as f32, cg as f32, cb as f32, (a as f32 / 255.0) * af);
+        }
+    }
+}
+
 unsafe fn draw_text(
     st: &State,
     buf: &mut [u8],
@@ -6084,6 +6403,22 @@ unsafe fn draw_text(
     if st.txt_dc.0.is_null() || text.is_empty() {
         return;
     }
+    let cv = canvas();
+    // ① 命中缓存：不再碰 GDI，直接贴遮罩（企业机上这就是每帧 100ms 的差别）
+    if text_cache_on() {
+        let guard = TEXT_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = guard.iter().find(|m| {
+            m.canvas == cv && m.px == px && m.max_w == max_w && m.text == text
+        }) {
+            TEXT_HIT.fetch_add(1, Ordering::Relaxed);
+            TXT_W.store(m.tw, Ordering::Relaxed);
+            let basex = if max_w > 0 { cx } else { cx - m.tw / 2 };
+            blend_mask(buf, &m.alpha, m.w, m.h, basex + m.x0, cy - 20 + m.y0,
+                       cr, cg, cb, alpha);
+            return;
+        }
+    }
+    TEXT_MISS.fetch_add(1, Ordering::Relaxed);
     let dc = HDC(st.txt_dc.0);
     let font = match px {
         20 => st.font_glyph,
@@ -6125,8 +6460,29 @@ unsafe fn draw_text(
         let _ = DrawTextW(dc, &mut chars, &mut rect, fmt_base | DT_CENTER);
     }
     TXT_W.store((rect.right - rect.left).max(0), Ordering::Relaxed);
-    let x0 = if max_w > 0 { cx } else { cx - (rect.right - rect.left) / 2 };
+    let tw = (rect.right - rect.left).max(0);
+    let x0 = if max_w > 0 { cx } else { cx - tw / 2 };
     let y0 = cy - 20;
+
+    // ② 入缓存（字形已画在遮罩 DC 的 [0,tw)×[0,40)），然后递归走命中路径 → 避免两套贴图循环
+    if tw > 0 && tw <= canvas() {
+        if let Some((bx, by, bw, bh, al)) = mask_bbox(st, tw, 40) {
+            {
+                let mut c = TEXT_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+                c.retain(|m| m.canvas == cv);
+                if c.len() >= TEXT_MASK_MAX {
+                    c.clear();
+                }
+                c.push(TextMask {
+                    canvas: cv, px, max_w, text: text.to_string(),
+                    x0: bx, y0: by, w: bw, h: bh, tw, tw3: 0.0, alpha: al,
+                });
+            }
+            if text_cache_on() {
+                return draw_text(st, buf, cx, cy, text, px, _weight, cr, cg, cb, alpha, max_w, _align);
+            }
+        }
+    }
 
     let af = alpha as f32 / 255.0;
     for yy in 0..40i32 {
@@ -6176,6 +6532,24 @@ unsafe fn draw_text_rot(
     if st.txt_dc.0.is_null() || text.is_empty() || alpha == 0 {
         return;
     }
+    let cv = canvas();
+    // ① 命中缓存：跳过 GDI（外环每帧 5~6 个名字，企业机上这是整帧的大头）
+    if text_cache_on() {
+        let guard = TEXT_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = guard.iter().find(|m| {
+            m.canvas == cv && m.px == px && m.max_w == -1 && m.text == text
+        }) {
+            TEXT_HIT.fetch_add(1, Ordering::Relaxed);
+            TXT_W.store(m.tw, Ordering::Relaxed);
+            let tw3 = m.tw3;
+            blend_mask_rot(buf, cx, cy, tw3 / 3.0, tw3, &m.alpha,
+                           m.x0, m.y0, m.w, m.h,
+                           tw3 - m.x0 as f32, 132.0 - m.y0 as f32,
+                           rot, cr, cg, cb, alpha);
+            return;
+        }
+    }
+    TEXT_MISS.fetch_add(1, Ordering::Relaxed);
     let dc = HDC(st.txt_dc.0);
     let font = match px {
         20 => st.font_glyph,
@@ -6213,7 +6587,6 @@ unsafe fn draw_text_rot(
     let fmt = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
     let _ = DrawTextW(dc, &mut chars, &mut rect, fmt | DT_CALCRECT);
     let tw3 = (rect.right - rect.left).max(1) as f32;
-    let tw = tw3 / Z; // 1x 逻辑宽度（用于布局/外接圆）
     let mut rect2 = RECT { left: 0, top: 0, right: tw3 as i32, bottom: 132 };
     let _ = DrawTextW(dc, &mut chars, &mut rect2, fmt | DT_CENTER);
     TXT_W.store((tw3 / 3.0) as i32, Ordering::Relaxed);
@@ -6227,9 +6600,38 @@ unsafe fn draw_text_rot(
         let _ = save_bmp(&format!("{}\u{5c}mask_{}.bmp", std::env::var("RL_MASKDBG").unwrap(), k), mb, canvas(), 140);
     }
 
+    // ② 入缓存，再递归走命中路径（保证只有一套采样实现）
+    // ⚠️ 裁剪区要**多留 2px**：双线性在字形边缘会读到 x0+1 / y0+1 的邻像素，
+    //    参考实现读的是整张遮罩（没裁），裁太紧会把边缘那圈的最后一个字形像素丢掉
+    //    （实测表现为文字边缘缺像素、与参考路径对比最大差 68~175）。
+    let scan_w = (tw3.ceil() as i32 + 2).min(canvas());
+    if tw3 >= 1.0 && scan_w > 0 {
+        if let Some((bx, by, bw, bh, al)) = mask_bbox(st, scan_w, 134) {
+            let tw_i = (tw3 / 3.0) as i32;
+            {
+                let mut c = TEXT_MASKS.lock().unwrap_or_else(|e| e.into_inner());
+                c.retain(|m| m.canvas == cv);
+                if c.len() >= TEXT_MASK_MAX {
+                    c.clear();
+                }
+                c.push(TextMask {
+                    canvas: cv, px, max_w: -1, text: text.to_string(),
+                    x0: bx, y0: by, w: bw, h: bh, tw: tw_i, tw3, alpha: al,
+                });
+            }
+            if text_cache_on() {
+                return draw_text_rot(st, buf, cx, cy, text, px, rot, cr, cg, cb, alpha);
+            }
+        }
+    }
+    if text_cache_on() {
+        return; // 遮罩为空（纯空格之类）→ 不画
+    }
+    // 缓存关闭（RL_TEXCACHE=0）：直接按旧实现对共享遮罩 DC 采样。
+    // 这是逐像素对照用的参考路径，别删 —— 改缓存算法时靠它验收。
+    let tw = tw3 / Z;
     let (sn, cs) = rot.sin_cos();
     let af = alpha as f32 / 255.0;
-    // 目标像素的包围盒 = 旋转后的矩形外接圆
     let ext = (((tw * tw + 1600.0).sqrt()) * 0.5 + 4.0).ceil() as i32;
     let cxi = cx.round() as i32;
     let cyi = cy.round() as i32;
@@ -6245,7 +6647,6 @@ unsafe fn draw_text_rot(
             if mx < 0.0 || my < 0.0 || mx >= tw3 || my >= 132.0 {
                 continue;
             }
-            // 双线性采样遮罩亮度
             let x0 = mx.floor() as i32;
             let y0 = my.floor() as i32;
             let fx = mx - x0 as f32;
@@ -6275,6 +6676,68 @@ unsafe fn draw_text_rot(
                 continue;
             }
             let bo = (py as usize * w + pxx as usize) * 4;
+            if buf[bo + 3] == 0 {
+                continue;
+            }
+            blend_over(buf, bo, cr as f32, cg as f32, cb as f32, acc * af);
+        }
+    }
+}
+
+/// 旋转文字的贴图：把裁好的遮罩按 `rot` **反向旋转 + 双线性采样**写进画布。
+/// 与旧内联实现逐像素同语义（旧版直接从 140 行全幅遮罩 DC 采样）。
+#[allow(clippy::too_many_arguments)]
+unsafe fn blend_mask_rot(
+    buf: &mut [u8], cx: f32, cy: f32, tw: f32, tw3: f32,
+    mask: &[u8], bx: i32, by: i32, bw: i32, bh: i32,
+    xmax: f32, ymax: f32,
+    rot: f32, cr: u8, cg: u8, cb: u8, alpha: u8,
+) {
+    const Z: f32 = 3.0;
+    let (sn, cs) = rot.sin_cos();
+    let af = alpha as f32 / 255.0;
+    let ext = (((tw * tw + 1600.0).sqrt()) * 0.5 + 4.0).ceil() as i32;
+    let cxi = cx.round() as i32;
+    let cyi = cy.round() as i32;
+    let cw = canvas() as i32;
+    for py in (cyi - ext).max(0)..=(cyi + ext).min(cw - 1) {
+        for pxx in (cxi - ext).max(0)..=(cxi + ext).min(cw - 1) {
+            let dx = pxx as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let lx = dx * cs + dy * sn;
+            let ly = -dx * sn + dy * cs;
+            // 采样中心必须落在**参考实现的取样窗口**里（x∈[0,tw3)、y∈[0,132)）：
+            // 多留的 2px 只用来提供双线性的邻像素，不能把中心也放出去。
+            let mx = lx * Z + tw3 * 0.5 - bx as f32;
+            let my = ly * Z + 66.0 - by as f32;
+            if mx < 0.0 || my < 0.0 || mx >= xmax || my >= ymax {
+                continue;
+            }
+            let x0 = mx.floor() as i32;
+            let y0 = my.floor() as i32;
+            let fx = mx - x0 as f32;
+            let fy = my - y0 as f32;
+            let mut acc = 0.0f32;
+            for (ox, oy, wgt) in [
+                (0i32, 0i32, (1.0 - fx) * (1.0 - fy)),
+                (1, 0, fx * (1.0 - fy)),
+                (0, 1, (1.0 - fx) * fy),
+                (1, 1, fx * fy),
+            ] {
+                if wgt <= 0.0 {
+                    continue;
+                }
+                let sx = x0 + ox;
+                let sy = y0 + oy;
+                if sx < 0 || sy < 0 || sx >= bw || sy >= bh {
+                    continue;
+                }
+                acc += (mask[(sy * bw + sx) as usize] as f32 / 255.0) * wgt;
+            }
+            if acc <= 0.004 {
+                continue;
+            }
+            let bo = (py as usize * cw as usize + pxx as usize) * 4;
             if buf[bo + 3] == 0 {
                 continue;
             }
@@ -7328,7 +7791,9 @@ fn app_is_folder_like(st: &State, ai: usize) -> bool {
 /// 内置入口（剪贴板 / 便签）：不允许拖出移除（开关在设置页，不在轮盘上）。
 fn builtin_locked(target: &str) -> bool {
     let t = target.trim();
-    t.eq_ignore_ascii_case("@act:clip") || t.eq_ignore_ascii_case("@act:note")
+    t.eq_ignore_ascii_case("@act:clip")
+        || t.eq_ignore_ascii_case("@act:note")
+        || t.eq_ignore_ascii_case("@act:search")
 }
 
 /// 新建的内环条目挪到**首位**（用户 2026-11-17 定：内环占位固定在首位）。
@@ -7800,6 +8265,7 @@ fn default_apps() -> Vec<(String, String)> {
         ("浏览器".to_string(), "https://www.bing.com".to_string()),
         ("剪贴板".to_string(), "@act:clip".to_string()),
         ("便签".to_string(), "@act:note".to_string()),
+        ("检索".to_string(), "@act:search".to_string()),
         ("开始菜单".to_string(), "@act:start".to_string()),
     ]
 }
@@ -8274,8 +8740,17 @@ fn ensure_host_app(st: &mut State, exe: &str) -> Option<usize> {
     // ⚠️ 同样排在 `host_app_index` 之前：历史 bug 建出来的重复 msedge 内环也要让位，
     //    否则新拖进来的浏览器窗口会继续塞进那个重复环（默认环形同虚设）。
     if is_browser_exe(exe) {
+        // ⚠️ 只在「同一个浏览器」时归 hub。以前任何浏览器窗口都塞进第一个浏览器应用
+        //    （用户这里是 msedge）→ 拖 Chrome 窗口进去，条目落在 Edge 的外环里，
+        //    界面上等于"没反应"（2026-11-25 实测）。不同浏览器各开各的内环。
         if let Some(ai) = browser_hub_index(st) {
-            return Some(ai);
+            let hub_same = exe_name_of(&st.apps[ai].target)
+                .zip(exe_name_of(exe))
+                .map(|(a, b)| a.eq_ignore_ascii_case(&b))
+                .unwrap_or(false);
+            if hub_same {
+                return Some(ai);
+            }
         }
     }
     if let Some(ai) = host_app_index(st, exe) {
@@ -8347,7 +8822,7 @@ unsafe fn capture_window(
         say(st, "内环装不下了", &format!("最多 {} 个 · 先移除再加", MAX_APPS), 3.0);
         return 0;
     };
-    let item = ItemEntry {
+    let mut item = ItemEntry {
         name: clamp_name(title),
         target: exe.to_string(),
         icon: decode_icon(exe).map(|(px, d)| IconTex::from_base(px, d)),
@@ -8356,6 +8831,15 @@ unsafe fn capture_window(
         relaunch: relaunch.to_string(),
         live_hwnd: hwnd.0 as isize,
     };
+    // 已经有网址（探针回填过 / 拖的就是页签）→ 直接挂站点图标；没有就后台抓
+    if let Some(host) = item_site_host(&item) {
+        let page = first_url(&item.relaunch);
+        if let Some((px, d)) = fav_cache_load(&host) {
+            item.icon = Some(IconTex::from_base(px, d));
+        } else {
+            favicon_fetch_async(&host, page);
+        }
+    }
     // 去重：同 exe + 同标题已存在 → 只刷新 live_hwnd/relaunch，不加重复
     if let Some(pos) = st
         .apps
@@ -8385,7 +8869,13 @@ unsafe fn capture_window(
             "refresh name={} old={} new={}",
             item.name, old, item.relaunch
         ));
-        return 1; // 刷新已有条目也算成功（调用方据此给反馈）
+        // 同一窗口的同名页签会走到这里（以前完全静默 = 用户以为"没反应"）。
+        // 把那条外环亮出来 + 说到落到哪个应用里。
+        let app_name = st.apps[ai].name.clone();
+        st.active_app = Some(ai);
+        st.chip_page[ai] = u16::MAX;
+        say(st, &format!("已在「{}」外环", app_name), &title, 1.8);
+        return 1;
     }
     if st.apps[ai].items.len() >= MAX_ITEMS {
         println!("[wincap] 外环已满，跳过 · {}", title);
@@ -8410,6 +8900,13 @@ unsafe fn capture_window(
     ));
     // 拖窗口进来 = "拖入过"（窗口条目落进的是某个应用的外环 kind=1）
     onb_done_drag(st);
+    let (app_name, item_name) = {
+        let a = &st.apps[ai];
+        (a.name.clone(), a.items.last().map(|x| x.name.clone()).unwrap_or_default())
+    };
+    st.active_app = Some(ai);
+    st.chip_page[ai] = u16::MAX;
+    say(st, &format!("已加到「{}」外环", app_name), &item_name, 1.8);
     1
 }
 
@@ -8437,7 +8934,28 @@ fn relaunch_score(s: &str) -> usize {
     if s.trim().is_empty() || low.contains("/factory") || low.contains("-embedding") {
         return 0;
     }
+    // 浏览器页签：网址比「裸 exe + 启动参数」更能重开原来那一页。
+    // ⚠️ 以前只数词（网址 1 词 vs 命令行 3 词）→ UIA 探到的网址**永远存不进去**，
+    //    外环一直是 Edge 图标、点开也只开个空白窗（2026-11-25 用户截图）。
+    if s.trim_start().to_ascii_lowercase().starts_with("http") {
+        return 100;
+    }
     s.split_whitespace().count()
+}
+
+/// 窗口标题与条目名是否还是同一页（捕获后用户可能切了标签）。
+/// 条目名被 `clamp_name` 截过，所以取前 12 个字做包含判断。
+fn title_like(win: &str, item: &str) -> bool {
+    let w = norm_title(win);
+    let n = norm_title(item);
+    if n.is_empty() {
+        return true;
+    }
+    if w == n || w.starts_with(&n) {
+        return true;
+    }
+    let cut: String = n.chars().take(12).collect();
+    !cut.is_empty() && w.contains(&cut)
 }
 
 /// 窗口捕获 / 点击的落盘诊断（LocalAppData\PiPie\logs\wincap.log）。
@@ -8741,7 +9259,14 @@ unsafe fn wincap_probe_start(st: &mut State, hw: HWND, exe: &str) {
         return;
     }
     std::thread::spawn(move || unsafe {
-        let got = wincap_probe_exe(h, &exe_owned, is_explorer);
+        // 刚松手那一瞬，浏览器（尤其自绘地址栏的 Chrome）的无障碍树可能还没就绪
+        // → 先等一拍再问；失败再补一次（2026-11-25 实测 Chrome 首次必失败）。
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let mut got = wincap_probe_exe(h, &exe_owned, is_explorer);
+        if got.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            got = wincap_probe_exe(h, &exe_owned, is_explorer);
+        }
         // ⚠️ 套间模型不是这里的关键：实测本线程先 `CoInitializeEx(MULTITHREADED)`
         //    （把后面那句 APARTMENTTHREADED 挡成 RPC_E_CHANGED_MODE）和根本不先初始化
         //    （= 走 STA）**结果一样**。跨进程 UIA 贵的是等提供方建树，不是我们的套间。
@@ -8782,21 +9307,51 @@ unsafe fn wincap_apply_probe(st: &mut State) {
             st.wincap_failed.push((h, now));
             continue;
         };
-        let hit = st.apps.iter().position(|a| {
-            a.items
-                .iter()
-                .any(|x| x.kind == 1 && x.live_hwnd == h && relaunch_score(&v) > relaunch_score(&x.relaunch))
-        });
-        let Some(ai) = hit else { continue };
-        let ii = st.apps[ai]
-            .items
-            .iter()
-            .position(|x| x.kind == 1 && x.live_hwnd == h)
-            .unwrap();
+        // 探到的是**当前活动标签**的地址。同一个浏览器窗口可能挂了多条条目
+        // （每个页签一条），它们共享同一个 live_hwnd —— 必须按标题挑出"现在这一页"
+        // 对应的那条，不能拿第一条（2026-11-25 用户拖「小程序」页签，网址被记到
+        // 「刀鸣」条目上、又因为标题对不上被丢弃，结果新条目还是 Edge 图标）。
+        let cur_title = {
+            let mut b = [0u16; 512];
+            let n = GetWindowTextW(HWND(h as *mut c_void), &mut b);
+            String::from_utf16_lossy(&b[..n as usize])
+        };
+        let mut target: Option<(usize, usize)> = None;
+        for (ai, a) in st.apps.iter().enumerate() {
+            for (ii, it) in a.items.iter().enumerate() {
+                if it.kind == 1 && it.live_hwnd == h && title_like(&cur_title, &it.name) {
+                    target = Some((ai, ii));
+                    break;
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some((ai, ii)) = target else {
+            wlog(&format!(
+                "probe-skip no title match hw={:#x} win={} url={}",
+                h, cur_title, v
+            ));
+            continue;
+        };
+        if relaunch_score(&v) <= relaunch_score(&st.apps[ai].items[ii].relaunch) {
+            continue;
+        }
         let exe = st.apps[ai].items[ii].target.clone();
         let sec = st.apps[ai].name.clone();
         let name = st.apps[ai].items[ii].name.clone();
         st.apps[ai].items[ii].relaunch = v.clone();
+        // 网址条目：顺手把站点图标换上（缓存命中立刻换，没命中就后台抓）
+        if let Some(url) = first_url(&v) {
+            if let Some(host) = url_host(&url) {
+                if let Some((px, d)) = fav_cache_load(&host) {
+                    st.apps[ai].items[ii].icon = Some(IconTex::from_base(px, d));
+                } else {
+                    favicon_fetch_async(&host, Some(url));
+                }
+            }
+        }
         ini_set_item(
             &st.ini_path,
             &sec,
@@ -9537,6 +10092,39 @@ unsafe fn omnibox_text(hwnd: HWND) -> Option<String> {
         )
         .ok()?;
     let root = ui.ElementFromHandle(hwnd).ok()?;
+    // ① **Document 元素**的 Value 就是当前页 URL（Chrome/Edge 都给，且带协议）。
+    //    Chrome 的自绘地址栏在部分版本里 ClassName 为空、只认 Name，取 Edit 反而不稳。
+    if let Ok(dcond) = ui.CreatePropertyCondition(
+        windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId,
+        &windows_core::VARIANT::from(50030i32), // UIA_DocumentControlTypeId
+    ) {
+        if let Ok(darr) = root.FindAll(TreeScope_Descendants, &dcond) {
+            for di in 0..darr.Length().unwrap_or(0).min(4) {
+                let Ok(e) = darr.GetElement(di) else { continue };
+                let mut v = String::new();
+                if let Ok(p) = e.GetCurrentPatternAs::<windows::Win32::UI::Accessibility::IUIAutomationValuePattern>(
+                    windows::Win32::UI::Accessibility::UIA_ValuePatternId,
+                ) {
+                    if let Ok(s) = p.CurrentValue() {
+                        v = s.to_string();
+                    }
+                }
+                if v.trim().is_empty() {
+                    if let Ok(l) = e.GetCurrentPatternAs::<
+                        windows::Win32::UI::Accessibility::IUIAutomationLegacyIAccessiblePattern,
+                    >(windows::Win32::UI::Accessibility::UIA_LegacyIAccessiblePatternId) {
+                        if let Ok(s) = l.CurrentValue() {
+                            v = s.to_string();
+                        }
+                    }
+                }
+                let t = v.trim();
+                if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("file://") {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
     let arr = root.FindAll(TreeScope_Descendants, &cond).ok()?;
     let hwi = hwnd.0 as isize;
     let mut edits = 0i32;
@@ -10318,6 +10906,13 @@ fn commit(st: &mut State) {
             unsafe {
                 close_menu_now(st);
                 open_note(st);
+            }
+            return;
+        }
+        if t == "@act:search" {
+            unsafe {
+                close_menu_now(st);
+                open_search(st);
             }
             return;
         }
@@ -12147,6 +12742,18 @@ unsafe fn read_persistent(st: &mut State) {
             } else if let Some(v) = get("note=") {
                 // 缺省 = 开（和剪贴板同一个理由：装了就该有）
                 st.note_on = v != "0";
+            } else if let Some(v) = get("search=") {
+                // 缺省 = 开
+                st.sr_on = v != "0";
+            } else if let Some(v) = get("sr_ring_pos=") {
+                st.sr_ring_pos = v.parse::<usize>().unwrap_or(usize::MAX);
+            } else if let Some(v) = get("sr_type=") {
+                st.sr_type = v.parse::<u8>().unwrap_or(0).min(9);
+            } else if let Some(v) = get("sr_preview=") {
+                // 缺省 = 开：单击就预览是默认手感
+                st.sr_click_preview = v != "0";
+            } else if let Some(v) = get("sr_app=") {
+                st.sr_app = v.parse::<u8>().unwrap_or(0).min(2);
             } else if let Some(v) = get("note_app=") {
                 st.note_app = v.parse::<u8>().unwrap_or(0).min(2);
             } else if let Some(v) = get("note_page=") {
@@ -12235,7 +12842,13 @@ unsafe fn load_icons(st: &mut State) {
         // 外环条目也要真图标（与内环同一套管线）。URL / ms-* / shell:* / 文件夹
         // `decode_icon` 内部都已经处理；失败时画首字母兜底。
         for it in a.items.iter_mut() {
-            it.icon = decode_icon(&it.target).map(|(px, d)| IconTex::from_base(px, d));
+            // 网址条目（含捕获的浏览器页签，网址在 relaunch 里）：优先站点图标；
+            // 缓存没有就先挂浏览器图标，后台抓到再换（WM_APP_FAVDONE）。
+            it.icon = match item_site_host(it) {
+                Some(host) => favicon_for_host(&host, item_site_page(it).as_deref())
+                    .or_else(|| decode_icon(&it.target).map(|(px, d)| IconTex::from_base(px, d))),
+                None => decode_icon(&it.target).map(|(px, d)| IconTex::from_base(px, d)),
+            };
         }
     }
 }
@@ -12426,6 +13039,15 @@ unsafe fn load_ini(st: &mut State) {
         && !st.apps.iter().any(|a| a.target == "@act:note")
     {
         ini_insert_app(&st.ini_path, "便签", "@act:note");
+        load_ini(st);
+        return;
+    }
+    if st.sr_on
+        && st.sr_app < 2
+        && st.apps.len() < MAX_APPS
+        && !st.apps.iter().any(|a| a.target == "@act:search")
+    {
+        ini_insert_app(&st.ini_path, "检索", "@act:search");
         load_ini(st);
         return;
     }
@@ -13016,6 +13638,519 @@ unsafe fn assoc_exe(assoc: &str) -> Option<String> {
 unsafe fn default_browser_icon() -> Option<(usize, Vec<u8>)> {
     let exe = default_browser_exe()?;
     decode_icon(&exe)
+}
+
+// ───────────────────── 网址条目的站点图标（favicon）─────────────────────
+//
+// 外环里抓来的浏览器页签，以前统一显示浏览器自己的图标（Edge 的 e）。
+// 现在按 URL 的主机名去抓站点图标（/favicon.ico → /apple-touch-icon.png），
+// 解码成与内环同一条纹理管线（icon_px 方形），缓存到 config\favicons\<hash>.bin。
+// 抓取在后台线程做；同一主机只抓一次（失败了下个会话再试）。
+
+const WM_APP_FAVDONE: u32 = WM_APP + 73;
+static FAV_REQ: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static FAV_FETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn favicon_dir() -> String {
+    format!("{}/favicons", config_dir())
+}
+
+/// `https://user@host:443/path?q` → `host`（小写，不带端口）。
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?.trim().to_ascii_lowercase();
+    if host.is_empty() || host.len() > 120 || !host.contains('.') {
+        return None;
+    }
+    Some(host)
+}
+
+/// 文本里第一个 http(s) URL（窗口条目的 relaunch 是命令行，网址是其中一个词）。
+fn first_url(s: &str) -> Option<String> {
+    let start = s.find("http://").or_else(|| s.find("https://"))?;
+    let rest = &s[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>' || c == ')')
+        .unwrap_or(rest.len());
+    if end <= 8 {
+        return None;
+    }
+    Some(rest[..end].to_string())
+}
+
+/// 条目对应的站点主机：URL 条目看 target；窗口条目（kind==1）从 relaunch 里找网址。
+fn item_site_host(it: &ItemEntry) -> Option<String> {
+    if let Some(h) = url_host(&it.target) {
+        return Some(h);
+    }
+    if it.kind == 1 {
+        return first_url(&it.relaunch).and_then(|u| url_host(&u));
+    }
+    None
+}
+
+fn item_site_page(it: &ItemEntry) -> Option<String> {
+    if it.target.starts_with("http") {
+        return Some(it.target.clone());
+    }
+    if it.kind == 1 {
+        return first_url(&it.relaunch);
+    }
+    None
+}
+
+fn fav_key(host: &str) -> String {
+    let mut h: u64 = 1469598103934665603;
+    for b in host.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{h:016x}")
+}
+
+fn fav_cache_load(host: &str) -> Option<(usize, Vec<u8>)> {
+    let p = format!("{}/{}.bin", favicon_dir(), fav_key(host));
+    let b = std::fs::read(p).ok()?;
+    if b.len() < 8 {
+        return None;
+    }
+    let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    if w == 0 || w > 512 {
+        return None;
+    }
+    let data = b[8..].to_vec();
+    if data.len() != w * w * 4 {
+        return None;
+    }
+    Some((w, data))
+}
+
+fn fav_cache_save(host: &str, px: usize, data: &[u8]) {
+    let dir = favicon_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let p = format!("{dir}/{}.bin", fav_key(host));
+    let mut out = Vec::with_capacity(8 + data.len());
+    out.extend_from_slice(&(px as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(data);
+    let _ = std::fs::write(p, out);
+}
+
+/// 任意图片字节（ICO/PNG）→ icon_px 方形 BGRA（保持比例，居中透明填充）。
+unsafe fn decode_favicon_bytes(bytes: &[u8]) -> Option<(usize, Vec<u8>)> {
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapInterpolationModeHighQualityCubic,
+        WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    let target = icon_px().clamp(16, 256);
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(bytes))?;
+    let decoder = factory
+        .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+        .ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    let conv = factory.CreateFormatConverter().ok()?;
+    conv.Initialize(
+        &frame,
+        &GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone,
+        None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+        0.0,
+        WICBitmapPaletteTypeCustom,
+    )
+    .ok()?;
+    let (mut sw, mut sh) = (0u32, 0u32);
+    frame.GetSize(&mut sw, &mut sh).ok()?;
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (dw, dh) = if sw <= sh {
+        (
+            target as u32,
+            ((sh as f64) * target as f64 / sw as f64).round().max(1.0) as u32,
+        )
+    } else {
+        (
+            ((sw as f64) * target as f64 / sh as f64).round().max(1.0) as u32,
+            target as u32,
+        )
+    };
+    let scaler = factory.CreateBitmapScaler().ok()?;
+    scaler
+        .Initialize(&conv, dw, dh, WICBitmapInterpolationModeHighQualityCubic)
+        .ok()?;
+    let mut px = vec![0u8; (dw as usize) * (dh as usize) * 4];
+    scaler.CopyPixels(std::ptr::null(), dw * 4, &mut px).ok()?;
+    let mut out = vec![0u8; target * target * 4];
+    let ox = (target as i32 - dw as i32) / 2;
+    let oy = (target as i32 - dh as i32) / 2;
+    for y in 0..dh as usize {
+        for x in 0..dw as usize {
+            let dx = ox + x as i32;
+            let dy = oy + y as i32;
+            if dx < 0 || dy < 0 || dx >= target as i32 || dy >= target as i32 {
+                continue;
+            }
+            let s = (y * dw as usize + x) * 4;
+            let d = (dy as usize * target + dx as usize) * 4;
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    Some((target, out))
+}
+
+/// 从 HTML 里找 `<link rel="...icon..." href="...">`（现代站点基本只给这个，
+/// 直接猜 /favicon.ico 对 nvsgames / mdnice 这类站点会 204/404）。
+fn html_icon_links(html: &str) -> Vec<String> {
+    let low = html.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < low.len() && out.len() < 6 {
+        let Some(p) = low[i..].find("<link") else { break };
+        let s = i + p;
+        let e = low[s..].find('>').map(|x| s + x).unwrap_or(low.len());
+        if e > s {
+            let tag = &html[s..e];
+            let tl = &low[s..e];
+            if tl.contains("icon") {
+                if let Some(hp) = tl.find("href=") {
+                    let rest = tag[hp + 5..].trim_start();
+                    let href = if let Some(st) = rest.strip_prefix('"') {
+                        st.split('"').next().unwrap_or("")
+                    } else if let Some(st) = rest.strip_prefix('\'') {
+                        st.split('\'').next().unwrap_or("")
+                    } else {
+                        rest.split_whitespace().next().unwrap_or("")
+                    };
+                    if !href.is_empty() && !href.starts_with("data:") {
+                        out.push(href.replace("&amp;", "&"));
+                    }
+                }
+            }
+        }
+        i = e + 1;
+    }
+    out
+}
+
+fn abs_icon_url(host: &str, href: &str) -> Option<String> {
+    let h = href.trim();
+    if h.is_empty() {
+        return None;
+    }
+    if h.starts_with("http://") || h.starts_with("https://") {
+        return Some(h.to_string());
+    }
+    if let Some(rest) = h.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if h.starts_with('/') {
+        return Some(format!("https://{host}{h}"));
+    }
+    Some(format!("https://{host}/{h}"))
+}
+
+/// 只给 SVG favicon 的站点（mdnice 等）：WIC 不解 SVG，用 Direct2D 的 SVG 渲染器
+/// 画到 WIC 位图上再读回 BGRA。失败（老系统 / 接口 QI 不到）就当作没有图标。
+unsafe fn decode_svg_bytes(bytes: &[u8]) -> Option<(usize, Vec<u8>)> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+        D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1_RENDER_TARGET_USAGE_NONE, ID2D1DeviceContext5, ID2D1Factory,
+    };
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_F,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+        WICBitmapCacheOnLoad,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    // SVG 的画布是它自己的 viewBox（mdnice 是 346×194），不是正方形。
+    // 直接按 73×73 建视口会只画出左上角 —— 先读 viewBox/width-height，
+    // 按原始比例渲染，再缩进 icon_px 方形（透明留边）。
+    let text = String::from_utf8_lossy(bytes);
+    let (mut vw, mut vh) = (100.0f32, 100.0f32);
+    if let Some(p) = text.find("viewBox=") {
+        let rest = &text[p + 8..];
+        let val = rest.trim_start_matches(|c| c == '"' || c == '\'');
+        let val = val.split('"').next().unwrap_or("").split('\'').next().unwrap_or("");
+        let nums: Vec<f32> = val.split(|c: char| c == ',' || c.is_whitespace()).filter_map(|t| t.parse().ok()).collect();
+        if nums.len() == 4 && nums[2] > 1.0 && nums[3] > 1.0 {
+            vw = nums[2];
+            vh = nums[3];
+        }
+    }
+    let cap = 512.0f32;
+    let sc = (cap / vw.max(vh)).min(1.0);
+    let rw = (vw * sc).round().max(1.0) as u32;
+    let rh = (vh * sc).round().max(1.0) as u32;
+    let wic: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let bmp = wic
+        .CreateBitmap(rw, rh, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
+        .ok()?;
+    let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
+    let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    };
+    let rt = factory.CreateWicBitmapRenderTarget(&bmp, &props).ok()?;
+    let dc: ID2D1DeviceContext5 = rt.cast().ok()?;
+    let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(bytes))?;
+    let svg = dc
+        .CreateSvgDocument(
+            &stream,
+            D2D_SIZE_F {
+                width: rw as f32,
+                height: rh as f32,
+            },
+        )
+        .ok()?;
+    dc.BeginDraw();
+    dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+    dc.DrawSvgDocument(&svg);
+    let _ = dc.EndDraw(None, None);
+    let mut px = vec![0u8; (rw * rh * 4) as usize];
+    bmp.CopyPixels(std::ptr::null(), rw * 4, &mut px).ok()?;
+    // 预乘 → 直通
+    for c in px.chunks_exact_mut(4) {
+        let a = c[3] as u32;
+        if a > 0 && a < 255 {
+            for k in 0..3 {
+                c[k] = ((c[k] as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Some(fit_square_bgra(&px, rw as usize, rh as usize, icon_px().clamp(16, 256)))
+}
+
+/// 任意尺寸 BGRA → target 方形（保持比例、居中、双线性放大；缩小时按面积平均）。
+fn fit_square_bgra(src: &[u8], sw: usize, sh: usize, target: usize) -> (usize, Vec<u8>) {
+    let mut out = vec![0u8; target * target * 4];
+    if sw == 0 || sh == 0 {
+        return (target, out);
+    }
+    let scale = (target as f32 / sw as f32).min(target as f32 / sh as f32);
+    let dw = ((sw as f32 * scale).round() as usize).max(1);
+    let dh = ((sh as f32 * scale).round() as usize).max(1);
+    let ox = (target - dw) / 2;
+    let oy = (target - dh) / 2;
+    for y in 0..dh {
+        let sy = ((y as f32 + 0.5) / scale - 0.5).clamp(0.0, (sh - 1) as f32);
+        for x in 0..dw {
+            let sx = ((x as f32 + 0.5) / scale - 0.5).clamp(0.0, (sw - 1) as f32);
+            // 4 邻双线性
+            let (x0, y0) = (sx.floor() as usize, sy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(sw - 1), (y0 + 1).min(sh - 1));
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            let mut acc = [0.0f32; 4];
+            for (xx, yy, wgt) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                (x1, y0, fx * (1.0 - fy)),
+                (x0, y1, (1.0 - fx) * fy),
+                (x1, y1, fx * fy),
+            ] {
+                let o = (yy * sw + xx) * 4;
+                for k in 0..4 {
+                    acc[k] += src[o + k] as f32 * wgt;
+                }
+            }
+            let d = ((oy + y) * target + ox + x) * 4;
+            for k in 0..4 {
+                out[d + k] = acc[k].clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    (target, out)
+}
+
+/// 候选图标 URL：先猜三条常规路径，再抓页面 HTML 里的 `<link rel="icon">`
+/// （现代站点大多只给后一种）。
+fn favicon_candidates(host: &str, page: Option<&str>) -> Vec<String> {
+    let mut cands: Vec<String> = vec![
+        format!("https://{host}/favicon.ico"),
+        format!("https://{host}/apple-touch-icon.png"),
+        format!("https://{host}/favicon.png"),
+        format!("https://{host}/favicon-32x32.png"),
+        format!("http://{host}/favicon.ico"),
+    ];
+    let page_url = page.map(|p| p.to_string()).unwrap_or_else(|| format!("https://{host}/"));
+    if let Ok((200, body)) = http_get_raw_cb_t(&page_url, None, 2500, 3500) {
+        if body.len() <= 8 * 1024 * 1024 {
+            let html = String::from_utf8_lossy(&body);
+            for href in html_icon_links(&html) {
+                if let Some(u) = abs_icon_url(host, &href) {
+                    if !cands.iter().any(|c| c.eq_ignore_ascii_case(&u)) {
+                        cands.push(u);
+                    }
+                }
+            }
+        }
+    }
+    cands
+}
+
+fn favicon_fetch_async(host: &str, page: Option<String>) {
+    {
+        let mut q = FAV_REQ.lock().unwrap_or_else(|e| e.into_inner());
+        if q.iter().any(|h| h == host) {
+            return;
+        }
+        q.push(host.to_string());
+        if q.len() > 256 {
+            q.remove(0);
+        }
+    }
+    let h = host.to_string();
+    std::thread::spawn(move || {
+        wlog(&format!("fav-start host={h}"));
+        for url in favicon_candidates(&h, page.as_deref()) {
+            if let Ok((200, body)) = http_get_raw_cb_t(&url, None, 2000, 3000) {
+                if body.len() > 32 {
+                    let is_svg = body.starts_with(b"<svg") || body.windows(4).any(|w| w == b"<svg");
+                    let decoded = if is_svg {
+                        unsafe { decode_svg_bytes(&body) }
+                    } else {
+                        unsafe { decode_favicon_bytes(&body) }
+                    };
+                    if let Some((px, data)) = decoded {
+                        fav_cache_save(&h, px, &data);
+                        wlog(&format!("fav-ok host={h} px={px} url={url}"));
+                        unsafe {
+                            post(WM_APP_FAVDONE, 0, 0);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+unsafe fn favicon_for_host(host: &str, page: Option<&str>) -> Option<IconTex> {
+    if let Some((px, d)) = fav_cache_load(host) {
+        return Some(IconTex::from_base(px, d));
+    }
+    favicon_fetch_async(host, page.map(|p| p.to_string()));
+    None
+}
+
+const WM_APP_URLREPAIR: u32 = WM_APP + 74;
+static URL_REPAIR: std::sync::Mutex<Vec<(usize, usize, String)>> = std::sync::Mutex::new(Vec::new());
+static URL_REPAIR_AT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 启动后补一次「老条目缺网址」：早期捕获的浏览器页签只存了命令行（没有 URL），
+/// 图标只能挂在浏览器上。这里找标题对得上的浏览器窗口，读地址栏回填 —— 只读 UIA，
+/// 不切换/激活用户的标签页。
+pub fn repair_urls_start(st: &State) {
+    // 每次呼出都可以再试一次（15s 节流）：用户把那个页签切到前台后，
+    // 下一次开门就能把网址补上。
+    let now = unsafe { GetTickCount() };
+    let prev = URL_REPAIR_AT.load(Ordering::SeqCst);
+    if prev != 0 && now.wrapping_sub(prev) < 15_000 {
+        return;
+    }
+    URL_REPAIR_AT.store(now, Ordering::SeqCst);
+    // 待修列表在 UI 线程先拍好快照（后台线程不读 State）
+    let mut todo: Vec<(usize, usize, String)> = Vec::new();
+    for (ai, a) in st.apps.iter().enumerate() {
+        for (ii, it) in a.items.iter().enumerate() {
+            if it.kind == 1 && is_browser_exe(&it.target) && first_url(&it.relaunch).is_none() {
+                todo.push((ai, ii, it.name.clone()));
+            }
+        }
+    }
+    if todo.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let mut hits: Vec<(usize, usize, String)> = Vec::new();
+        for (ai, ii, name) in todo {
+            for hw in unsafe { windows_of_class("Chrome_WidgetWin_1", true) } {
+                let title = unsafe {
+                    let mut b = [0u16; 512];
+                    let n = GetWindowTextW(hw, &mut b);
+                    String::from_utf16_lossy(&b[..n as usize])
+                };
+                if !title_like(&title, &name) {
+                    continue;
+                }
+                if let Some(url) = unsafe { browser_window_url(hw) } {
+                    hits.push((ai, ii, url));
+                    break;
+                }
+            }
+        }
+        if !hits.is_empty() {
+            *URL_REPAIR.lock().unwrap_or_else(|e| e.into_inner()) = hits;
+            unsafe { post(WM_APP_URLREPAIR, 0, 0) };
+        }
+    });
+}
+
+unsafe fn repair_urls_apply(st: &mut State) {
+    let hits = std::mem::take(&mut *URL_REPAIR.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut changed = false;
+    for (ai, ii, url) in hits {
+        let Some(it) = st.apps.get(ai).and_then(|a| a.items.get(ii)) else { continue };
+        if it.kind != 1 || first_url(&it.relaunch).is_some() {
+            continue;
+        }
+        let exe = it.target.clone();
+        let name = it.name.clone();
+        let sec = st.apps[ai].name.clone();
+        st.apps[ai].items[ii].relaunch = url.clone();
+        ini_set_item(&st.ini_path, &sec, &name, &format!("{exe}|@win|{url}"));
+        wlog(&format!("url-repair app={} name={} url={}", sec, name, url));
+        if let Some(host) = url_host(&url) {
+            if let Some((px, d)) = fav_cache_load(&host) {
+                st.apps[ai].items[ii].icon = Some(IconTex::from_base(px, d));
+            } else {
+                favicon_fetch_async(&host, Some(url));
+            }
+        }
+        changed = true;
+    }
+    if changed && MENU_OPEN.load(Ordering::Relaxed) {
+        frame(st, 255);
+    }
+}
+
+/// 抓到一个新图标后：只刷新网址条目的图标（不重解全部图标），开着环就重画一帧。
+unsafe fn refresh_favicons(st: &mut State) {
+    let mut changed = false;
+    for a in st.apps.iter_mut() {
+        for it in a.items.iter_mut() {
+            if let Some(host) = item_site_host(it) {
+                if let Some((px, d)) = fav_cache_load(&host) {
+                    it.icon = Some(IconTex::from_base(px, d));
+                    changed = true;
+                } else {
+                    // 之前抓失败的站点：每次呼出给一次机会（同会话按 host 去重）
+                    favicon_fetch_async(&host, item_site_page(it));
+                }
+            }
+        }
+    }
+    if changed && MENU_OPEN.load(Ordering::Relaxed) {
+        frame(st, 255);
+    }
 }
 
 /// `shell:Downloads` / `shell:Desktop` / `shell:Personal`… → 真实文件夹路径。
@@ -13851,7 +14986,7 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
                             seg: (f32, f32, f32), r_in: f32, r_out: f32,
                             icon: Option<&IconTex>, name: &str,
                             fg: (u8, u8, u8), hot: f32, caret: bool, alpha: f32,
-                            loading: bool) {
+                            loading: bool, plate: bool) {
     let (mid_deg, a1, a2) = seg;
     let a8 = (255.0 * alpha).clamp(0.0, 255.0) as u8;
     if a8 == 0 {
@@ -13877,8 +15012,18 @@ unsafe fn draw_ring_content(st: &State, buf: &mut [u8], pal: &Pal,
     // 左端图标（各自贴弧、按该处切线转；与内环同一套纹理管线）
     let (ix, iy, iang) = place(-half + chip_pad_l() + chip_icon() * 0.5, 0.0);
     if let Some(tex) = icon {
-        draw_bgra_icon_rot(buf, ix, iy, chip_icon() * (1.0 + 0.06 * hot),
-                           tex, iang.to_radians(), alpha);
+        if plate {
+            // 站点图标（favicon）底下垫一块近白小牌：GitHub 这类单色黑 logo
+            // 直接画在深色胶囊上等于消失（2026-11-25 用户实测要求）。
+            let s = chip_icon() * 1.08;
+            rot_rrect(buf, ix, iy, s * 0.5, s * 0.5, s * 0.30, iang.to_radians(),
+                      mixc((255, 255, 255), pal.paper, 0.10), 0.94 * alpha);
+            draw_bgra_icon_rot(buf, ix, iy, chip_icon() * 0.78 * (1.0 + 0.06 * hot),
+                               tex, iang.to_radians(), alpha);
+        } else {
+            draw_bgra_icon_rot(buf, ix, iy, chip_icon() * (1.0 + 0.06 * hot),
+                               tex, iang.to_radians(), alpha);
+        }
     } else if let Some(ch) = name.chars().next() {
         // 拿不到图标（少数 shell: 命名空间）→ **中性**小底板 + 首字母。
         // 全界面唯一允许有颜色的东西是真实图标，所以这里不放彩色。
@@ -16610,8 +17755,11 @@ unsafe fn frame(st: &mut State, alpha: u8) {
     }
     let n = (canvas() * canvas() * 4) as usize;
     let buf = std::slice::from_raw_parts_mut(st.dbi_bits, n);
+    let t0 = GetTickCount();
     draw_scene(st, buf);
+    let t1 = GetTickCount();
     premultiply(buf);
+    let t2 = GetTickCount();
 
     let rh = RING_HWND.load(Ordering::Relaxed);
     if rh == 0 {
@@ -16637,6 +17785,30 @@ unsafe fn frame(st: &mut State, alpha: u8) {
         Some(&blend),
         ULW_ALPHA,
     );
+    // 慢帧取证：拆开"画 / 预乘 / 提交"三段 + 文字缓存命中率，1 秒最多一行。
+    // 公司机（GDI 被安全软件挂钩）上，胶囊名字每帧重画曾是整帧 100~700ms 的大头。
+    let t3 = GetTickCount();
+    let total = t3.wrapping_sub(t0);
+    if total > 100 {
+        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nowt = GetTickCount();
+        if nowt.wrapping_sub(LAST.load(Ordering::Relaxed)) > 1000 {
+            LAST.store(nowt, Ordering::Relaxed);
+            let chips = st.active_app
+                .and_then(|ai| st.apps.get(ai))
+                .map(|a| a.items.len())
+                .unwrap_or(0);
+            let bub = (st.bub_until > now_s()) as u8;
+            perf_line(&format!(
+                "PERF frame {total}ms draw={} prem={} ulw={} chips={chips} bub={bub} texhit={} texmiss={}",
+                t1.wrapping_sub(t0),
+                t2.wrapping_sub(t1),
+                t3.wrapping_sub(t2),
+                TEXT_HIT.load(Ordering::Relaxed),
+                TEXT_MISS.load(Ordering::Relaxed),
+            ));
+        }
+    }
 }
 
 // ───────────────────── 菜单生命周期 ─────────────────────
@@ -16648,6 +17820,7 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     unsafe {
         close_clip(st);
         close_note(st);
+        close_search(st);
     }
     let rh = RING_HWND.load(Ordering::Relaxed);
     if rh == 0 {
@@ -16713,6 +17886,10 @@ unsafe fn show_menu(st: &mut State, sx: i32, sy: i32, count_update: bool) {
     st.hiding = false;
     st.entering = true;
     st.ent0 = now_s();
+    // 每次呼出核对一次站点图标（缓存已有就换上；没有就再试一次抓取）。
+    // FAVDONE 可能落在环已收起的时候，这里兜住"下一次开门"。
+    refresh_favicons(st);
+    repair_urls_start(st);
     st.face0 = now_s();
     st.face_prev = 0.0;
     st.gaze = [0.0, 0.0];
@@ -17149,6 +18326,127 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 frame(st, 255);
             }
             LRESULT(0)
+        }
+        WM_APP_URLREPAIR => {
+            let st = state_of(hwnd);
+            unsafe { repair_urls_apply(st) };
+            LRESULT(0)
+        }
+        WM_APP_FAVDONE => {
+            let st = state_of(hwnd);
+            unsafe { refresh_favicons(st) };
+            LRESULT(0)
+        }
+        WM_APP_FAVSTAT => {
+            let st = state_of(hwnd);
+            let ai = w.0;
+            let mut bits = 0usize;
+            if let Some(a) = st.apps.get(ai) {
+                for (i, it) in a.items.iter().take(8).enumerate() {
+                    let host = item_site_host(it);
+                    let hit = host
+                        .as_deref()
+                        .map(|h| fav_cache_load(h).is_some())
+                        .unwrap_or(false);
+                    bits |= (host.is_some() as usize) << (3 * i);
+                    bits |= (hit as usize) << (3 * i + 1);
+                    bits |= (it.icon.is_some() as usize) << (3 * i + 2);
+                }
+            }
+            LRESULT(bits as isize)
+        }
+        WM_APP_HOVERSIM => {
+            let st = state_of(hwnd);
+            let ai = w.0;
+            if MENU_OPEN.load(Ordering::Relaxed) && ai < st.apps.len() {
+                st.active_app = Some(ai);
+                st.hover_chip = None;
+                st.chip_page[ai] = 0;
+                unsafe { frame(st, 255) };
+            }
+            LRESULT(0)
+        }
+        WM_APP_PVINFO => {
+            let st = state_of(hwnd);
+            let v = match w.0 as u32 {
+                0 => st.pv_shown as usize,
+                1 => st.pv_kind as usize,
+                2 => st.pv_lines.len(),
+                3 => st.pv_img.as_ref().map(|v| v.0 as usize).unwrap_or(0),
+                4 => st.pv_img.as_ref().map(|v| v.1 as usize).unwrap_or(0),
+                5 => st.pv_md as usize,
+                6 => st.pv_scroll as usize,
+                7 => st.pv_more as usize,
+                _ => 0,
+            };
+            LRESULT(v as isize)
+        }
+        WM_APP_SRTYPE => {
+            // 自动化：直接设类型（w & 0xFF = 类型，bit8 = 顺手把面板打开供截图）
+            let st = state_of(hwnd);
+            st.sr_type = (w.0 & 0xFF) as u8;
+            st.sr_type_open = (w.0 & 0x100) != 0;
+            sr_apply(st);
+            search_present(st);
+            LRESULT(st.sr_rows.len() as isize)
+        }
+        WM_APP_SRPREVIEW => {
+            let st = state_of(hwnd);
+            let i = w.0;
+            if let Some(row) = st.sr_rows.get(i) {
+                if row.kind != 1 {
+                    let p = row.path.clone();
+                    unsafe { preview_open(st, &p) };
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_SROPEN => {
+            let st = state_of(hwnd);
+            unsafe {
+                hide_menu(st);
+                open_search(st);
+            }
+            LRESULT(0)
+        }
+        WM_APP_SRINFO => {
+            let st = state_of(hwnd);
+            let v = match w.0 as u32 {
+                0 => st.sr_rows.len(),
+                1 => st.sr_sel,
+                2 => st.sr_q.chars().count(),
+                3 => SR_READY.load(Ordering::Relaxed) as usize,
+                4 => sr_index_count(),
+                5 => {
+                    let h = SEARCH_HWND.load(Ordering::Relaxed);
+                    (h != 0 && unsafe { IsWindowVisible(HWND(h as *mut c_void)) }.as_bool()) as usize
+                }
+                6 => st.sr_type as usize,
+                7 => st.sr_type_open as usize,
+                8 => st.sr_caret,
+                9 => st.sr_anchor,
+                10 => sr_chars(&st.sr_q),
+                11 => {
+                    // 前 8 个字节打包（自动化断言输入内容用）
+                    let mut v: u64 = 0;
+                    for (i, b) in st.sr_q.as_bytes().iter().take(8).enumerate() {
+                        v |= (*b as u64) << (8 * i);
+                    }
+                    v as usize
+                }
+                12..=15 => {
+                    // 类型下拉面板 rect（逻辑坐标：左/上/右/下），自动化点选用
+                    let (panel, _) = unsafe { sr_type_panel_rects(st.c_lo_dc, st) };
+                    match w.0 as u32 {
+                        12 => panel.left as usize,
+                        13 => panel.top as usize,
+                        14 => panel.right as usize,
+                        _ => panel.bottom as usize,
+                    }
+                }
+                _ => 0,
+            };
+            LRESULT(v as isize)
         }
         WM_APP_DROPINFO => {
             let st = state_of(hwnd);
@@ -18661,10 +19959,11 @@ const S_X1: i32 = S_W - 26;          // 内容区右边界
 const S_LIST_TOP: i32 = ACT_TOP_Y + ACT_LABEL_H + ACT_GAP;
 /// ⚠️ 列表底**不是**贴着页脚 —— 底下还要留一条独立的「剪贴板」开关卡（`clip_card_rect`）。
 /// 列表本身可滚，少给 72px 只是早一点开始滚。
-const S_LIST_BOT: i32 = S_H - 214;
+const S_LIST_BOT: i32 = S_H - 278;
 /// 应用页底部两张独立的「总开关」卡（剪贴板 / 便签）：和上面的应用行**故意长得
 /// 不一样**（圆角卡 + 右侧开关），因为它管的不是某个应用，而是这个功能开不开。
 /// 用户 2026-11-02：「粘贴板和便签都是默认展示的，应用里粘贴板下边加上便签的开关」。
+const SR_CARD_TOP: i32 = S_H - 262;
 const NOTE_CARD_TOP: i32 = S_H - 134;
 const CLIP_CARD_TOP: i32 = S_H - 198;
 const CLIP_CARD_H: i32 = 56;
@@ -18676,6 +19975,16 @@ fn clip_card_rect() -> RECT {
 /// 卡里那颗开关（右侧，离卡片边 14）
 fn clip_sw_rect() -> RECT {
     RECT { left: S_X1 - 60, top: CLIP_CARD_TOP + (CLIP_CARD_H - 26) / 2, right: S_X1 - 14, bottom: CLIP_CARD_TOP + (CLIP_CARD_H + 26) / 2 }
+}
+
+fn sr_card_rect() -> RECT {
+    RECT { left: S_X0, top: SR_CARD_TOP, right: S_X1, bottom: SR_CARD_TOP + CLIP_CARD_H }
+}
+fn sr_sw_rect() -> RECT {
+    RECT { left: S_X1 - 60, top: SR_CARD_TOP + (CLIP_CARD_H - 26) / 2, right: S_X1 - 14, bottom: SR_CARD_TOP + (CLIP_CARD_H + 26) / 2 }
+}
+fn sr_tip_rect() -> RECT {
+    RECT { left: S_X0 + 90, top: SR_CARD_TOP + 18, right: S_X0 + 108, bottom: SR_CARD_TOP + 36 }
 }
 
 fn note_card_rect() -> RECT {
@@ -18860,6 +20169,50 @@ enum Ctl {
     ClipOn,
     /// 便签总开关（和 `ClipOn` 同一个意思）
     NoteOn,
+    /// 检索卡：单击结果行是否自动预览（在「检索」页）
+    SrPreview,
+    /// 应用页底部「检索」总开关（关 = 轮盘上摘掉图标）
+    SearchOn,
+}
+
+// ── 检索页：目前只有一张「点击预览」开关卡 ──
+fn sr_page_card_rect() -> RECT {
+    RECT { left: S_X0, top: S_LIST_TOP, right: S_X1, bottom: S_LIST_TOP + CLIP_CARD_H }
+}
+fn sr_page_sw_rect() -> RECT {
+    RECT {
+        left: S_X1 - 60,
+        top: S_LIST_TOP + (CLIP_CARD_H - 26) / 2,
+        right: S_X1 - 14,
+        bottom: S_LIST_TOP + (CLIP_CARD_H + 26) / 2,
+    }
+}
+fn sr_page_tip_rect() -> RECT {
+    RECT { left: S_X0 + 90, top: S_LIST_TOP + 18, right: S_X0 + 108, bottom: S_LIST_TOP + 36 }
+}
+
+unsafe fn s_paint_search(st: &mut State, dc: HDC, pal: &Pal) {
+    let y = ACT_TOP_Y;
+    g_text(dc, "检索",
+        RECT { left: S_X0, top: y, right: S_X1, bottom: y + ACT_LABEL_H }, pal.ink, st.sf_bold, false);
+
+    let cr = sr_page_card_rect();
+    let tr = sr_page_tip_rect();
+    let sw = sr_page_sw_rect();
+    let hv = hov(st, Ctl::SrPreview);
+    g_rrect(
+        dc,
+        cr,
+        12,
+        mixc(pal.paper, pal.ink, 0.03 + 0.04 * hv),
+        Some(mixc(pal.paper, pal.ink, 0.12 + 0.10 * hv)),
+        2,
+    );
+    g_text(dc, "点击预览",
+        RECT { left: cr.left + 14, top: cr.top + 16, right: cr.left + 14 + 76, bottom: cr.top + 40 },
+        pal.ink, st.sf_body, false);
+    draw_tip_icon(st, dc, pal, tr, 11);
+    g_switch(dc, pal, sw, st.sw_a[8]);
 }
 
 // ══ 交互页几何（绘制与命中共用，别写第二份）══
@@ -19100,6 +20453,8 @@ fn tip_lines(id: u8) -> &'static [&'static str] {
         8 => &["关掉后轮盘上的「便签」图标一起消失。", "已经写下的便签不会丢，再打开接着写。"],
         9 => &["关着：玻璃实时透出桌面，但截图／录屏拍不到轮盘。", "开着：用呼出那一刻的桌面快照，截图／录屏能拍到轮盘。"],
         10 => &["逐项滚动：滚轮一格移动一个应用。", "整页翻页：滚轮一格翻一屏（12 个）。"],
+        11 => &["开着：单击结果行，右侧立即显示预览。", "关掉：单击只选中，双击或回车才打开文件。"],
+        12 => &["关掉后轮盘上的「检索」图标一起消失。", "已经建好的文件索引不会删，再打开直接能用。"],
         _ => &[],
     }
 }
@@ -19140,6 +20495,14 @@ fn tip_anchor(id: u8) -> (i32, i32, bool) {
             let r = act_scroll_tip_rect();
             (r.left, r.bottom + 6, false)
         }
+        11 => {
+            let r = sr_page_tip_rect();
+            (r.left, r.bottom + 6, false)
+        }
+        12 => {
+            let r = sr_tip_rect();
+            (r.left, r.top - 6, true)
+        }
         _ => (0, 0, false),
     }
 }
@@ -19159,6 +20522,7 @@ fn row_target_text(t: &str) -> &str {
     match t {
         "@act:clip" => "内置 · 剪贴板历史",
         "@act:note" => "内置 · 便签",
+        "@act:search" => "内置 · 全盘检索",
         "@act:start" => "内置 · 开始菜单",
         _ => t,
     }
@@ -19763,7 +21127,7 @@ unsafe fn g_switch(dc: HDC, pal: &Pal, r: RECT, anim: f32) {
 
 // ── 绘制 ──
 
-const S_PAGES: [&str; 4] = ["外观", "交互", "应用", "关于"];
+const S_PAGES: [&str; 5] = ["外观", "交互", "应用", "检索", "关于"];
 
 /// 控件当前的 hover 强度 0..1：新 hover 淡入、旧 hover 淡出。
 /// 用「渐变状态量」而不是布尔 —— 否则 hover 是硬切，没有过渡感。
@@ -20226,6 +21590,7 @@ unsafe fn settings_draw(st: &mut State, dc: HDC) {
         0 => s_paint_look(st, dc, &pal),
         1 => s_paint_act(st, dc, &pal),
         2 => s_paint_apps(st, dc, &pal),
+        3 => s_paint_search(st, dc, &pal),
         _ => s_paint_adv(st, dc, &pal),
     }
 
@@ -20714,9 +22079,10 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
     // ── 底部独立卡：「剪贴板」总开关 ──
     // 故意不跟着上面的应用行走同一套样式：它管的不是某个应用开不开，
     // 是整个功能存不存在（关掉连轮盘上那条图标都没有），混进列表会被当成一条可删的条目。
-    for (cr, tip_r, sw_r, title, ctl, tip_id, anim) in [
-        (clip_card_rect(), clip_tip_rect(), clip_sw_rect(), "剪贴板", Ctl::ClipOn, 7u8, st.sw_a[6]),
-        (note_card_rect(), note_tip_rect(), note_sw_rect(), "便签", Ctl::NoteOn, 8u8, st.sw_a[7]),
+    for (cr, tip_r, sw_r, title, ctl, tip_id, anim, title_w) in [
+        (sr_card_rect(), sr_tip_rect(), sr_sw_rect(), "检索", Ctl::SearchOn, 12u8, st.sw_a[9], 48),
+        (clip_card_rect(), clip_tip_rect(), clip_sw_rect(), "剪贴板", Ctl::ClipOn, 7u8, st.sw_a[6], 48),
+        (note_card_rect(), note_tip_rect(), note_sw_rect(), "便签", Ctl::NoteOn, 8u8, st.sw_a[7], 48),
     ] {
         let hv = hov(st, ctl);
         g_rrect(
@@ -20730,7 +22096,7 @@ unsafe fn s_paint_apps(st: &mut State, dc: HDC, pal: &Pal) {
         g_text(
             dc,
             title,
-            RECT { left: cr.left + 14, top: cr.top + 16, right: cr.left + 62, bottom: cr.top + 40 },
+            RECT { left: cr.left + 14, top: cr.top + 16, right: cr.left + 14 + title_w, bottom: cr.top + 40 },
             pal.ink,
             st.sf_body,
             false,
@@ -21159,9 +22525,23 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
                 return Ctl::ExcPlus(c as u8);
             }
         }
+        3 => {
+            if in_rect(sr_page_tip_rect(), x, y) {
+                return Ctl::Tip(11);
+            }
+            if in_rect(sr_page_card_rect(), x, y) {
+                return Ctl::SrPreview;
+            }
+        }
         2 => {
-            // 底部那张独立的「剪贴板」卡先判：它在 `S_LIST_BOT` 之下，
+            // 底部三张独立的「默认应用」卡先判：它们在 `S_LIST_BOT` 之下，
             // 走到下面那句「超出列表区 → None」就被吃掉了。
+            if in_rect(sr_tip_rect(), x, y) {
+                return Ctl::Tip(12);
+            }
+            if in_rect(sr_card_rect(), x, y) {
+                return Ctl::SearchOn;
+            }
             if in_rect(clip_tip_rect(), x, y) {
                 return Ctl::Tip(7);
             }
@@ -21242,6 +22622,22 @@ fn s_hit(st: &State, x: i32, y: i32) -> Ctl {
         _ => {}
     }
     Ctl::None
+}
+
+unsafe fn win_class_name(h: HWND) -> String {
+    let mut b = [0u16; 64];
+    let n = GetClassNameW(h, &mut b).max(0) as usize;
+    String::from_utf16_lossy(&b[..n.min(64)])
+}
+
+/// 检索卡 + 附着在它旁边的预览卡 = 一套东西：失焦看门狗要一起算，
+/// 否则「鼠标挪到右边卡上」会被判成离开 → 两张卡一起收掉（用户 2026-11-26 报）。
+unsafe fn sr_cursor_on_cards(st: &State, hwnd: HWND) -> bool {
+    if cursor_on_window(hwnd) {
+        return true;
+    }
+    let pvh = PV_HWND.load(Ordering::SeqCst);
+    pvh != 0 && st.pv_shown && cursor_on_window(HWND(pvh as *mut c_void))
 }
 
 /// 光标在不在这个窗口上（失焦看门狗用：鼠标停在卡上 = 用户正在用，别收）
@@ -21512,6 +22908,9 @@ unsafe fn s_do_del(st: &mut State, t: Ctl) {
             if st.apps.get(ai).map(|a| a.target == "@act:clip").unwrap_or(false) {
                 st.clip_app = 2;
             }
+            if st.apps.get(ai).map(|a| a.target == "@act:search").unwrap_or(false) {
+                st.sr_app = 2;
+            }
             st.apps.remove(ai);
             if st.set_expanded == ai {
                 st.set_expanded = usize::MAX;
@@ -21772,6 +23171,15 @@ unsafe fn s_click(st: &mut State, hwnd: HWND, x: i32, y: i32) {
             unsafe { note_set_on(st, !st.note_on) };
             setup_kick(st, hwnd);
         }
+        Ctl::SrPreview => {
+            st.sr_click_preview = !st.sr_click_preview;
+            unsafe { save_settings(st) };
+            setup_kick(st, hwnd);
+        }
+        Ctl::SearchOn => {
+            unsafe { sr_set_on(st, !st.sr_on) };
+            setup_kick(st, hwnd);
+        }
         Ctl::AppHead(ai) => {
             st.set_expanded = if st.set_expanded == ai { usize::MAX } else { ai };
             st.set_scroll = st.set_scroll.min(s_scroll_max(st));
@@ -21950,7 +23358,7 @@ unsafe fn kick_setup_frame(st: &mut State) {
 /// ⚠️ 映射只写这一份：`setup_tick` 拿它当动画目标，`open_settings` 打开时也直接
 ///    用它把 `sw_a` 对齐 —— 否则第一次打开会先画一帧 `State::new` 的初值
 ///    （用户 2026-11-07：录屏模式明明是开着的，设置页却显示关着）。
-fn sw_targets(st: &State) -> [f32; 8] {
+fn sw_targets(st: &State) -> [f32; 10] {
     [
         if st.persistent { 1.0 } else { 0.0 },
         if st.running { 1.0 } else { 0.0 },
@@ -21960,6 +23368,8 @@ fn sw_targets(st: &State) -> [f32; 8] {
         look_live_val(st),
         if st.cl_on { 1.0 } else { 0.0 },
         if st.note_on { 1.0 } else { 0.0 },
+        if st.sr_click_preview { 1.0 } else { 0.0 },
+        if st.sr_on { 1.0 } else { 0.0 },
     ]
 }
 
@@ -21988,7 +23398,7 @@ unsafe fn setup_tick(st: &mut State, hwnd: HWND) {
         }
     }
     let targets = sw_targets(st);
-    for i in 0..8 {
+    for i in 0..10 {
         let d = targets[i] - st.sw_a[i];
         if d.abs() > 0.003 {
             st.sw_a[i] += d * k;
@@ -22320,6 +23730,10 @@ unsafe fn save_settings(st: &State) {
     out.push_str(&format!("clip_x={}\r\n", st.cl_x));
     out.push_str(&format!("clip_y={}\r\n", st.cl_y));
     out.push_str(&format!("note={}\r\n", b(st.note_on)));
+    out.push_str(&format!("sr_preview={}\r\n", b(st.sr_click_preview)));
+    out.push_str(&format!("sr_type={}\r\n", st.sr_type));
+    out.push_str(&format!("search={}\r\n", b(st.sr_on)));
+    out.push_str(&format!("sr_ring_pos={}\r\n", st.sr_ring_pos));
     out.push_str(&format!("decor={}\r\n", st.decor.join(",")));
     out.push_str(&format!("avatar={}\r\n", b(st.avatar_on)));
     out.push_str(&format!("note_app={}\r\n", st.note_app));
@@ -23035,7 +24449,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
         .chain([(1usize, 3u8, -1), (1, 4, -1), (1, 5, -1), (1, 10, -1)])
         .chain([(0usize, 6u8, -1)])
         // 应用页底部「剪贴板」卡那个「?」
-        .chain([(2usize, 7u8, -1), (2, 8, -1)])
+        .chain([(3usize, 11u8, -1), (2, 12, -1), (2, 7, -1), (2, 8, -1)])
         // 外观页「录屏模式」的「?」
         .chain([(0usize, 9u8, -1)])
         // 交互页的 4 个引导步骤也出图（离屏没法点按钮，直接置位核对）
@@ -23085,7 +24499,7 @@ unsafe fn settings_dump(dir: &str, st: &mut State) {
 
     // 「关于」页 · 更新三态：有新版本 / 正在查找更新源（**不画进度条**）/ 下载中（进度条 + 右侧说明）
     {
-        st.set_page = 3;
+        st.set_page = 4;
         st.set_page_a = 1.0;
         st.guide_step = -1;
         st.tip = 0;
@@ -24450,6 +25864,57 @@ fn hide_clip_ring(st: &mut State) {
         }
         st.active_app = None;
     }
+}
+
+fn search_ring_entry() -> AppEntry {
+    AppEntry {
+        name: "检索".to_string(),
+        target: "@act:search".to_string(),
+        icon: None,
+        items: Vec::new(),
+        grad: grad_for("检索"),
+    }
+}
+
+/// 摘下轮盘上那条「检索」（记住槽位；不落盘）
+fn hide_search_ring(st: &mut State) {
+    if let Some(i) = st.apps.iter().position(|a| a.target == "@act:search") {
+        st.sr_ring_pos = i;
+        st.apps.remove(i);
+        st.set_edit_ai = usize::MAX;
+        st.set_edit_buf.clear();
+        if st.set_expanded == i {
+            st.set_expanded = usize::MAX;
+        } else if st.set_expanded != usize::MAX && st.set_expanded > i {
+            st.set_expanded -= 1;
+        }
+        st.active_app = None;
+    }
+}
+
+/// 检索总开关：关 = 关卡片 + 轮盘上摘掉图标；开 = 塞回原槽位。索引文件不动。
+unsafe fn sr_set_on(st: &mut State, on: bool) {
+    if st.sr_on == on {
+        return;
+    }
+    st.sr_on = on;
+    if on {
+        if st.sr_app < 2
+            && st.apps.len() < MAX_APPS
+            && !st.apps.iter().any(|a| a.target == "@act:search")
+        {
+            let at = st.sr_ring_pos.min(st.apps.len());
+            st.apps.insert(at, search_ring_entry());
+        }
+    } else {
+        if st.sr_shown {
+            close_search(st);
+        }
+        hide_search_ring(st);
+    }
+    save_settings(st);
+    load_icons(st);
+    println!("[*] 检索：{}", if on { "开" } else { "关（轮盘上不展示）" });
 }
 
 fn note_ring_entry() -> AppEntry {
@@ -26060,6 +27525,7 @@ fn clip_frost_tint(st: &State, bg: &mut [u8]) {
 enum Card {
     Clip,
     Note,
+    Search,
 }
 
 unsafe fn card_render(st: &mut State, card: Card) {
@@ -26103,6 +27569,7 @@ unsafe fn card_render(st: &mut State, card: Card) {
     match card {
         Card::Clip => clip_draw(st, st.c_hi_dc),
         Card::Note => note_draw(st, st.c_hi_dc),
+        Card::Search => search_draw(st, st.c_hi_dc),
     }
     let d_draw = t_draw.elapsed().as_secs_f32() * 1000.0;
     let mut id = XFORM { eM11: 1.0, eM22: 1.0, ..Default::default() };
@@ -26208,6 +27675,7 @@ unsafe fn card_present(st: &mut State, card: Card) {
     let (h, shown) = match card {
         Card::Clip => (CLIP_HWND.load(Ordering::SeqCst), st.cl_shown),
         Card::Note => (NOTE_HWND.load(Ordering::SeqCst), st.nt_shown),
+        Card::Search => (SEARCH_HWND.load(Ordering::SeqCst), st.sr_shown),
     };
     if h == 0 || !shown {
         return;
@@ -30926,6 +32394,3647 @@ unsafe fn updater_apply(new_path: &str, target: &str, parent_pid: u32) {
     }
 }
 
+// ───────────────────── 全盘文件名索引（检索 v1）─────────────────────
+//
+// 目标：比 Everything 更"选得出"文档。第一版只做**文件名**（正文索引随后接），
+// 但把排序和上下文先做对：文件名命中位置/完整度 + 最近使用（mtime）+ 路径命中。
+// 存储自己写（不引 SQLite）：1M 文件约 40~60MB，检索一次几十毫秒，exe 体积不变。
+
+const IDX_MAGIC: &[u8; 8] = b"PIGOIDX2";
+
+// 检索子系统共享的全局量（卡片/CLI/后台线程都读它们）
+static SR_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const IDX_MAX_ENTRIES: usize = 4_000_000;
+
+pub struct FileIdx {
+    pub dirs: Vec<String>,    // 目录完整路径（展示）
+    pub dirs_lc: Vec<String>, // 小写（检索用）
+    pub names: Vec<u8>,       // 文件名（原始大小写）UTF-8 拼接
+    pub names_lc: Vec<u8>,    // 小写副本（检索用；加载时现算，不落盘）
+    pub py_ini: Vec<u8>,      // 汉字拼音首字母串（工作周报 → gzzb）
+    pub py_full: Vec<u8>,     // 汉字全拼串（工作周报 → gongzuozhoubao）
+    pub name_off: Vec<u32>,
+    pub name_len: Vec<u16>,
+    pub name_lc_off: Vec<u32>,
+    pub name_lc_len: Vec<u16>,
+    pub ini_off: Vec<u32>,
+    pub ini_len: Vec<u16>,
+    pub full_off: Vec<u32>,
+    pub full_len: Vec<u16>,
+    pub dir_id: Vec<u32>,
+    pub mtime: Vec<u32>,
+    pub size_kb: Vec<u32>,
+    pub is_dir: Vec<u8>,
+    pub built_at: u64,
+}
+
+impl FileIdx {
+    fn new() -> Self {
+        FileIdx {
+            dirs: Vec::new(),
+            dirs_lc: Vec::new(),
+            names: Vec::new(),
+            names_lc: Vec::new(),
+            py_ini: Vec::new(),
+            py_full: Vec::new(),
+            name_off: Vec::new(),
+            name_len: Vec::new(),
+            name_lc_off: Vec::new(),
+            name_lc_len: Vec::new(),
+            ini_off: Vec::new(),
+            ini_len: Vec::new(),
+            full_off: Vec::new(),
+            full_len: Vec::new(),
+            dir_id: Vec::new(),
+            mtime: Vec::new(),
+            size_kb: Vec::new(),
+            is_dir: Vec::new(),
+            built_at: 0,
+        }
+    }
+    fn len(&self) -> usize {
+        self.name_off.len()
+    }
+    fn name_of(&self, i: usize) -> &[u8] {
+        let o = self.name_off[i] as usize;
+        let l = self.name_len[i] as usize;
+        &self.names[o..o + l]
+    }
+    fn name_lc_of(&self, i: usize) -> &[u8] {
+        let o = self.name_lc_off[i] as usize;
+        let l = self.name_lc_len[i] as usize;
+        &self.names_lc[o..o + l]
+    }
+    fn py_ini_of(&self, i: usize) -> &[u8] {
+        let o = self.ini_off[i] as usize;
+        let l = self.ini_len[i] as usize;
+        &self.py_ini[o..o + l]
+    }
+    fn py_full_of(&self, i: usize) -> &[u8] {
+        let o = self.full_off[i] as usize;
+        let l = self.full_len[i] as usize;
+        &self.py_full[o..o + l]
+    }
+    fn path_of(&self, i: usize) -> String {
+        let d = &self.dirs[self.dir_id[i] as usize];
+        let n = String::from_utf8_lossy(self.name_of(i)).to_string();
+        if d.ends_with('\\') {
+            format!("{d}{n}")
+        } else {
+            format!("{d}\\{n}")
+        }
+    }
+    fn push(&mut self, dir_id: u32, name: &str, mtime: u32, size_kb: u32, is_dir: bool) {
+        let n = name.len().min(u16::MAX as usize);
+        self.name_off.push(self.names.len() as u32);
+        self.name_len.push(n as u16);
+        self.names.extend_from_slice(&name.as_bytes()[..n]);
+        self.push_lc(name);
+        self.push_py(name);
+        self.dir_id.push(dir_id);
+        self.mtime.push(mtime);
+        self.size_kb.push(size_kb.min(u32::MAX - 1));
+        self.is_dir.push(is_dir as u8);
+    }
+    fn push_py(&mut self, name: &str) {
+        let (ini, full) = search_pinyin_keys(name);
+        let il = ini.len().min(u16::MAX as usize);
+        self.ini_off.push(self.py_ini.len() as u32);
+        self.ini_len.push(il as u16);
+        self.py_ini.extend_from_slice(&ini.as_bytes()[..il]);
+        let fl = full.len().min(u16::MAX as usize);
+        self.full_off.push(self.py_full.len() as u32);
+        self.full_len.push(fl as u16);
+        self.py_full.extend_from_slice(&full.as_bytes()[..fl]);
+    }
+    fn push_lc(&mut self, name: &str) {
+        let lc = name.to_lowercase();
+        let n = lc.len().min(u16::MAX as usize);
+        self.name_lc_off.push(self.names_lc.len() as u32);
+        self.name_lc_len.push(n as u16);
+        self.names_lc.extend_from_slice(&lc.as_bytes()[..n]);
+    }
+}
+
+#[derive(Default)]
+pub struct IdxStats {
+    pub files: u64,
+    pub dirs: u64,
+    pub truncated: bool,
+}
+
+/// 这些目录名整棵跳过：系统/回收站/包缓存/依赖目录（全盘正文索引的前提）。
+fn idx_skip_dir(name_lc: &str) -> bool {
+    matches!(
+        name_lc,
+        "windows"
+            | "$recycle.bin"
+            | "system volume information"
+            | "recovery"
+            | "$winreagent"
+            | "config.msi"
+            | "windows.old"
+            | "perflogs"
+            | "node_modules"
+            | "bower_components"
+            | ".git"
+            | ".svn"
+            | ".hg"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "env"
+            | ".tox"
+            | "target"
+            | ".gradle"
+            | ".m2"
+            | ".nuget"
+            | ".cache"
+            | ".npm"
+            | ".pnpm-store"
+            | "appdata"
+            | "programdata"
+            | "$sysreset"
+            | "onedrivetemp"
+            | "temp"
+            | "tmp"
+            | ".tmp"
+    )
+}
+
+fn win_filetime_to_unix(ft: u64) -> u32 {
+    // 1601-01-01 → 1970-01-01 = 11644473600 秒
+    let secs = (ft / 10_000_000).saturating_sub(11_644_473_600);
+    secs.min(u32::MAX as u64) as u32
+}
+
+unsafe fn idx_walk(root: &str, idx: &mut FileIdx, stats: &mut IdxStats) {
+    use windows::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
+    };
+    let mut stack: Vec<String> = vec![root.to_string()];
+    while let Some(dir) = stack.pop() {
+        if idx.len() >= IDX_MAX_ENTRIES {
+            stats.truncated = true;
+            return;
+        }
+        let dir_id = idx.dirs.len() as u32;
+        idx.dirs.push(dir.clone());
+        idx.dirs_lc.push(dir.to_lowercase());
+        stats.dirs += 1;
+
+        let pat = if dir.ends_with('\\') {
+            format!("{dir}*")
+        } else {
+            format!("{dir}\\*")
+        };
+        let mut wpat = wide(&pat);
+        let mut fd = std::mem::zeroed::<WIN32_FIND_DATAW>();
+        let h = match FindFirstFileW(PCWSTR(wpat.as_mut_ptr()), &mut fd) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        loop {
+            let name = PCWSTR(fd.cFileName.as_ptr()).to_string().unwrap_or_default();
+            if !name.is_empty() && name != "." && name != ".." {
+                let attr = fd.dwFileAttributes;
+                let is_dir = attr & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+                let is_rep = attr & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+                if !is_rep {
+                    let nlc = name.to_lowercase();
+                    if is_dir {
+                        if !idx_skip_dir(&nlc) {
+                            let child = if dir.ends_with('\\') {
+                                format!("{dir}{name}")
+                            } else {
+                                format!("{dir}\\{name}")
+                            };
+                            if child.len() <= 240 {
+                                stack.push(child);
+                            }
+                        }
+                    } else if idx.len() < IDX_MAX_ENTRIES {
+                        let ft = ((fd.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                            | fd.ftLastWriteTime.dwLowDateTime as u64;
+                        let sz = ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
+                        idx.push(
+                            dir_id,
+                            &name,
+                            win_filetime_to_unix(ft),
+                            ((sz + 1023) / 1024) as u32,
+                            false,
+                        );
+                        stats.files += 1;
+                        if stats.files & 0x3FF == 0 {
+                            SR_SCANNED.store(stats.files, Ordering::Relaxed);
+                        }
+                    } else {
+                        stats.truncated = true;
+                        let _ = FindClose(h);
+                        return;
+                    }
+                }
+            }
+            if FindNextFileW(h, &mut fd).is_err() {
+                break;
+            }
+        }
+        let _ = FindClose(h);
+    }
+}
+
+/// 枚举所有本地固定盘（跳 U 盘/光驱/网络盘 —— 全盘索引只对固定盘有意义）。
+pub unsafe fn idx_build_all() -> (FileIdx, IdxStats) {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    let mut idx = FileIdx::new();
+    let mut stats = IdxStats::default();
+    let mask = GetLogicalDrives();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{letter}:\\");
+        let mut w = wide(&root);
+        if GetDriveTypeW(PCWSTR(w.as_mut_ptr())) != DRIVE_FIXED {
+            continue;
+        }
+        idx_walk(&root, &mut idx, &mut stats);
+    }
+    idx.built_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (idx, stats)
+}
+
+pub fn idx_path() -> String {
+    format!("{}\\idx\\files.idx", config_dir())
+}
+
+pub fn idx_save(idx: &FileIdx) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = idx_path();
+    if let Some(p) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let tmp = format!("{path}.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(IDX_MAGIC)?;
+        f.write_all(&(idx.dirs.len() as u32).to_le_bytes())?;
+        f.write_all(&(idx.len() as u32).to_le_bytes())?;
+        f.write_all(&(idx.names.len() as u32).to_le_bytes())?;
+        f.write_all(&(idx.py_ini.len() as u32).to_le_bytes())?;
+        f.write_all(&(idx.py_full.len() as u32).to_le_bytes())?;
+        f.write_all(&idx.built_at.to_le_bytes())?;
+        for d in &idx.dirs {
+            f.write_all(&(d.len() as u32).to_le_bytes())?;
+            f.write_all(d.as_bytes())?;
+        }
+        f.write_all(&idx.names)?;
+        for v in &idx.name_off {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.name_len {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.dir_id {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.mtime {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.size_kb {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        f.write_all(&idx.is_dir)?;
+        f.write_all(&idx.py_ini)?;
+        f.write_all(&idx.py_full)?;
+        for v in &idx.ini_off {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.ini_len {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.full_off {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for v in &idx.full_len {
+            f.write_all(&v.to_le_bytes())?;
+        }
+    }
+    std::fs::rename(&tmp, &path)
+}
+
+fn rd_u32(b: &[u8], p: &mut usize) -> std::io::Result<u32> {
+    if *p + 4 > b.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "trunc"));
+    }
+    let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    Ok(v)
+}
+
+pub fn idx_load() -> Option<FileIdx> {
+    let b = std::fs::read(idx_path()).ok()?;
+    if b.len() < 20 || &b[0..8] != IDX_MAGIC {
+        return None;
+    }
+    let mut p = 8usize;
+    let ndirs = rd_u32(&b, &mut p).ok()? as usize;
+    let nent = rd_u32(&b, &mut p).ok()? as usize;
+    let nnames = rd_u32(&b, &mut p).ok()? as usize;
+    let n_pyini = rd_u32(&b, &mut p).ok()? as usize;
+    let n_pyfull = rd_u32(&b, &mut p).ok()? as usize;
+    let built_at = {
+        if p + 8 > b.len() {
+            return None;
+        }
+        let v = u64::from_le_bytes([
+            b[p], b[p + 1], b[p + 2], b[p + 3], b[p + 4], b[p + 5], b[p + 6], b[p + 7],
+        ]);
+        p += 8;
+        v
+    };
+    if ndirs > 500_000
+        || nent > IDX_MAX_ENTRIES
+        || nnames > 512 * 1024 * 1024
+        || n_pyini > 256 * 1024 * 1024
+        || n_pyfull > 512 * 1024 * 1024
+    {
+        return None;
+    }
+    let mut idx = FileIdx::new();
+    idx.built_at = built_at;
+    for _ in 0..ndirs {
+        let l = rd_u32(&b, &mut p).ok()? as usize;
+        if p + l > b.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&b[p..p + l]).to_string();
+        p += l;
+        idx.dirs_lc.push(s.to_lowercase());
+        idx.dirs.push(s);
+    }
+    if p + nnames > b.len() {
+        return None;
+    }
+    idx.names.extend_from_slice(&b[p..p + nnames]);
+    p += nnames;
+    let need = nent * (4 + 2 + 4 + 4 + 4) + nent;
+    if p + need > b.len() {
+        return None;
+    }
+    for _ in 0..nent {
+        idx.name_off.push(rd_u32(&b, &mut p).ok()?);
+    }
+    for _ in 0..nent {
+        if p + 2 > b.len() {
+            return None;
+        }
+        idx.name_len.push(u16::from_le_bytes([b[p], b[p + 1]]));
+        p += 2;
+    }
+    for _ in 0..nent {
+        idx.dir_id.push(rd_u32(&b, &mut p).ok()?);
+    }
+    for _ in 0..nent {
+        idx.mtime.push(rd_u32(&b, &mut p).ok()?);
+    }
+    for _ in 0..nent {
+        idx.size_kb.push(rd_u32(&b, &mut p).ok()?);
+    }
+    if p + nent > b.len() {
+        return None;
+    }
+    idx.is_dir.extend_from_slice(&b[p..p + nent]);
+    p += nent;
+    // 小写检索副本：加载时现算（不落盘），回车键/名字显示仍用原大小写
+    let mut lc = Vec::with_capacity(idx.names.len());
+    let mut loff = Vec::with_capacity(nent);
+    let mut llen = Vec::with_capacity(nent);
+    let mut prev_end = 0usize;
+    for i in 0..nent {
+        let o = idx.name_off[i] as usize;
+        let l = idx.name_len[i] as usize;
+        // 名字在 arena 里是连续追加的：直接取原文切片做小写
+        let end = if i + 1 < nent { idx.name_off[i + 1] as usize } else { idx.names.len() };
+        let _ = (o, l, prev_end);
+        prev_end = end;
+        let s = String::from_utf8_lossy(&idx.names[o..end.min(idx.names.len())]);
+        let low = s.to_lowercase();
+        loff.push(lc.len() as u32);
+        llen.push(low.len().min(u16::MAX as usize) as u16);
+        lc.extend_from_slice(&low.as_bytes()[..low.len().min(u16::MAX as usize)]);
+    }
+    idx.names_lc = lc;
+    idx.name_lc_off = loff;
+    idx.name_lc_len = llen;
+    // 拼音两段（构建时算好，加载直接读）
+    if p + n_pyini + n_pyfull + nent * (4 + 2 + 4 + 2) > b.len() {
+        return None;
+    }
+    idx.py_ini.extend_from_slice(&b[p..p + n_pyini]);
+    p += n_pyini;
+    idx.py_full.extend_from_slice(&b[p..p + n_pyfull]);
+    p += n_pyfull;
+    for _ in 0..nent {
+        idx.ini_off.push(rd_u32(&b, &mut p).ok()?);
+    }
+    for _ in 0..nent {
+        if p + 2 > b.len() {
+            return None;
+        }
+        idx.ini_len.push(u16::from_le_bytes([b[p], b[p + 1]]));
+        p += 2;
+    }
+    for _ in 0..nent {
+        idx.full_off.push(rd_u32(&b, &mut p).ok()?);
+    }
+    for _ in 0..nent {
+        if p + 2 > b.len() {
+            return None;
+        }
+        idx.full_len.push(u16::from_le_bytes([b[p], b[p + 1]]));
+        p += 2;
+    }
+    Some(idx)
+}
+
+fn mem_find_lc(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    let first = needle[0];
+    let last = hay.len() - needle.len();
+    let mut i = 0usize;
+    while i <= last {
+        if hay[i] == first && &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// ── 「搜到后真打开过」的使用记录：排序的第二权重 ──
+// 只记路径 + 次数 + 最近时间；打开才加。文件在 config\search_used.txt。
+static SEARCH_USAGE: std::sync::Mutex<Option<std::collections::HashMap<String, (u32, u32)>>> =
+    std::sync::Mutex::new(None);
+
+fn search_usage_path() -> String {
+    format!("{}/search_used.txt", config_dir())
+}
+
+fn search_usage_ensure() {
+    let mut g = SEARCH_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some() {
+        return;
+    }
+    let mut m = std::collections::HashMap::new();
+    if let Ok(txt) = std::fs::read_to_string(search_usage_path()) {
+        for ln in txt.lines() {
+            let mut it = ln.splitn(3, '\u{9}');
+            let (Some(c), Some(t), Some(p)) = (it.next(), it.next(), it.next()) else { continue };
+            if p.is_empty() {
+                continue;
+            }
+            let cnt = c.parse::<u32>().unwrap_or(0);
+            let last = t.parse::<u32>().unwrap_or(0);
+            m.insert(p.to_lowercase(), (cnt, last));
+        }
+    }
+    *g = Some(m);
+}
+
+pub fn search_usage_record(path: &str) {
+    search_usage_ensure();
+    let now = unix_now() as u32;
+    let snapshot = {
+        let mut g = SEARCH_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = g.as_mut() else { return };
+        let e = m.entry(path.to_lowercase()).or_insert((0, 0));
+        e.0 = e.0.saturating_add(1).min(9999);
+        e.1 = now;
+        m.clone()
+    };
+    // 条数很少（几十~几百），整文件重写 + 原子替换足够
+    let mut out = String::with_capacity(snapshot.len() * 48);
+    for (p, (c, t)) in snapshot {
+        out.push_str(&format!("{c}	{t}	{p}
+"));
+    }
+    let f = search_usage_path();
+    let tmp = format!("{f}.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, &f);
+    }
+}
+
+#[derive(Clone)]
+pub struct FileHit {
+    pub score: i32,
+    pub path: String,
+    pub name: String,
+    pub mtime: u32,
+    pub size_kb: u32,
+    pub is_dir: bool,
+}
+
+/// 分词（空格）都命中：优先文件名，其次目录路径；命中位置/完整度给分，再叠 mtime 新鲜度。
+pub fn idx_search(idx: &FileIdx, query: &str, limit: usize, now: u32) -> Vec<FileHit> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let toks: Vec<&[u8]> = q.split_whitespace().map(|t| t.as_bytes()).collect();
+    if toks.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<FileHit> = Vec::new();
+    let cap = (limit.saturating_mul(8)).max(400);
+    // 目录小写字符串的逐条检查很贵（每个文件都做一次）。DFS 枚举出来的条目同目录相邻，
+    // 缓存「上一个目录 + 该 token 是否命中」→ 检查次数从"文件数"降到"目录数"。
+    let mut dcache: Vec<(u32, bool)> = vec![(u32::MAX, false); toks.len()];
+    for i in 0..idx.len() {
+        let name = idx.name_lc_of(i);
+        if name.is_empty() {
+            continue;
+        }
+        let mut score = 0i32;
+        let mut all = true;
+        for (ti, t) in toks.iter().enumerate() {
+            let ascii_t = t.iter().all(|b| b.is_ascii_alphanumeric());
+            match mem_find_lc(name, t) {
+                Some(0) if name.len() == t.len() => score += 80,
+                Some(0) => score += 55,
+                Some(_) => score += 35,
+                None => {
+                    // 拼音：全拼前缀 > 首字母命中 > 全拼包含（汉字文件名），
+                    // 然后再退到目录命中（"桌面 周报" 这类）。
+                    let mut s = 0;
+                    if ascii_t {
+                        let full = idx.py_full_of(i);
+                        let ini = idx.py_ini_of(i);
+                        if !full.is_empty() && full.starts_with(t) {
+                            s = 45;
+                        } else if !ini.is_empty() && mem_find_lc(ini, t).is_some() {
+                            s = 30;
+                        } else if !full.is_empty() && mem_find_lc(full, t).is_some() {
+                            s = 22;
+                        }
+                    }
+                    if s > 0 {
+                        score += s;
+                    } else {
+                        let d = idx.dir_id[i];
+                        let ok_dir = if dcache[ti].0 == d {
+                            dcache[ti].1
+                        } else {
+                            let r = idx
+                                .dirs_lc[d as usize]
+                                .as_bytes()
+                                .windows(t.len())
+                                .any(|w| w == *t);
+                            dcache[ti] = (d, r);
+                            r
+                        };
+                        if ok_dir {
+                            score += 8;
+                        } else {
+                            all = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !all {
+            continue;
+        }
+        // 新鲜度：7 天 +18 / 30 天 +10 / 一年 +3。
+        // （原来 40/20/6 太猛：刚改过的无关文件会压过名字更准的文档。）
+        let age = now.saturating_sub(idx.mtime[i]);
+        score += if age < 7 * 86400 {
+            18
+        } else if age < 30 * 86400 {
+            10
+        } else if age < 365 * 86400 {
+            3
+        } else {
+            0
+        };
+        // 文件夹本身降一档：多数时候找的是文件
+        if idx.is_dir[i] != 0 {
+            score -= 10;
+        }
+        hits.push(FileHit {
+            score,
+            path: idx.path_of(i),
+            name: String::from_utf8_lossy(idx.name_of(i)).to_string(),
+            mtime: idx.mtime[i],
+            size_kb: idx.size_kb[i],
+            is_dir: idx.is_dir[i] != 0,
+        });
+        if hits.len() >= cap {
+            break;
+        }
+    }
+    hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.mtime.cmp(&a.mtime)));
+    // 使用记录加权：只对前 160 个候选做（每次全量拼小写路径太贵），
+    // 打开过的文件 + 次数/最近加成，然后重排。
+    search_usage_ensure();
+    let top = hits.len().min(160);
+    if let Ok(g) = SEARCH_USAGE.lock() {
+        if let Some(map) = g.as_ref() {
+            if !map.is_empty() {
+                for h in hits.iter_mut().take(top) {
+                    let key = h.path.to_lowercase();
+                    if let Some(&(cnt, last)) = map.get(&key) {
+                        let mut b = (cnt.min(6) * 4) as i32;
+                        let age = now.saturating_sub(last);
+                        if age < 7 * 86400 {
+                            b += 18;
+                        } else if age < 30 * 86400 {
+                            b += 8;
+                        }
+                        h.score += b;
+                    }
+                }
+                hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.mtime.cmp(&a.mtime)));
+            }
+        }
+    }
+    hits.truncate(limit);
+    hits
+}
+
+// ───────────────────── 检索卡片（RLSearch）─────────────────────
+//
+// 和剪贴板 / 便签同一套卡片：独立分层窗口、同一块画布与材质、失焦收起。
+// 交互：顶部输入（支持 IME）、结果列表（↑↓/PgUp/PgDn/Home/End）、
+//       Enter 打开、Shift+Enter 打开所在目录、Esc 关闭、滚轮翻行、单击选中/双击打开。
+
+static SEARCH_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 索引本体：后台线程装载/重建后放到这里；检索时短暂加锁。
+static SR_IDX: std::sync::Mutex<Option<FileIdx>> = std::sync::Mutex::new(None);
+static SR_BOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SR_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SR_BUILDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const TIMER_SR_BLINK: usize = 11;
+const TIMER_SR_FG: usize = 12;
+
+const SR_ROW_H: i32 = 44;
+const SR_ROWS: usize = 8;
+const SR_LIMIT: usize = 60;
+
+fn sr_sheet() -> RECT {
+    RECT {
+        left: CL_PAD,
+        top: CL_PAD + 4,
+        right: CL_W - CL_PAD,
+        bottom: CL_H - CL_PAD,
+    }
+}
+/// 排序/聚合方式：0 相关度（默认）· 1 时间倒序 · 2 目录聚合
+const SR_SORT_NAMES: [&str; 2] = ["相关度", "时间"];
+
+/// 「常用文件」筛选：0 = 全部；名字会显示在下拉里
+const SR_TYPES: [(&str, &[&str]); 10] = [
+    ("全部", &[]),
+    ("Word", &["doc", "docx", "docm", "dotx", "wps", "rtf", "odt"]),
+    ("Excel", &["xls", "xlsx", "xlsm", "csv"]),
+    ("PPT", &["ppt", "pptx"]),
+    ("PDF", &["pdf"]),
+    ("文本", &["txt", "md", "markdown", "log", "ini", "conf"]),
+    ("图片", &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "svg", "tif", "tiff"]),
+    (
+        "代码",
+        &[
+            "rs", "js", "ts", "jsx", "tsx", "py", "java", "c", "h", "cpp", "hpp", "cs", "go",
+            "rb", "php", "html", "htm", "css", "scss", "less", "xml", "yml", "yaml", "toml",
+            "json", "sql", "sh", "bat", "ps1", "vue",
+        ],
+    ),
+    ("压缩包", &["zip", "rar", "7z", "tar", "gz", "tgz"]),
+    ("音视频", &["mp3", "wav", "flac", "m4a", "aac", "mp4", "mkv", "avi", "mov", "wmv", "webm"]),
+];
+
+fn sr_type_ok(path: &str, t: u8) -> bool {
+    let Some((_, exts)) = SR_TYPES.get(t as usize) else {
+        return true;
+    };
+    if exts.is_empty() {
+        return true;
+    }
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    exts.iter().any(|x| *x == ext)
+}
+
+fn sr_type_label(t: u8) -> &'static str {
+    if t == 0 {
+        "常用文件"
+    } else {
+        SR_TYPES.get(t as usize).map(|x| x.0).unwrap_or("常用文件")
+    }
+}
+
+fn sr_chars(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn sr_sel_range(st: &State) -> Option<(usize, usize)> {
+    let (a, b) = (st.sr_anchor.min(st.sr_caret), st.sr_anchor.max(st.sr_caret));
+    if a == b {
+        None
+    } else {
+        Some((a, b))
+    }
+}
+
+/// 删掉 [a, b) 并把光标收回到 a
+fn sr_edit_delete(st: &mut State, a: usize, b: usize) {
+    let mut out = String::new();
+    for (i, ch) in st.sr_q.chars().enumerate() {
+        if i < a || i >= b {
+            out.push(ch);
+        }
+    }
+    st.sr_q = out;
+    st.sr_caret = a;
+    st.sr_anchor = a;
+}
+
+fn sr_edit_insert(st: &mut State, ch: char) {
+    if let Some((a, b)) = sr_sel_range(st) {
+        sr_edit_delete(st, a, b);
+    }
+    let len = sr_chars(&st.sr_q);
+    let at = st.sr_caret.min(len);
+    let mut out = String::new();
+    for (i, c) in st.sr_q.chars().enumerate() {
+        if i == at {
+            out.push(ch);
+        }
+        out.push(c);
+    }
+    if at >= len {
+        out.push(ch);
+    }
+    st.sr_q = out;
+    st.sr_caret = at + 1;
+    st.sr_anchor = st.sr_caret;
+}
+
+fn sr_edit_backspace(st: &mut State) -> bool {
+    if let Some((a, b)) = sr_sel_range(st) {
+        sr_edit_delete(st, a, b);
+        return true;
+    }
+    if st.sr_caret == 0 {
+        return false;
+    }
+    let c = st.sr_caret;
+    sr_edit_delete(st, c - 1, c);
+    true
+}
+
+/// 点击位置 → 字符下标（取最近的字符边界）
+unsafe fn sr_caret_at_x(st: &State, x: i32) -> usize {
+    let ir = sr_input_rect();
+    let mut cur = ir.left + 14;
+    let mut idx = 0;
+    for (i, ch) in st.sr_q.chars().enumerate() {
+        let mut b = [0u8; 4];
+        let w = s_text_w(st.c_lo_dc, ch.encode_utf8(&mut b), st.cf_note);
+        if x < cur + w / 2 {
+            return i;
+        }
+        cur += w;
+        idx = i + 1;
+    }
+    idx
+}
+
+/// 字符下标 → 输入框里的 x
+unsafe fn sr_caret_x(st: &State, idx: usize) -> i32 {
+    let ir = sr_input_rect();
+    let prefix: String = st.sr_q.chars().take(idx).collect();
+    (ir.left + 14 + s_text_w(st.c_lo_dc, &prefix, st.cf_note)).min(ir.right - 6)
+}
+
+/// 「常用文件」胶囊（排在排序胶囊右侧）
+unsafe fn sr_type_chip_rect(dc: HDC, st: &State) -> RECT {
+    let chips = sr_chip_rects(dc, st);
+    let x = chips.last().map(|(r, _)| r.right + 6).unwrap_or(sr_chips_rect().left);
+    let w = s_text_w(dc, sr_type_label(st.sr_type), st.cf_small) + 20;
+    RECT { left: x, top: sr_chips_rect().top, right: x + w, bottom: sr_chips_rect().bottom }
+}
+
+/// 「胶囊 + 缝隙 + 面板」的整块热区：鼠标从胶囊移向面板的 6px 缝里不能判成离开
+unsafe fn sr_type_zone(dc: HDC, st: &State) -> RECT {
+    let chip = sr_type_chip_rect(dc, st);
+    let (panel, _) = sr_type_panel_rects(dc, st);
+    RECT {
+        left: chip.left.min(panel.left) - 2,
+        top: chip.top - 2,
+        right: chip.right.max(panel.right) + 2,
+        bottom: panel.bottom + 2,
+    }
+}
+
+/// 类型下拉：面板矩形 + 每个条目的矩形
+unsafe fn sr_type_panel_rects(dc: HDC, st: &State) -> (RECT, Vec<(RECT, u8)>) {
+    let chip = sr_type_chip_rect(dc, st);
+    let mut w = 88;
+    for (name, _) in SR_TYPES.iter() {
+        w = w.max(s_text_w(dc, name, st.cf_small) + 36);
+    }
+    let item_h = 26;
+    let mut items = Vec::new();
+    let mut y = chip.bottom + 6;
+    for i in 0..SR_TYPES.len() {
+        items.push((RECT { left: chip.left, top: y, right: chip.left + w, bottom: y + item_h }, i as u8));
+        y += item_h;
+    }
+    let panel = RECT { left: chip.left, top: chip.bottom + 6, right: chip.left + w, bottom: y + 4 };
+    (panel, items)
+}
+
+fn sr_input_rect() -> RECT {
+    let s = sr_sheet();
+    RECT { left: s.left + 12, top: s.top + 8, right: s.right - 96, bottom: s.top + 46 }
+}
+fn sr_chips_rect() -> RECT {
+    let s = sr_sheet();
+    RECT { left: s.left + 12, top: s.top + 54, right: s.right - 12, bottom: s.top + 76 }
+}
+fn sr_list_rect() -> RECT {
+    let s = sr_sheet();
+    RECT { left: s.left + 8, top: s.top + 84, right: s.right - 8, bottom: s.bottom - 8 }
+}
+/// 三颗排序胶囊的矩形（按文字宽度排，左对齐）
+unsafe fn sr_chip_rects(dc: HDC, st: &State) -> Vec<(RECT, u8)> {
+    let r = sr_chips_rect();
+    let mut x = r.left;
+    let mut out = Vec::with_capacity(SR_SORT_NAMES.len());
+    for (i, name) in SR_SORT_NAMES.iter().enumerate() {
+        let w = s_text_w(dc, name, st.cf_small) + 20;
+        out.push((RECT { left: x, top: r.top, right: x + w, bottom: r.bottom }, i as u8));
+        x += w + 6;
+    }
+    out
+}
+
+/// 后台装载索引：有就先用（哪怕旧），再从后台重建并替换。
+fn search_index_boot() {
+    if SR_BOOT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let now = unix_now() as u64;
+        let mut idx = idx_load();
+        let stale = idx
+            .as_ref()
+            .map(|i| now > i.built_at + 7 * 86400)
+            .unwrap_or(true);
+        // ⚠️ 旧索引**先装上、先能搜**（Everything 那种「正在更新数据库、不能搜」正是这里做反了）；
+        //    过期的旧数据在后台重建期间继续用，重建完再原子换掉。
+        if let Some(i) = idx.take() {
+            *SR_IDX.lock().unwrap_or_else(|e| e.into_inner()) = Some(i);
+            SR_READY.store(true, Ordering::SeqCst);
+        }
+        if stale {
+            SR_BUILDING.store(true, Ordering::SeqCst);
+            SR_SCANNED.store(0, Ordering::SeqCst);
+            let (fresh, _st) = unsafe { idx_build_all() };
+            let _ = idx_save(&fresh);
+            *SR_IDX.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+            SR_BUILDING.store(false, Ordering::SeqCst);
+            SR_READY.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+fn sr_index_count() -> usize {
+    SR_IDX
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|i| i.len()))
+        .unwrap_or(0)
+}
+
+/// 列表里的一行：文件，或「目录聚合」下的目录头。
+#[derive(Clone)]
+struct SrRow {
+    kind: u8, // 0 = 文件, 1 = 目录头
+    name: String,
+    sub: String,
+    path: String,
+    mtime: u32,
+    size_kb: u32,
+    count: u32,
+}
+
+unsafe fn sr_rows_fill(st: &mut State) {
+    st.sr_rows.clear();
+    st.sr_sel = 0;
+    st.sr_scroll = 0;
+    if st.sr_hits.is_empty() {
+        return;
+    }
+    let mut hits = st.sr_hits.clone();
+    if st.sr_sort == 1 {
+        hits.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.score.cmp(&a.score)));
+    }
+    if st.sr_sort == 2 {
+        // 目录聚合：只列目录（名字 + N 项 + 箭头）；展开的那个下面挂最多 4 个文件。
+        let mut groups: Vec<(String, Vec<FileHit>)> = Vec::new();
+        for h in hits {
+            let d = match h.path.rsplit_once('\\') {
+                Some((d, _)) => d.to_string(),
+                None => String::new(),
+            };
+            match groups.iter_mut().find(|(gd, _)| *gd == d) {
+                Some((_, v)) => v.push(h),
+                None => groups.push((d, vec![h])),
+            }
+        }
+        let open = st.sr_dir_open.clone();
+        for (d, v) in groups {
+            let cnt = v.len() as u32;
+            let dname = d.rsplit_once('\\').map(|(_, n)| n).unwrap_or(&d).to_string();
+            st.sr_rows.push(SrRow {
+                kind: 1,
+                name: if dname.is_empty() { d.clone() } else { dname },
+                sub: d.clone(),
+                path: d.clone(),
+                mtime: v.first().map(|h| h.mtime).unwrap_or(0),
+                size_kb: 0,
+                count: cnt,
+            });
+            if open.as_deref() == Some(d.as_str()) {
+                for h in v.into_iter().take(4) {
+                    st.sr_rows.push(SrRow {
+                        kind: 2,
+                        name: h.name,
+                        sub: String::new(),
+                        path: h.path,
+                        mtime: h.mtime,
+                        size_kb: h.size_kb,
+                        count: 0,
+                    });
+                }
+            }
+            if st.sr_rows.len() >= 240 {
+                break;
+            }
+        }
+        return;
+    }
+    for h in hits {
+        let dir = h.path.rsplit_once('\\').map(|(d, _)| d.to_string()).unwrap_or_default();
+        st.sr_rows.push(SrRow {
+            kind: 0,
+            name: h.name,
+            sub: dir,
+            path: h.path,
+            mtime: h.mtime,
+            size_kb: h.size_kb,
+            count: 0,
+        });
+    }
+}
+
+unsafe fn sr_apply(st: &mut State) {
+    let q = st.sr_q.trim().to_string();
+    st.sr_hits = Vec::new();
+    st.sr_rows.clear();
+    st.sr_sel = 0;
+    st.sr_scroll = 0;
+    if q.is_empty() {
+        st.sr_note.clear();
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let hits = {
+        let g = SR_IDX.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some(idx) => idx_search(idx, &q, SR_LIMIT, unix_now() as u32),
+            None => Vec::new(),
+        }
+    };
+    let mut hits = hits;
+    if st.sr_type != 0 {
+        hits.retain(|h| sr_type_ok(&h.path, st.sr_type));
+    }
+    st.sr_hits = hits;
+    st.sr_note = format!("{:.0}ms", t0.elapsed().as_secs_f32() * 1000.0);
+    sr_rows_fill(st);
+}
+
+unsafe fn sr_open_hit(path: &str, reveal: bool) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    let op = wide("open");
+    let mut file = wide(path);
+    let ok = if reveal {
+        // 打开所在目录并选中它
+        let args = wide(&format!("/select,\"{}\"", path));
+        let exe = wide("explorer.exe");
+        let r = ShellExecuteW(
+            HWND(ptr::null_mut()),
+            PCWSTR(op.as_ptr()),
+            PCWSTR(exe.as_ptr()),
+            PCWSTR(args.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        (r.0 as isize) > 32
+    } else {
+        let r = ShellExecuteW(
+            HWND(ptr::null_mut()),
+            PCWSTR(op.as_ptr()),
+            PCWSTR(file.as_mut_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        (r.0 as isize) > 32
+    };
+    if ok {
+        search_usage_record(path);
+    }
+    ok
+}
+
+/// unix 秒 → 本地“2026-11-24”。只用于列表右端，不做时区换算（按 UTC 排就行）。
+fn sr_fmt_date(mtime: u32) -> String {
+    let days = (mtime / 86400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}-{m:02}-{d:02}")
+}
+
+fn sr_fmt_size(kb: u32) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1}GB", kb as f64 / 1024.0 / 1024.0)
+    } else if kb >= 1024 {
+        format!("{:.0}MB", kb as f64 / 1024.0)
+    } else {
+        format!("{kb}KB")
+    }
+}
+
+unsafe fn search_draw(st: &mut State, dc: HDC) {
+    let pal = pal_of(st.glass_liquid);
+    let frost = !st.card_bg.is_empty();
+    let s = sr_sheet();
+    if frost {
+        g_rrect_alpha(dc, s, CL_RAD, pal.paper, 132);
+        g_rrect_stroke(dc, s, CL_RAD, mixc(pal.edge, pal.ink, 0.25), 1);
+    } else {
+        g_fill(
+            dc,
+            RECT { left: -S_M, top: -S_M, right: CL_W + S_M, bottom: CL_H + S_M },
+            pal.wall,
+        );
+        g_shadow(dc, s, CL_RAD, &pal);
+        g_rrect(dc, s, CL_RAD, pal.paper, Some(mixc(pal.edge, pal.ink, 0.18)), 1);
+    }
+    // 右上角只留索引规模；输入框与它同一行
+    let info = if !SR_READY.load(Ordering::Relaxed) {
+        String::from("准备索引…")
+    } else if SR_BUILDING.load(Ordering::Relaxed) {
+        format!("建索引中 · {}", SR_SCANNED.load(Ordering::Relaxed) / 1000)
+    } else {
+        let n = sr_index_count();
+        if n >= 10_000 {
+            format!("{:.0} 万文件", n as f64 / 10_000.0)
+        } else {
+            format!("{n} 个文件")
+        }
+    };
+    let ir = sr_input_rect();
+    {
+        let info_r = RECT { left: ir.right + 6, top: ir.top, right: sr_sheet().right - 6, bottom: ir.bottom };
+        c_text(dc, &info, info_r, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 2);
+    }
+
+    // 输入框（空的时候也要有光标）
+    g_rrect_alpha(dc, ir, 10, pal.ink, 7);
+    g_rrect_stroke(dc, ir, 10, mixc(pal.edge, pal.ink, 0.22), 1);
+    let q = format!("{}{}", st.sr_q, st.sr_comp);
+    let text_r = RECT { left: ir.left + 14, top: ir.top, right: ir.right - 14, bottom: ir.bottom };
+    let caret_x;
+    if q.is_empty() {
+        c_text(dc, "输入关键词，空格分隔多个词", text_r, mixc(pal.edge, pal.ink, 0.28), st.cf_note, 0);
+        caret_x = ir.left + 14;
+    } else {
+        // 选区底色先画，字再盖上去
+        if let Some((a, b)) = sr_sel_range(st) {
+            let x0 = sr_caret_x(st, a);
+            let x1 = sr_caret_x(st, b).max(x0 + 1);
+            g_rrect_alpha(
+                dc,
+                RECT { left: x0, top: ir.top + 7, right: x1, bottom: ir.bottom - 7 },
+                3,
+                pal.ink,
+                34,
+            );
+        }
+        c_text(dc, &q, text_r, pal.ink, st.cf_note, 0);
+        caret_x = if st.sr_comp.is_empty() {
+            sr_caret_x(st, st.sr_caret)
+        } else {
+            (ir.left + 14 + s_text_w(st.c_lo_dc, &q, st.cf_note)).min(ir.right - 6)
+        };
+    }
+    if st.sr_blink {
+        c_line(dc, caret_x, ir.top + 10, caret_x, ir.bottom - 10, 1 + SS, pal.ink);
+    }
+
+    // 排序胶囊
+    for (r, idx) in sr_chip_rects(st.c_lo_dc, st) {
+        let on = st.sr_sort == idx;
+        let bg = if on { pal.ink } else { mixc(pal.paper, pal.ink, 0.10) };
+        let fg = if on { pal.paper } else { mixc(pal.edge, pal.ink, 0.45) };
+        g_rrect_alpha(dc, r, (r.bottom - r.top) / 2, bg, 255);
+        c_text(dc, SR_SORT_NAMES[idx as usize], r, fg, st.cf_small, 1);
+    }
+    // 「常用文件」：选了类型就显示类型名（再点可清掉）
+    {
+        let tr = sr_type_chip_rect(st.c_lo_dc, st);
+        let on = st.sr_type != 0;
+        let bg = if on { pal.ink } else if st.sr_type_open { mixc(pal.paper, pal.ink, 0.16) } else { mixc(pal.paper, pal.ink, 0.10) };
+        let fg = if on { pal.paper } else { mixc(pal.edge, pal.ink, 0.45) };
+        g_rrect_alpha(dc, tr, (tr.bottom - tr.top) / 2, bg, 255);
+        c_text(dc, sr_type_label(st.sr_type), tr, fg, st.cf_small, 1);
+    }
+    // 行号计数放胶囊行右侧（省掉一整条底栏）
+    if !st.sr_rows.is_empty() {
+        let cr = sr_chips_rect();
+        let cnt = format!("{} / {}", st.sr_sel.min(st.sr_rows.len() - 1) + 1, st.sr_rows.len());
+        c_text(dc, &cnt, cr, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 2);
+    }
+
+    // 结果列表
+    let lr = sr_list_rect();
+    let n = st.sr_rows.len();
+    if n == 0 {
+        if !q.trim().is_empty() || !SR_READY.load(Ordering::Relaxed) {
+            let hint = RECT { left: lr.left, top: lr.top + 36, right: lr.right, bottom: lr.top + 60 };
+            let msg = if !SR_READY.load(Ordering::Relaxed) {
+                "索引还没建好，正在扫描全盘…"
+            } else {
+                "没有匹配 · 试试用空格拆成多个关键词"
+            };
+            c_text(dc, msg, hint, mixc(pal.edge, pal.ink, 0.26), st.cf_small, 1);
+        }
+    } else {
+        let sel = st.sr_sel.min(n.saturating_sub(1));
+        // 选中行必须可见（行高不一致，向上/向下各扫一遍）
+        let mut acc = 0i32;
+        for i in st.sr_scroll..n {
+            if i == sel {
+                break;
+            }
+            acc += sr_row_h(&st.sr_rows[i]);
+        }
+        if sel < st.sr_scroll {
+            st.sr_scroll = sel;
+        } else if acc >= lr.bottom - lr.top {
+            // 从选中行往下数，倒推起始行
+            let mut need = sr_row_h(&st.sr_rows[sel]);
+            let mut sc = sel;
+            while sc > 0 {
+                let h = sr_row_h(&st.sr_rows[sc - 1]);
+                if need + h > lr.bottom - lr.top {
+                    break;
+                }
+                need += h;
+                sc -= 1;
+            }
+            st.sr_scroll = sc;
+        }
+        let mut y = lr.top;
+        for i in st.sr_scroll..n {
+            let row = &st.sr_rows[i];
+            let rh = sr_row_h(row);
+            if y + rh > lr.bottom + 2 {
+                break;
+            }
+            let r = RECT { left: lr.left, top: y, right: lr.right, bottom: y + rh - 4 };
+            if i == sel {
+                g_rrect_alpha(dc, r, 8, pal.ink, 14);
+                g_rrect_stroke(dc, r, 8, mixc(pal.edge, pal.ink, 0.20), 1);
+            }
+            if row.kind == 1 {
+                // 目录头：▸/▾ + 名字 + N 项，下面是完整路径
+                let cy = (r.top + r.bottom) / 2;
+                let cx = r.left + 16;
+                if st.sr_dir_open.as_deref() == Some(row.path.as_str()) {
+                    c_line(dc, cx, cy - 2, cx + 4, cy + 3, 1 + SS, pal.ink);
+                    c_line(dc, cx + 4, cy + 3, cx + 8, cy - 2, 1 + SS, pal.ink);
+                } else {
+                    c_line(dc, cx, cy - 3, cx + 5, cy, 1 + SS, pal.ink);
+                    c_line(dc, cx + 5, cy, cx, cy + 3, 1 + SS, pal.ink);
+                }
+                let name_r = RECT { left: r.left + 30, top: r.top + 1, right: r.right - 90, bottom: r.top + 19 };
+                c_text(dc, &row.name, name_r, pal.ink, st.cf_note, 0);
+                let cnt_r = RECT { left: r.right - 86, top: r.top + 2, right: r.right - 12, bottom: r.top + 20 };
+                c_text(dc, &format!("{} 项", row.count), cnt_r, mixc(pal.edge, pal.ink, 0.35), st.cf_small, 2);
+                let sub_r = RECT { left: r.left + 30, top: r.top + 18, right: r.right - 12, bottom: r.top + 35 };
+                c_text(dc, &row.sub, sub_r, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 0);
+            } else if row.kind == 2 {
+                // 展开目录里的文件：缩进 + 左侧细导引线
+                c_line(dc, r.left + 22, r.top, r.left + 22, r.bottom, 1, mixc(pal.paper, pal.ink, 0.16));
+                let name_r = RECT { left: r.left + 30, top: r.top + 1, right: r.right - 90, bottom: r.top + 21 };
+                c_text(dc, &row.name, name_r, pal.ink, st.cf_note, 0);
+                let meta = format!("{} · {}", sr_fmt_date(row.mtime), sr_fmt_size(row.size_kb));
+                let meta_r = RECT { left: r.right - 118, top: r.top + 6, right: r.right - 12, bottom: r.top + 24 };
+                c_text(dc, &meta, meta_r, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 2);
+            } else {
+                let name_r = RECT { left: r.left + 12, top: r.top + 3, right: r.right - 90, bottom: r.top + 23 };
+                c_text(dc, &row.name, name_r, pal.ink, st.cf_note, 0);
+                let sub_r = RECT { left: r.left + 12, top: r.top + 22, right: r.right - 78, bottom: r.top + 40 };
+                c_text(dc, &row.sub, sub_r, mixc(pal.edge, pal.ink, 0.34), st.cf_small, 0);
+                let date_r = RECT { left: r.right - 86, top: r.top + 5, right: r.right - 12, bottom: r.top + 22 };
+                c_text(dc, &sr_fmt_date(row.mtime), date_r, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 2);
+                let size_r = RECT { left: r.right - 70, top: r.top + 22, right: r.right - 12, bottom: r.top + 40 };
+                c_text(dc, &sr_fmt_size(row.size_kb), size_r, mixc(pal.edge, pal.ink, 0.30), st.cf_small, 2);
+            }
+            y += rh;
+        }
+    }
+    // 类型下拉最后画（盖在列表上面）
+    if st.sr_type_open {
+        let (panel, items) = sr_type_panel_rects(st.c_lo_dc, st);
+        g_shadow(dc, panel, 10, &pal);
+        g_rrect(dc, panel, 10, pal.paper, Some(mixc(pal.edge, pal.ink, 0.16)), 1);
+        for (r, i) in items {
+            let on = st.sr_type == i;
+            let hv = st.sr_type_hover == Some(i as usize);
+            if on || hv {
+                g_rrect_alpha(
+                    dc,
+                    RECT { left: r.left + 4, top: r.top + 2, right: r.right - 4, bottom: r.bottom - 2 },
+                    6,
+                    pal.ink,
+                    if on { 30 } else { 14 },
+                );
+            }
+            let fg = if on { pal.ink } else { mixc(pal.edge, pal.ink, 0.45) };
+            c_text(dc, SR_TYPES[i as usize].0, r, fg, st.cf_small, 1);
+        }
+    }
+}
+
+/// 光标在列表的哪一行（行高不一致，逐行累加）
+fn sr_row_at(st: &State, x: i32, y: i32) -> Option<usize> {
+    let lr = sr_list_rect();
+    if x < lr.left || x > lr.right || y < lr.top || y > lr.bottom {
+        return None;
+    }
+    let mut yy = lr.top;
+    for i in st.sr_scroll..st.sr_rows.len() {
+        let h = sr_row_h(&st.sr_rows[i]);
+        if y >= yy && y < yy + h {
+            return Some(i);
+        }
+        yy += h;
+        if yy > lr.bottom {
+            break;
+        }
+    }
+    None
+}
+
+/// 展开/收起某个目录头
+unsafe fn sr_dir_toggle(st: &mut State, i: usize) {
+    if st.sr_rows.get(i).map(|r| r.kind) != Some(1) {
+        return;
+    }
+    let path = st.sr_rows[i].path.clone();
+    st.sr_dir_open = if st.sr_dir_open.as_deref() == Some(path.as_str()) {
+        None
+    } else {
+        Some(path.clone())
+    };
+    sr_rows_fill(st);
+    if let Some(ni) = st
+        .sr_rows
+        .iter()
+        .position(|r| r.kind == 1 && r.path == path)
+    {
+        st.sr_sel = ni;
+    }
+}
+
+/// 行高：目录头 40、展开后的文件 34、普通文件 44
+fn sr_row_h(row: &SrRow) -> i32 {
+    match row.kind {
+        1 => 40,
+        2 => 34,
+        _ => 44,
+    }
+}
+
+unsafe fn sr_ime_place(st: &State, hwnd: HWND) {
+    let himc = ImmGetContext(hwnd);
+    if himc.0.is_null() {
+        return;
+    }
+    let ir = sr_input_rect();
+    let mut q: String = st.sr_q.chars().take(st.sr_caret).collect();
+    q.push_str(&st.sr_comp);
+    let x = ir.left + 14 + s_text_w(st.c_lo_dc, &q, st.cf_note);
+    let mut cf = COMPOSITIONFORM {
+        dwStyle: CFS_POINT,
+        ptCurrentPos: POINT {
+            x: ((x + S_M) as f32 * card_scale()).round() as i32,
+            y: ((ir.top + 4 + S_M) as f32 * card_scale()).round() as i32,
+        },
+        rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+    };
+    let _ = ImmSetCompositionWindow(himc, &mut cf);
+    let _ = ImmReleaseContext(hwnd, himc);
+}
+
+unsafe fn open_search(st: &mut State) {
+    let h = SEARCH_HWND.load(Ordering::SeqCst);
+    if h == 0 || st.sr_shown || !st.sr_on {
+        return;
+    }
+    close_clip(st);
+    close_note(st);
+    search_index_boot();
+    let hwnd = HWND(h as *mut c_void);
+    st.sr_shown = true;
+    st.sr_fg0 = now_s();
+    st.sr_q.clear();
+    st.sr_comp.clear();
+    st.sr_caret = 0;
+    st.sr_anchor = 0;
+    st.sr_drag = false;
+    st.sr_type_open = false;
+    st.sr_type_hover = None;
+    st.sr_hits.clear();
+    st.sr_sel = 0;
+    st.sr_scroll = 0;
+    st.sr_blink = true;
+    st.sr_note.clear();
+    let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    st.sr_x = (sw - card_win_w()) / 2;
+    st.sr_y = (sh - card_win_h()) / 2;
+    let _ = SetWindowPos(hwnd, None, st.sr_x, st.sr_y, card_win_w(), card_win_h(), SWP_NOZORDER);
+    clip_snap_bg(st, st.sr_x, st.sr_y);
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    focus_window(hwnd);
+    clip_log(&format!(
+        "search open fg={} focus={}",
+        GetForegroundWindow() == hwnd,
+        GetFocus() == hwnd
+    ));
+    let _ = SetTimer(hwnd, TIMER_SR_BLINK, 500, None);
+    let _ = SetTimer(hwnd, TIMER_SR_FG, 250, None);
+    sr_apply(st);
+    search_present(st);
+}
+
+unsafe fn close_search(st: &mut State) {
+    if !st.sr_shown {
+        return;
+    }
+    preview_close(st);
+    st.sr_shown = false;
+    st.card_bg.clear();
+    card_bg_hi_free(st);
+    let h = SEARCH_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        let hwnd = HWND(h as *mut c_void);
+        let _ = KillTimer(hwnd, TIMER_SR_BLINK);
+        let _ = KillTimer(hwnd, TIMER_SR_FG);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+unsafe fn search_present(st: &mut State) {
+    card_present(st, Card::Search);
+}
+
+unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        let mut ps = PAINTSTRUCT::default();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    let lx = || card_local((l.0 & 0xFFFF) as i16 as i32);
+    let ly = || card_local(((l.0 >> 16) & 0xFFFF) as i16 as i32);
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(ptr::null_mut())));
+            LRESULT(1)
+        }
+        WM_NCHITTEST => {
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let x = card_local(((l.0 & 0xFFFF) as i16 as i32) - wr.left);
+            let y = card_local((((l.0 >> 16) & 0xFFFF) as i16 as i32) - wr.top);
+            let top = sr_input_rect().top;
+            if y < top - 2 {
+                return LRESULT(HTCAPTION as isize);
+            }
+            let _ = x;
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_LBUTTONDOWN => {
+            let st = state_of(hwnd);
+            let (x, y) = (lx(), ly());
+            // 类型下拉：先吃点击（选一个类型 / 点热区外才收起）
+            if st.sr_type_open {
+                let (panel, items) = sr_type_panel_rects(st.c_lo_dc, st);
+                let zone = sr_type_zone(st.c_lo_dc, st);
+                if in_rect(zone, x, y) || in_rect(panel, x, y) {
+                    if let Some((_, i)) = items.into_iter().find(|(r, _)| in_rect(*r, x, y)) {
+                        st.sr_type = i;
+                        st.sr_type_open = false;
+                        st.sr_type_hover = None;
+                        sr_apply(st);
+                        search_present(st);
+                    }
+                    // 点在缝里/边缘：什么也不做，面板保持
+                    return LRESULT(0);
+                }
+                st.sr_type_open = false;
+                st.sr_type_hover = None;
+            }
+            // 输入框：点击定位光标 + 开始拖选
+            let ir = sr_input_rect();
+            if in_rect(ir, x, y) {
+                let ci = sr_caret_at_x(st, x);
+                st.sr_caret = ci;
+                st.sr_anchor = ci;
+                st.sr_drag = true;
+                st.sr_blink = true;
+                use windows::Win32::UI::Input::KeyboardAndMouse::SetCapture;
+                let _ = SetCapture(hwnd);
+                search_present(st);
+                return LRESULT(0);
+            }
+            // 胶囊：排序 + 类型
+            if y >= sr_chips_rect().top && y <= sr_chips_rect().bottom {
+                let dc = HDC(st.c_lo_dc.0);
+                let tr = sr_type_chip_rect(dc, st);
+                if in_rect(tr, x, y) {
+                    if st.sr_type != 0 && !st.sr_type_open {
+                        // 已筛选时再点 = 清掉
+                        st.sr_type = 0;
+                        sr_apply(st);
+                    } else {
+                        st.sr_type_open = !st.sr_type_open;
+                        st.sr_type_hover = None;
+                    }
+                    search_present(st);
+                    return LRESULT(0);
+                }
+                let hit = sr_chip_rects(dc, st)
+                    .into_iter()
+                    .find(|(r, _)| x >= r.left && x <= r.right)
+                    .map(|(_, i)| i);
+                if let Some(i) = hit {
+                    if st.sr_sort != i {
+                        st.sr_sort = i;
+                        sr_rows_fill(st);
+                        search_present(st);
+                    }
+                }
+                return LRESULT(0);
+            }
+            if let Some(i) = sr_row_at(st, x, y) {
+                let kind = st.sr_rows[i].kind;
+                let path = st.sr_rows[i].path.clone();
+                if kind == 1 {
+                    // 目录头：选中态下再点一次 = 打开目录；否则展开/收起
+                    if st.sr_sel == i {
+                        if sr_open_hit(&path, false) {
+                            close_search(st);
+                            return LRESULT(0);
+                        }
+                    }
+                    sr_dir_toggle(st, i);
+                    search_present(st);
+                } else {
+                    // 单击：默认只预览、绝不当场打开（用户 2026-11-26）；设置页可关掉自动预览
+                    st.sr_sel = i;
+                    if st.sr_click_preview {
+                        preview_open(st, &path);
+                    }
+                    st.sr_blink = true;
+                    search_present(st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let st = state_of(hwnd);
+            let (x, y) = (lx(), ly());
+            if st.sr_drag {
+                let ci = sr_caret_at_x(st, x);
+                if ci != st.sr_caret {
+                    st.sr_caret = ci;
+                    st.sr_blink = true;
+                    search_present(st);
+                }
+                return LRESULT(0);
+            }
+            let dc = HDC(st.c_lo_dc.0);
+            let tr = sr_type_chip_rect(dc, st);
+            let (panel, items) = sr_type_panel_rects(dc, st);
+            let zone = sr_type_zone(dc, st);
+            let over_chip = in_rect(tr, x, y);
+            let over_zone = in_rect(zone, x, y) || in_rect(panel, x, y);
+            if over_chip && !st.sr_type_open {
+                st.sr_type_open = true;
+                st.sr_type_hover = None;
+                search_present(st);
+            } else if !over_zone && st.sr_type_open {
+                st.sr_type_open = false;
+                st.sr_type_hover = None;
+                search_present(st);
+            }
+            let hv = items
+                .into_iter()
+                .find(|(r, _)| in_rect(*r, x, y))
+                .map(|(_, i)| i as usize);
+            if hv != st.sr_type_hover {
+                st.sr_type_hover = hv;
+                if st.sr_type_open {
+                    search_present(st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            let st = state_of(hwnd);
+            if st.sr_type_open || st.sr_type_hover.is_some() {
+                st.sr_type_open = false;
+                st.sr_type_hover = None;
+                search_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let st = state_of(hwnd);
+            if st.sr_drag {
+                st.sr_drag = false;
+                use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+                let _ = ReleaseCapture();
+                search_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let st = state_of(hwnd);
+            let (x, y) = (lx(), ly());
+            // 输入框双击 = 全选
+            let ir = sr_input_rect();
+            if in_rect(ir, x, y) {
+                st.sr_anchor = 0;
+                st.sr_caret = sr_chars(&st.sr_q);
+                st.sr_blink = true;
+                search_present(st);
+                return LRESULT(0);
+            }
+            if let Some(i) = sr_row_at(st, x, y) {
+                let path = st.sr_rows[i].path.clone();
+                if sr_open_hit(&path, false) {
+                    close_search(st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let st = state_of(hwnd);
+            let d = ((w.0 >> 16) & 0xFFFF) as i16 as i32 / 120;
+            // 滚轮消息进的是**有焦点**的检索卡，但要看光标在哪张卡上：在预览卡上就滚预览
+            let ph = PV_HWND.load(Ordering::SeqCst);
+            if st.pv_shown && ph != 0 {
+                let sx = (l.0 & 0xFFFF) as i16 as i32;
+                let sy = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+                let mut rc = RECT::default();
+                if GetWindowRect(HWND(ph as *mut c_void), &mut rc).is_ok()
+                    && sx >= rc.left && sx < rc.right && sy >= rc.top && sy < rc.bottom
+                {
+                    preview_scroll(st, if d > 0 { -1 } else { 1 });
+                    return LRESULT(0);
+                }
+            }
+            if st.sr_rows.is_empty() {
+                return LRESULT(0);
+            }
+            let n = st.sr_rows.len();
+            let sel = (st.sr_sel as i32 - d).clamp(0, n as i32 - 1) as usize;
+            st.sr_sel = sel;
+            // 用户 2026-11-26：滚动列表时不要一直切预览（每换一行都读盘很卡），点击/回车再预览
+            search_present(st);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let st = state_of(hwnd);
+            let vk = w.0 as u16 as i32;
+            match vk {
+                0x26 => {
+                    if st.sr_sel > 0 {
+                        st.sr_sel -= 1;
+                    }
+                }
+                0x28 => {
+                    if st.sr_sel + 1 < st.sr_rows.len() {
+                        st.sr_sel += 1;
+                    }
+                }
+                0x21 => {
+                    st.sr_sel = st.sr_sel.saturating_sub(SR_ROWS);
+                }
+                0x22 => {
+                    if !st.sr_rows.is_empty() {
+                        st.sr_sel = (st.sr_sel + SR_ROWS).min(st.sr_rows.len() - 1);
+                    }
+                }
+                0x24 => {
+                    // Home：光标到行首（Shift 保留锚点 = 选区）
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    st.sr_caret = 0;
+                    if GetKeyState(0x10) >= 0 {
+                        st.sr_anchor = 0;
+                    }
+                    st.sr_blink = true;
+                }
+                0x23 => {
+                    // End：光标到行尾
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    st.sr_caret = sr_chars(&st.sr_q);
+                    if GetKeyState(0x10) >= 0 {
+                        st.sr_anchor = st.sr_caret;
+                    }
+                    st.sr_blink = true;
+                }
+                0x0D => {
+                    if let Some(row) = st.sr_rows.get(st.sr_sel) {
+                        let p = row.path.clone();
+                        let kind = row.kind;
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                        let shift = GetKeyState(0x10) < 0; // VK_SHIFT
+                        let ctrl = GetKeyState(0x11) < 0; // VK_CONTROL
+                        if ctrl && kind != 1 {
+                            preview_open(st, &p);
+                        } else if kind == 1 && !shift {
+                            sr_dir_toggle(st, st.sr_sel);
+                        } else if sr_open_hit(&p, shift && kind != 1) {
+                            close_search(st);
+                            return LRESULT(0);
+                        }
+                    }
+                }
+                0x27 => {
+                    // → 光标右移（Shift = 扩选区；有选区且不按 Shift = 收拢到选区右端）
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    let shift = GetKeyState(0x10) < 0;
+                    let len = sr_chars(&st.sr_q);
+                    if !shift {
+                        if let Some((_, b)) = sr_sel_range(st) {
+                            st.sr_caret = b;
+                            st.sr_anchor = b;
+                        } else if st.sr_caret < len {
+                            st.sr_caret += 1;
+                            st.sr_anchor = st.sr_caret;
+                        }
+                    } else if st.sr_caret < len {
+                        st.sr_caret += 1;
+                    }
+                    st.sr_blink = true;
+                }
+                0x25 => {
+                    // ← 光标左移
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    let shift = GetKeyState(0x10) < 0;
+                    if !shift {
+                        if let Some((a, _)) = sr_sel_range(st) {
+                            st.sr_caret = a;
+                            st.sr_anchor = a;
+                        } else if st.sr_caret > 0 {
+                            st.sr_caret -= 1;
+                            st.sr_anchor = st.sr_caret;
+                        }
+                    } else if st.sr_caret > 0 {
+                        st.sr_caret -= 1;
+                    }
+                    st.sr_blink = true;
+                }
+                0x41 => {
+                    // Ctrl+A 全选
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+                    if GetKeyState(0x11) < 0 {
+                        st.sr_anchor = 0;
+                        st.sr_caret = sr_chars(&st.sr_q);
+                        st.sr_blink = true;
+                    } else {
+                        return LRESULT(0);
+                    }
+                }
+                0x1B => {
+                    if st.pv_shown {
+                        preview_close(st);
+                    } else {
+                        close_search(st);
+                        return LRESULT(0);
+                    }
+                }
+                0x2E => {
+                    // Delete = 清空输入
+                    st.sr_q.clear();
+                    st.sr_comp.clear();
+                    st.sr_caret = 0;
+                    st.sr_anchor = 0;
+                    sr_apply(st);
+                }
+                _ => return LRESULT(0),
+            }
+            search_present(st);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            let st = state_of(hwnd);
+            let c = w.0 as u32;
+            match c {
+                0x08 => {
+                    if sr_edit_backspace(st) {
+                        st.sr_comp.clear();
+                        sr_apply(st);
+                    }
+                }
+                0x0D | 0x1B | 0x09 => {
+                    // 回车/转义在 WM_KEYDOWN 已处理
+                }
+                _ => {
+                    if let Some(ch) = char::from_u32(c) {
+                        if !ch.is_control() {
+                            sr_edit_insert(st, ch);
+                            sr_apply(st);
+                        }
+                    }
+                }
+            }
+            st.sr_blink = true;
+            search_present(st);
+            LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION => {
+            let st = state_of(hwnd);
+            sr_ime_place(st, hwnd);
+            LRESULT(0)
+        }
+        WM_IME_COMPOSITION => {
+            let st = state_of(hwnd);
+            let flags = l.0 as u32;
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                if flags & GCS_RESULTSTR.0 != 0 {
+                    let s = imm_string(himc, GCS_RESULTSTR);
+                    st.sr_comp.clear();
+                    if !s.is_empty() {
+                        st.sr_q.push_str(&s);
+                        sr_apply(st);
+                    }
+                    let _ = ImmReleaseContext(hwnd, himc);
+                    search_present(st);
+                    return LRESULT(0);
+                } else if flags & GCS_COMPSTR.0 != 0 {
+                    st.sr_comp = imm_string(himc, GCS_COMPSTR);
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+            search_present(st);
+            LRESULT(0)
+        }
+        WM_IME_ENDCOMPOSITION => {
+            let st = state_of(hwnd);
+            st.sr_comp.clear();
+            search_present(st);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let st = state_of(hwnd);
+            match w.0 as usize {
+                TIMER_SR_BLINK => {
+                    if st.sr_shown {
+                        st.sr_blink = !st.sr_blink;
+                        search_present(st);
+                    }
+                }
+                TIMER_SR_FG => {
+                    if std::env::var_os("PIPIE_KEEP_CARDS").is_some() {
+                        // 测试沙箱
+                    } else if st.sr_shown && now_s() - st.sr_fg0 > CARD_FG_GRACE {
+                        let fg = GetForegroundWindow();
+                        let pvh = PV_HWND.load(Ordering::SeqCst);
+                        let fg_is_pv = pvh != 0 && fg.0 as isize == pvh;
+                        if !fg.is_invalid() && fg != hwnd && !fg_is_pv {
+                            let age = now_s() - st.sr_fg0;
+                            if age < CARD_FG_KEEP || sr_cursor_on_cards(st, hwnd) {
+                                focus_window(hwnd);
+                            } else {
+                                clip_log(&format!(
+                                    "search close fg cls={} on_card={} pv={}",
+                                    win_class_name(fg),
+                                    sr_cursor_on_cards(st, hwnd) as u8,
+                                    st.pv_shown as u8
+                                ));
+                                close_search(st);
+                            }
+                        }
+                    }
+                    // 索引变好了（后台装完）→ 若已输入关键词，顺手重搜一次
+                    if st.sr_shown && SR_READY.load(Ordering::Relaxed) && st.sr_hits.is_empty() {
+                        sr_apply(st);
+                        search_present(st);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            let st = state_of(hwnd);
+            if (w.0 & 0xFFFF) as u32 == WA_INACTIVE
+                && std::env::var_os("PIPIE_KEEP_CARDS").is_none()
+            {
+                if st.sr_shown {
+                    let age = now_s() - st.sr_fg0;
+                    if age < CARD_FG_KEEP || sr_cursor_on_cards(st, hwnd) {
+                        focus_window(hwnd);
+                    } else {
+                        clip_log(&format!(
+                            "search close act cls={} on_card={} pv={}",
+                            win_class_name(GetForegroundWindow()),
+                            sr_cursor_on_cards(st, hwnd) as u8,
+                            st.pv_shown as u8
+                        ));
+                        close_search(st);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let st = state_of(hwnd);
+            close_search(st);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+// ───────────────────── 文件预览卡片（RLPreview v2：纯卡片 + Markdown）─────────────────────
+//
+// 独立浮层（WS_EX_NOACTIVATE，不抢焦点），检索卡旁边开一张**更大的纯卡片**。
+// 用户 2026-11-26 的口径：不要元信息/底部键帽那一套，只要一张圆角纸 + 一行文件名，
+// 正文默认按 Markdown 渲染（标题/列表/引用/代码块/分隔线），不是等宽纯文本堆。
+// 「是不是 Markdown」看**内容**判定，不只看后缀。
+
+static PV_HWND: AtomicIsize = AtomicIsize::new(0);
+
+const PVW: i32 = 480;
+const PVH: i32 = 440;
+const PV_PAD: i32 = 20;
+const PV_RAD: i32 = 12;
+/// 软阴影留白（窗口每边多出来的一圈）
+const PV_SM: i32 = 12;
+const PV_MAX_TEXT: usize = 65536;
+const PV_MAX_IMG: u64 = 48 * 1024 * 1024;
+
+/// 一行 Markdown 的块级样式：0 正文 1 h1 2 h2 3 h3 4 列表 5 引用 6 代码 7 分隔线 8 空行 9 表格行
+#[derive(Clone)]
+struct MLine {
+    kind: u8,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+struct PvFonts {
+    title: isize,
+    body: isize,
+    h1: isize,
+    h2: isize,
+    h3: isize,
+    mono: isize,
+    small: isize,
+}
+
+static PV_FONTS: std::sync::Mutex<Option<(u32, PvFonts)>> = std::sync::Mutex::new(None);
+
+unsafe fn pv_fonts() -> PvFonts {
+    let key = (card_scale() * 1000.0).round() as u32;
+    {
+        let g = PV_FONTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, f)) = g.as_ref() {
+            if *k == key {
+                return *f;
+            }
+        }
+    }
+    let cs = card_scale();
+    let px = |v: f32| -((v * cs).round() as i32);
+    let face = wide("Microsoft YaHei UI");
+    let monoface = wide("Consolas");
+    let mk = |size: f32, weight: i32, f: &[u16]| -> isize {
+        CreateFontW(px(size), 0, 0, 0, weight, 0, 0, 0, 134, 0, 0, 2, 0, PCWSTR(f.as_ptr())).0 as isize
+    };
+    let f = PvFonts {
+        title: mk(12.5, 500, &face),
+        body: mk(13.5, 400, &face),
+        h1: mk(18.0, 600, &face),
+        h2: mk(15.0, 600, &face),
+        h3: mk(13.5, 600, &face),
+        mono: mk(12.5, 400, &monoface),
+        small: mk(10.5, 400, &face),
+    };
+    *PV_FONTS.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, f));
+    f
+}
+
+/// 把超长单行切成 ≤cap 字符的小段（优先在空格处断）。
+/// ⚠️ 64KB 的压缩 JSON 如果是一整行，DrawText(DT_WORDBREAK) 会逐字排，一次几百毫秒。
+fn pv_chunk_line(line: &str, cap: usize) -> Vec<String> {
+    if line.chars().count() <= cap {
+        return vec![line.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let mut count = 0usize;
+        let mut cut = rest.len();
+        let mut last_space = None;
+        for (i, ch) in rest.char_indices() {
+            if count >= cap {
+                cut = i;
+                break;
+            }
+            if ch.is_whitespace() {
+                last_space = Some(i);
+            }
+            count += 1;
+        }
+        let cut = match last_space {
+            Some(sp) if sp > 0 => sp,
+            _ => cut,
+        };
+        out.push(rest[..cut].to_string());
+        rest = rest[cut..].trim_start();
+    }
+    out
+}
+
+fn pv_ext_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn pv_is_image(ext: &str) -> bool {
+    matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tif" | "tiff")
+}
+
+/// 第一版不内嵌渲染的格式：只给一句「用默认程序打开」
+fn pv_is_rich_doc(ext: &str) -> bool {
+    matches!(
+        ext,
+        "xls" | "xlsx" | "ppt" | "pptx" | "pdf" | "wps" | "rtf" | "odt"
+            | "zip" | "rar" | "7z" | "exe" | "dll" | "msi"
+    )
+}
+
+/// 任意图片字节 → (w, h, BGRA 直通 alpha)
+unsafe fn decode_preview_image(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let stream = factory.CreateStream().ok()?;
+    stream.InitializeFromMemory(bytes).ok()?;
+    let decoder = factory
+        .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+        .ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    let (mut w, mut h) = (0u32, 0u32);
+    frame.GetSize(&mut w, &mut h).ok()?;
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return None;
+    }
+    let conv = factory.CreateFormatConverter().ok()?;
+    conv.Initialize(
+        &frame,
+        &GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone,
+        None::<&windows::Win32::Graphics::Imaging::IWICPalette>,
+        0.0,
+        WICBitmapPaletteTypeCustom,
+    )
+    .ok()?;
+    let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+    conv.CopyPixels(std::ptr::null(), w * 4, &mut px).ok()?;
+    Some((w, h, px))
+}
+
+/// 行内标记去掉（v1 不做混排）：**粗**、`代码`、[文字](链接)、![图](路径)
+fn md_strip_inline(s: &str) -> String {
+    let mut t = s.to_string();
+    for m in ["**", "__", "`"] {
+        t = t.replace(m, "");
+    }
+    let mut out = String::with_capacity(t.len());
+    let b = t.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let img = b[i] == b'!' && i + 1 < b.len() && b[i + 1] == b'[';
+        if img || b[i] == b'[' {
+            let open = if img { i + 1 } else { i };
+            if let Some(close_rel) = t[open..].find(']') {
+                let close = open + close_rel;
+                if close + 1 < b.len() && b[close + 1] == b'(' {
+                    if let Some(rp_rel) = t[close..].find(')') {
+                        let inner = &t[open + 1..close];
+                        out.push_str(if img { "[图片]" } else { inner });
+                        i = close + rp_rel + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch_len = t[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&t[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// 解析 Markdown：块级样式 + 纯文本内容
+fn md_parse(text: &str) -> Vec<MLine> {
+    let mut out: Vec<MLine> = Vec::new();
+    let mut in_code = false;
+    // HTML 块（README 的徽章那堆 `<p>/<img>`）：从标签行到空行整段丢掉，
+    // 否则满屏 `<a href=…` 源码 —— 用户要的是「看内容」不是「看源码」。
+    let mut in_html = false;
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            in_code = !in_code;
+            if !in_code {
+                out.push(MLine { kind: 8, text: String::new() });
+            }
+            continue;
+        }
+        if in_code {
+            for seg in pv_chunk_line(line, 300) {
+                out.push(MLine { kind: 6, text: seg });
+            }
+            continue;
+        }
+        if t.is_empty() {
+            in_html = false;
+            out.push(MLine { kind: 8, text: String::new() });
+            continue;
+        }
+        if in_html || t.starts_with('<') {
+            in_html = true;
+            continue;
+        }
+        if t.len() >= 3
+            && (t.starts_with("---") || t.starts_with("***") || t.starts_with("___"))
+            && t.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+        {
+            out.push(MLine { kind: 7, text: String::new() });
+            continue;
+        }
+        let hashes = t.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+            let kind = if hashes == 1 { 1 } else if hashes == 2 { 2 } else { 3 };
+            out.push(MLine { kind, text: md_strip_inline(t[hashes..].trim_start()) });
+            continue;
+        }
+        if t.starts_with("> ") {
+            out.push(MLine { kind: 5, text: md_strip_inline(&t[2..]) });
+            continue;
+        }
+        if t.starts_with('|') {
+            // 表格分隔行（|---|:--:|）丢掉，其余按单元格画
+            let sep = t.trim_matches('|').split('|').all(|c| {
+                !c.trim().is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+            });
+            if !sep {
+                out.push(MLine { kind: 9, text: t.to_string() });
+            }
+            continue;
+        }
+        let mut body: Option<(String, &str)> = None;
+        let c0 = t.chars().next().unwrap_or(' ');
+        if t.len() > 2 && matches!(c0, '-' | '*' | '+') && t[1..].starts_with(' ') {
+            body = Some(("• ".to_string(), &t[2..]));
+        } else {
+            let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                let rest = &t[digits.len()..];
+                if rest.starts_with(". ") || rest.starts_with(") ") {
+                    body = Some((format!("{digits}. "), &rest[2..]));
+                }
+            }
+        }
+        if let Some((mark, rest)) = body {
+            out.push(MLine { kind: 4, text: format!("{mark}{}", md_strip_inline(rest)) });
+            continue;
+        }
+        out.push(MLine { kind: 0, text: md_strip_inline(t) });
+    }
+    out
+}
+
+/// 内容判定：后缀是 md 系；或者纯文本里出现足够多的 Markdown 特征行
+fn md_looks_like(text: &str, ext: &str) -> bool {
+    if matches!(ext, "md" | "markdown" | "mdx" | "mdown" | "mermaid") {
+        return true;
+    }
+    if !matches!(ext, "" | "txt" | "text" | "log" | "ini" | "conf") {
+        return false;
+    }
+    let mut score = 0;
+    for ln in text.lines().take(200) {
+        let t = ln.trim_start();
+        if t.starts_with("# ") || t.starts_with("## ") || t.starts_with("```") {
+            score += 2;
+        } else if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("> ") {
+            score += 1;
+        } else if t.starts_with('|') || t.contains("](http") {
+            score += 1;
+        }
+        if score >= 3 {
+            return true;
+        }
+    }
+    false
+}
+
+// ── OOXML（docx）正文抽取：ZIP 中央目录 + Deflate + 极简 XML 扫描 ──
+//
+// 不引 Office 依赖：docx 就是 ZIP 里的 `word/document.xml`。这里只认 w:p / w:t /
+// w:pStyle / w:numPr / w:tbl，够把正文、标题、列表、表格还原成和 Markdown 一样的行。
+
+fn zip_read_entry(data: &[u8], want: &str) -> Option<Vec<u8>> {
+    if data.len() < 22 {
+        return None;
+    }
+    let mut eocd = None;
+    let mut i = data.len() - 22;
+    let lo = data.len().saturating_sub(65557);
+    loop {
+        if &data[i..i + 4] == b"PK\x05\x06" {
+            eocd = Some(i);
+            break;
+        }
+        if i == lo {
+            break;
+        }
+        i -= 1;
+    }
+    let e = eocd?;
+    let cnt = u16::from_le_bytes([data[e + 10], data[e + 11]]) as usize;
+    let mut p = u32::from_le_bytes([data[e + 16], data[e + 17], data[e + 18], data[e + 19]]) as usize;
+    for _ in 0..cnt {
+        if p + 46 > data.len() || &data[p..p + 4] != b"PK\x01\x02" {
+            return None;
+        }
+        let method = u16::from_le_bytes([data[p + 10], data[p + 11]]);
+        let csize = u32::from_le_bytes([data[p + 20], data[p + 21], data[p + 22], data[p + 23]]) as usize;
+        let nlen = u16::from_le_bytes([data[p + 28], data[p + 29]]) as usize;
+        let elen = u16::from_le_bytes([data[p + 30], data[p + 31]]) as usize;
+        let clen = u16::from_le_bytes([data[p + 32], data[p + 33]]) as usize;
+        let loff = u32::from_le_bytes([data[p + 42], data[p + 43], data[p + 44], data[p + 45]]) as usize;
+        if p + 46 + nlen <= data.len() {
+            let name = String::from_utf8_lossy(&data[p + 46..p + 46 + nlen]).to_ascii_lowercase();
+            if name == want {
+                if loff + 30 > data.len() {
+                    return None;
+                }
+                let ln = u16::from_le_bytes([data[loff + 26], data[loff + 27]]) as usize;
+                let le = u16::from_le_bytes([data[loff + 28], data[loff + 29]]) as usize;
+                let ds = loff + 30 + ln + le;
+                let de = ds.saturating_add(csize);
+                if de > data.len() {
+                    return None;
+                }
+                let raw = &data[ds..de];
+                return match method {
+                    0 => Some(raw.to_vec()),
+                    8 => {
+                        use std::io::Read;
+                        let mut out = Vec::new();
+                        let mut d = flate2::read::DeflateDecoder::new(raw);
+                        d.take(8 * 1024 * 1024 + 1).read_to_end(&mut out).ok()?;
+                        if out.len() > 8 * 1024 * 1024 {
+                            return None;
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                };
+            }
+            p += 46 + nlen + elen + clen;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let Some(j) = rest.find(';') else {
+            out.push_str(rest);
+            return out;
+        };
+        let ent = &rest[1..j];
+        match ent {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                if let Ok(v) = u32::from_str_radix(&ent[2..], 16) {
+                    if let Some(c) = char::from_u32(v) {
+                        out.push(c);
+                    }
+                }
+            }
+            _ if ent.starts_with('#') => {
+                if let Ok(v) = ent[1..].parse::<u32>() {
+                    if let Some(c) = char::from_u32(v) {
+                        out.push(c);
+                    }
+                }
+            }
+            _ => {
+                out.push('&');
+                out.push_str(ent);
+                out.push(';');
+            }
+        }
+        rest = &rest[j + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 取一个 XML 标签里的属性值（只认 `name="..."` / `name='...'`）
+fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let p = tag.find(name)?;
+    let rest = tag[p + name.len()..].trim_start().strip_prefix('=')?.trim_start();
+    let q = rest.chars().next()?;
+    if q != '"' && q != '\'' {
+        return None;
+    }
+    let end = rest[1..].find(q)?;
+    Some(&rest[1..1 + end])
+}
+
+fn docx_style_kind(style: &str, outline: Option<i32>) -> u8 {
+    let s = style.to_ascii_lowercase();
+    if s == "title" || s == "heading1" || s == "heading 1" || s == "标题 1" || s == "标题1" {
+        return 1;
+    }
+    if s == "heading2" || s == "heading 2" || s == "标题 2" || s == "标题2" || s == "subtitle" {
+        return 2;
+    }
+    if s.starts_with("heading") || s.starts_with("标题") {
+        return 3;
+    }
+    match outline {
+        Some(0) => 1,
+        Some(1) => 2,
+        Some(2) => 3,
+        _ => 0,
+    }
+}
+
+fn ooxml_lines(xml: &str) -> Vec<MLine> {
+    let mut out: Vec<MLine> = Vec::new();
+    let mut para = String::new();
+    let mut style = String::new();
+    let mut outline: Option<i32> = None;
+    let mut is_list = false;
+    let mut in_t = false;
+    let mut in_tbl = 0i32;
+    let mut row: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut chars = 0usize;
+    let mut i = 0usize;
+    while i < xml.len() && out.len() < 4000 && chars < 262144 {
+        let Some(lt_rel) = xml[i..].find('<') else { break };
+        let lt = i + lt_rel;
+        if in_t && lt > i {
+            let seg = xml_unescape(&xml[i..lt]);
+            chars += seg.len();
+            if in_tbl > 0 {
+                cell.push_str(&seg);
+            } else {
+                para.push_str(&seg);
+            }
+        }
+        let Some(gt_rel) = xml[lt..].find('>') else { break };
+        let gt = lt + gt_rel;
+        let tag = &xml[lt + 1..gt];
+        i = gt + 1;
+        let closing = tag.starts_with('/');
+        if in_t {
+            if closing {
+                in_t = false;
+            }
+            continue;
+        }
+        let tname = tag
+            .trim_start_matches('/')
+            .split(|c: char| c == ' ' || c == '/' || c == '\t')
+            .next()
+            .unwrap_or("");
+        match tname {
+            "w:t" => {
+                if !closing {
+                    in_t = true;
+                }
+            }
+            "w:p" => {
+                if !closing {
+                    style.clear();
+                    outline = None;
+                    is_list = false;
+                } else {
+                    let t = para.trim().to_string();
+                    if in_tbl > 0 {
+                        if !t.is_empty() {
+                            if !cell.is_empty() {
+                                cell.push(' ');
+                            }
+                            cell.push_str(&t);
+                        }
+                    } else {
+                        let kind = if t.is_empty() {
+                            8
+                        } else if is_list {
+                            4
+                        } else {
+                            docx_style_kind(&style, outline)
+                        };
+                        if kind == 4 {
+                            out.push(MLine { kind, text: format!("• {t}") });
+                        } else {
+                            out.push(MLine { kind, text: t });
+                        }
+                    }
+                    para.clear();
+                }
+            }
+            "w:pStyle" => {
+                if !closing {
+                    if let Some(v) = tag_attr(tag, "w:val") {
+                        style = v.to_string();
+                    }
+                }
+            }
+            "w:outlineLvl" => {
+                if !closing {
+                    if let Some(v) = tag_attr(tag, "w:val") {
+                        outline = v.parse::<i32>().ok();
+                    }
+                }
+            }
+            "w:numPr" => {
+                if !closing {
+                    is_list = true;
+                }
+            }
+            "w:tbl" => {
+                if closing {
+                    in_tbl = (in_tbl - 1).max(0);
+                } else {
+                    in_tbl += 1;
+                }
+            }
+            "w:tr" => {
+                if closing && !row.is_empty() {
+                    out.push(MLine { kind: 9, text: format!("| {} |", row.join(" | ")) });
+                    row.clear();
+                }
+            }
+            "w:tc" => {
+                if closing {
+                    row.push(cell.trim().to_string());
+                    cell.clear();
+                }
+            }
+            "w:tab" | "w:br" | "w:cr" => {
+                if in_tbl > 0 {
+                    cell.push(' ');
+                } else {
+                    para.push(' ');
+                }
+            }
+            "w:drawing" | "w:pict" => {
+                if !closing {
+                    let s = if in_tbl > 0 { &mut cell } else { &mut para };
+                    if !s.ends_with("[图片]") {
+                        s.push_str("[图片]");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let t = para.trim().to_string();
+    if !t.is_empty() && out.len() < 4000 {
+        out.push(MLine { kind: docx_style_kind(&style, outline), text: t });
+    }
+    // 表头识别：docx 表格第一行通常就是表头 —— 交给 md 表格渲染即可
+    out
+}
+
+fn docx_lines(path: &str) -> Option<Vec<MLine>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    let xmlb = zip_read_entry(&data, "word/document.xml")?;
+    let xml = String::from_utf8_lossy(&xmlb);
+    let mut lines = ooxml_lines(&xml);
+    // 收拾连续空行 + 去掉尾部空；标题前补一点空，节奏和 Markdown 一样
+    let mut out: Vec<MLine> = Vec::with_capacity(lines.len());
+    for ln in lines.drain(..) {
+        if ln.kind == 8 && out.last().map(|l: &MLine| l.kind == 8).unwrap_or(true) {
+            continue;
+        }
+        if (1..=3).contains(&ln.kind) && !out.is_empty() {
+            let prev = out.last().map(|l| l.kind).unwrap_or(8);
+            if prev != 8 {
+                out.push(MLine { kind: 8, text: String::new() });
+            }
+        }
+        out.push(ln);
+    }
+    while out.last().map(|l| l.kind == 8).unwrap_or(false) {
+        out.pop();
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+// ── 老式 .doc（Word 97-2003）：OLE2 复合文档 + FIB + piece table 抽正文 ──
+//
+// 只读两个流：`WordDocument` 和 `0Table`/`1Table`（FIB 的 fWhichTblStm 决定）。
+// 正文在 piece table 里：每段落在 WordDocument 中的 fc 处，compressed=单字节、否则 UTF-16LE。
+
+fn ole_le16(b: &[u8], o: usize) -> u16 {
+    if o + 2 > b.len() {
+        0
+    } else {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+}
+fn ole_le32(b: &[u8], o: usize) -> u32 {
+    if o + 4 > b.len() {
+        0
+    } else {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+}
+
+struct Ole<'a> {
+    data: &'a [u8],
+    sec: usize,
+    mini_sec: usize,
+    mini_cut: usize,
+    fat: Vec<u32>,
+    minifat: Vec<u32>,
+    mini_stream: Vec<u8>,
+    streams: Vec<(String, u32, usize)>, // 名字 / 起始扇区 / 大小
+}
+
+impl<'a> Ole<'a> {
+    fn sector(&self, n: usize) -> Option<&'a [u8]> {
+        let off = (n + 1) * self.sec;
+        self.data.get(off..off + self.sec)
+    }
+    fn chain(&self, start: u32, fat: &[u32], out: &mut Vec<u8>) -> Option<()> {
+        let mut s = start;
+        let mut guard = 0;
+        while s != 0xFFFF_FFFE && guard < fat.len() + 8 {
+            guard += 1;
+            let idx = s as usize;
+            let sec = self.sector(idx)?;
+            out.extend_from_slice(sec);
+            let next = *fat.get(idx)?;
+            if next >= 0xFFFF_FFFA {
+                return Some(());
+            }
+            s = next;
+        }
+        Some(())
+    }
+    fn read(&self, start: u32, size: usize) -> Option<Vec<u8>> {
+        if size < self.mini_cut {
+            let mut out = Vec::new();
+            let mut s = start;
+            let mut guard = 0;
+            while (out.len() < size) && guard < self.minifat.len() + 8 {
+                guard += 1;
+                let off = s as usize * self.mini_sec;
+                let chunk = self.mini_stream.get(off..(off + self.mini_sec).min(self.mini_stream.len()))?;
+                out.extend_from_slice(chunk);
+                let next = *self.minifat.get(s as usize)?;
+                if next >= 0xFFFF_FFFA {
+                    break;
+                }
+                s = next;
+            }
+            out.truncate(size);
+            Some(out)
+        } else {
+            let mut out = Vec::new();
+            self.chain(start, &self.fat, &mut out)?;
+            out.truncate(size);
+            Some(out)
+        }
+    }
+    fn get(&self, name: &str) -> Option<Vec<u8>> {
+        let e = self.streams.iter().find(|s| s.0 == name)?;
+        self.read(e.1, e.2)
+    }
+}
+
+fn ole_open(data: &[u8]) -> Option<Ole<'_>> {
+    if data.len() < 512 || &data[..8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" {
+        return None;
+    }
+    let sec = 1usize << ole_le16(data, 30).min(14);
+    let mini_sec = 1usize << ole_le16(data, 32).min(14);
+    let n_fat = ole_le32(data, 44) as usize;
+    let dir_start = ole_le32(data, 48);
+    let mini_cut = ole_le32(data, 56) as usize;
+    let minifat_start = ole_le32(data, 60);
+    let n_minifat = ole_le32(data, 64) as usize;
+    let difat_start = ole_le32(data, 68);
+    // FAT 扇区号：头里 109 个 + DIFAT 链
+    let mut fat_sectors: Vec<u32> = (0..109)
+        .map(|i| ole_le32(data, 76 + i * 4))
+        .filter(|v| *v < 0xFFFF_FFFA)
+        .collect();
+    let mut d = difat_start;
+    let mut guard = 0;
+    while d < 0xFFFF_FFFA && guard < 256 {
+        guard += 1;
+        let off = (d as usize + 1) * sec;
+        let Some(blk) = data.get(off..off + sec) else { break };
+        let per = sec / 4;
+        for i in 0..per - 1 {
+            let v = ole_le32(blk, i * 4);
+            if v < 0xFFFF_FFFA {
+                fat_sectors.push(v);
+            }
+        }
+        d = ole_le32(blk, (per - 1) * 4);
+    }
+    if fat_sectors.len() > n_fat.max(1) * 4 {
+        fat_sectors.truncate(n_fat.max(1) + 4);
+    }
+    let mut fat = Vec::with_capacity(fat_sectors.len() * sec / 4);
+    for s in fat_sectors {
+        let off = (s as usize + 1) * sec;
+        let blk = data.get(off..off + sec)?;
+        for i in 0..sec / 4 {
+            fat.push(ole_le32(blk, i * 4));
+        }
+    }
+    let mut ole = Ole {
+        data,
+        sec,
+        mini_sec,
+        mini_cut: if mini_cut == 0 { 4096 } else { mini_cut },
+        fat,
+        minifat: Vec::new(),
+        mini_stream: Vec::new(),
+        streams: Vec::new(),
+    };
+    // 目录
+    let mut dirb = Vec::new();
+    ole.chain(dir_start, &ole.fat.clone(), &mut dirb)?;
+    let mut root: Option<(u32, usize)> = None;
+    for e in dirb.chunks_exact(128) {
+        let nlen = ole_le16(e, 64) as usize;
+        if nlen < 2 || nlen > 64 {
+            continue;
+        }
+        let name = String::from_utf16_lossy(
+            &e[..nlen - 2]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        );
+        let typ = e[66];
+        let start = ole_le32(e, 116);
+        let size = ole_le32(e, 120) as usize;
+        if typ == 5 {
+            root = Some((start, size));
+        } else if typ == 2 {
+            ole.streams.push((name, start, size));
+        }
+    }
+    // MiniFAT + Mini 流
+    if n_minifat > 0 {
+        let mut mb = Vec::new();
+        ole.chain(minifat_start, &ole.fat.clone(), &mut mb)?;
+        for i in 0..mb.len() / 4 {
+            ole.minifat.push(ole_le32(&mb, i * 4));
+        }
+    }
+    if let Some((start, size)) = root {
+        let mut ms = Vec::new();
+        ole.chain(start, &ole.fat.clone(), &mut ms)?;
+        ms.truncate(size);
+        ole.mini_stream = ms;
+    }
+    Some(ole)
+}
+
+fn word_doc_text(data: &[u8], cap: usize) -> Option<String> {
+    let ole = ole_open(data)?;
+    let wd = ole.get("WordDocument")?;
+    if wd.len() < 0x0200 || ole_le16(&wd, 0) != 0xA5EC {
+        return None;
+    }
+    let tbl_name = if ole_le16(&wd, 0x0A) & 0x0200 != 0 { "1Table" } else { "0Table" };
+    let tbl = ole.get(tbl_name)?;
+    let ccp_text = ole_le32(&wd, 0x4C) as usize;
+    let fc_clx = ole_le32(&wd, 0x01A2) as usize;
+    let lcb_clx = ole_le32(&wd, 0x01A6) as usize;
+    if lcb_clx == 0 {
+        return None;
+    }
+    let clx = tbl.get(fc_clx..fc_clx.checked_add(lcb_clx)?)?;
+    // 跳过 Prc，找 Pcdt(0x02)
+    let mut pos = 0usize;
+    let mut plc: Option<&[u8]> = None;
+    while pos < clx.len() {
+        match clx[pos] {
+            0x01 => {
+                let cb = ole_le16(clx, pos + 1) as usize;
+                pos += 3 + cb;
+            }
+            0x02 => {
+                let lcb = ole_le32(clx, pos + 1) as usize;
+                plc = clx.get(pos + 5..pos + 5 + lcb);
+                break;
+            }
+            _ => break,
+        }
+    }
+    let plc = plc?;
+    if plc.len() < 16 {
+        return None;
+    }
+    let n = (plc.len() - 4) / 12;
+    let pcd_base = (n + 1) * 4;
+    let mut out = String::new();
+    for i in 0..n {
+        if out.len() >= cap {
+            break;
+        }
+        let cp_start = ole_le32(plc, i * 4) as usize;
+        let cp_end = ole_le32(plc, (i + 1) * 4) as usize;
+        if cp_start >= ccp_text {
+            break;
+        }
+        let cp_end = cp_end.min(ccp_text).max(cp_start);
+        let chars = cp_end - cp_start;
+        let fc_raw = ole_le32(plc, pcd_base + i * 8 + 2);
+        let compressed = fc_raw & 0x4000_0000 != 0;
+        let fc = (fc_raw & 0x3FFF_FFFF) as usize;
+        if compressed {
+            let fc = fc / 2;
+            if let Some(bytes) = wd.get(fc..fc + chars) {
+                for &b in bytes {
+                    let c = b as char;
+                    out.push(if c == '\r' { '\n' } else { c });
+                }
+            }
+        } else if let Some(bytes) = wd.get(fc..fc + chars * 2) {
+            for ch in bytes.chunks_exact(2) {
+                let u = u16::from_le_bytes([ch[0], ch[1]]);
+                out.push(if u == 0x0D { '\n' } else { char::from_u32(u as u32).unwrap_or(' ') });
+            }
+        }
+    }
+    // 清控制符：域名指令 0x13..0x15 丢，单元格/行结束 0x07 → 空格，其余控制符丢
+    let mut s = String::with_capacity(out.len());
+    let mut skip_field = false;
+    for c in out.chars() {
+        match c {
+            '\u{13}' => skip_field = true,
+            '\u{14}' => skip_field = false,
+            '\u{15}' => skip_field = false,
+            '\u{7}' => s.push(' '),
+            '\n' => {
+                s.push('\n');
+            }
+            c if (c as u32) < 0x20 => {}
+            c => {
+                if !skip_field {
+                    s.push(c);
+                }
+            }
+        }
+    }
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 老式 .doc / 其它 Office 格式：走系统 IFilter（装了 Office/WPS 才有），有就用，没有就退回信息态
+unsafe fn ifilter_text(path: &str, cap: usize) -> Option<String> {
+    use windows::Win32::Storage::IndexServer::{LoadIFilter, IFilter, CHUNK_TEXT, STAT_CHUNK};
+    use windows::core::Interface;
+    let mut punk: *mut core::ffi::c_void = std::ptr::null_mut();
+    let wpath = wide(path);
+    LoadIFilter(PCWSTR(wpath.as_ptr()), None, &mut punk).ok()?;
+    if punk.is_null() {
+        return None;
+    }
+    let f: IFilter = Interface::from_raw(punk);
+    let mut flags = 0u32;
+    if f.Init(0, &[], &mut flags) != 0 {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chunk = STAT_CHUNK::default();
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 10000 || f.GetChunk(&mut chunk) != 0 {
+            break;
+        }
+        if chunk.flags.0 & CHUNK_TEXT.0 == 0 {
+            continue;
+        }
+        loop {
+            let mut n = 8192u32;
+            let mut buf = vec![0u16; n as usize];
+            if f.GetText(&mut n, PWSTR(buf.as_mut_ptr())) != 0 || n == 0 {
+                break;
+            }
+            out.push_str(&String::from_utf16_lossy(&buf[..n as usize]));
+            if out.len() >= cap {
+                return Some(out);
+            }
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+unsafe fn preview_load(st: &mut State, path: &str) {
+    st.pv_path = path.to_string();
+    st.pv_name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    st.pv_lines.clear();
+    st.pv_img = None;
+    st.pv_md = false;
+    st.pv_mono = false;
+    st.pv_scroll = 0;
+    st.pv_more = false;
+    st.pv_total_h = 0;
+    st.pv_overflow = false;
+    st.pv_kind = 0; // 0=文本/Markdown 1=图片 2=不支持
+    let ext = pv_ext_of(path);
+    if pv_is_image(&ext) {
+        let ok = std::fs::metadata(path).map(|m| m.len() <= PV_MAX_IMG).unwrap_or(false);
+        if ok {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(img) = decode_preview_image(&bytes) {
+                    st.pv_img = Some(img);
+                    st.pv_kind = 1;
+                    return;
+                }
+            }
+        }
+        st.pv_kind = 2;
+        return;
+    }
+    if matches!(ext.as_str(), "docx" | "docm" | "dotx" | "dotm") {
+        if let Some(lines) = docx_lines(path) {
+            st.pv_lines = lines;
+            st.pv_md = true;
+            st.pv_kind = 0;
+            return;
+        }
+        st.pv_kind = 2;
+        return;
+    }
+    if ext == "doc" {
+        // 老式 .doc：先自己解 OLE2/piece table；失败再试系统 IFilter
+        let raw = std::fs::metadata(path)
+            .ok()
+            .filter(|m| m.len() <= 64 * 1024 * 1024)
+            .and_then(|_| std::fs::read(path).ok())
+            .and_then(|d| word_doc_text(&d, 262144));
+        if raw.is_none() {
+            if let Some(t) = ifilter_text(path, 262144) {
+                st.pv_lines = t
+                    .lines()
+                    .map(|l| MLine { kind: 0, text: l.trim_end().to_string() })
+                    .take(8000)
+                    .collect();
+                st.pv_kind = 0;
+                return;
+            }
+        } else if let Some(t) = raw {
+            st.pv_lines = t
+                .lines()
+                .map(|l| MLine { kind: 0, text: l.trim_end().to_string() })
+                .take(8000)
+                .collect();
+            st.pv_kind = 0;
+            return;
+        }
+        st.pv_kind = 2;
+        return;
+    }
+    if pv_is_rich_doc(&ext) {
+        st.pv_kind = 2;
+        return;
+    }
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            let mut buf = vec![0u8; PV_MAX_TEXT];
+            let n = f.read(&mut buf).unwrap_or(0);
+            buf.truncate(n);
+            if buf.iter().take(8192).any(|b| *b == 0) {
+                st.pv_kind = 2;
+                return;
+            }
+            let text = String::from_utf8_lossy(&buf);
+            st.pv_md = md_looks_like(&text, &ext);
+            st.pv_mono = matches!(
+                ext.as_str(),
+                "json" | "js" | "mjs" | "cjs" | "ts" | "jsx" | "tsx" | "py" | "rs" | "go"
+                    | "java" | "kt" | "c" | "h" | "hpp" | "cpp" | "cc" | "cs" | "rb" | "php"
+                    | "sh" | "bash" | "zsh" | "bat" | "cmd" | "ps1" | "css" | "scss" | "less"
+                    | "html" | "htm" | "xml" | "yml" | "yaml" | "toml" | "sql" | "ini" | "conf"
+                    | "csv" | "tsv"
+            );
+            st.pv_lines = if st.pv_md {
+                md_parse(&text)
+            } else {
+                let mut ls = Vec::new();
+                for l in text.lines() {
+                    let l = l.trim_end();
+                    for seg in pv_chunk_line(l, 200) {
+                        ls.push(MLine { kind: 0, text: seg });
+                    }
+                    if ls.len() > 8000 {
+                        break;
+                    }
+                }
+                ls
+            };
+            st.pv_kind = 0;
+        }
+        Err(_) => st.pv_kind = 2,
+    }
+}
+
+/// 代码块：整段一起算高度、铺浅底、再画字；返回下一行的 y
+unsafe fn pv_draw_code(dc: HDC, font: isize, body: RECT, pal: &Pal, text: &str, y0: i32) -> i32 {
+    if text.trim().is_empty() {
+        return y0;
+    }
+    let r = RECT { left: body.left, top: y0, right: body.right, bottom: body.bottom };
+    let mut t: Vec<u16> = text.trim_end().encode_utf16().collect();
+    if t.is_empty() {
+        return y0;
+    }
+    let mut calc = r;
+    let _ = SelectObject(dc, HGDIOBJ(font as *mut c_void));
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, rgb(pal.ink));
+    let _ = DrawTextW(dc, &mut t, &mut calc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+    let bh = (calc.bottom - calc.top).max(1);
+    let bg = CreateSolidBrush(rgb(mixc(pal.paper, pal.ink, 0.05)));
+    let _ = FillRect(dc, &RECT { left: r.left - 6, top: y0 - 4, right: r.right + 6, bottom: y0 + bh + 6 }, bg);
+    let _ = DeleteObject(HGDIOBJ(bg.0));
+    let mut rr = RECT { left: r.left, top: y0, right: r.right, bottom: y0 + bh + 4 };
+    let _ = DrawTextW(dc, &mut t, &mut rr, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    y0 + bh + 12
+}
+
+/// 表格：按列测宽、逐格裁省略；表头下一条细线（v1 不做隔行底色）
+unsafe fn pv_draw_table(dc: HDC, font: isize, body: RECT, pal: &Pal, rows: &[String], y0: i32, cs: f32) -> i32 {
+    if rows.is_empty() {
+        return y0;
+    }
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.trim_matches('|').split('|').map(|c| md_strip_inline(c.trim())).collect())
+        .collect();
+    let ncol = cells.iter().map(|c| c.len()).max().unwrap_or(0).max(1);
+    let padc = (14.0 * cs) as i32;
+    let mut widths = vec![padc; ncol];
+    for r in &cells {
+        for (i, c) in r.iter().enumerate() {
+            if !c.is_empty() {
+                widths[i] = widths[i].max(pv_text_w(dc, font, c) + padc);
+            }
+        }
+    }
+    let avail = (body.right - body.left).max(40);
+    // 单列最多占一半，避免第一列长文本把整张表挤到右边
+    let cap = (avail as f32 * 0.46) as i32;
+    for w in widths.iter_mut() {
+        if *w > cap {
+            *w = cap;
+        }
+    }
+    let total: i32 = widths.iter().sum();
+    let row_h = (21.0 * cs) as i32;
+    let line_br = CreateSolidBrush(rgb(mixc(pal.edge, pal.paper, 0.45)));
+    let _ = SelectObject(dc, HGDIOBJ(font as *mut c_void));
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, rgb(pal.ink));
+    let mut y = y0;
+    for (ri, r) in cells.iter().enumerate() {
+        if y + row_h > body.bottom {
+            break;
+        }
+        let mut x = body.left;
+        for (i, c) in r.iter().enumerate() {
+            let w = if total > avail { (widths[i] * avail / total).max(10) } else { widths[i] };
+            if c.is_empty() {
+                x += w;
+                continue;
+            }
+            let mut t: Vec<u16> = c.encode_utf16().collect();
+            let mut rr = RECT { left: x + 2, top: y, right: (x + w - 2).min(body.right), bottom: y + row_h };
+            let _ = DrawTextW(dc, &mut t, &mut rr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+            x += w;
+        }
+        if ri == 0 {
+            let ly = y + row_h;
+            let _ = FillRect(dc, &RECT { left: body.left, top: ly, right: body.right, bottom: ly + (1.0 * cs).max(1.0) as i32 }, line_br);
+        }
+        y += row_h;
+    }
+    let _ = DeleteObject(HGDIOBJ(line_br.0));
+    y + (5.0 * cs) as i32
+}
+
+/// 单行文字宽度（预览卡是 1× 物理画布，不能用卡片 hi 画布的 s_text_w）
+unsafe fn pv_text_w(dc: HDC, font: isize, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let op = SelectObject(dc, HGDIOBJ(font as *mut c_void));
+    let t: Vec<u16> = text.encode_utf16().collect();
+    let mut sz = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &t, &mut sz);
+    let _ = SelectObject(dc, op);
+    sz.cx
+}
+
+/// 右上角「×」的矩形（客户端坐标）
+fn pv_close_rect(st: &State) -> RECT {
+    let cs = card_scale();
+    let sm = (PV_SM as f32 * cs).round() as i32;
+    let pad = (PV_PAD as f32 * cs) as i32;
+    let size = (22.0 * cs).round() as i32;
+    let title_top = sm + (9.0 * cs) as i32;
+    let title_h = (28.0 * cs) as i32;
+    let top = title_top + (title_h - size) / 2;
+    RECT {
+        left: st.pv_w - sm - pad - size,
+        top,
+        right: st.pv_w - sm - pad,
+        bottom: top + size,
+    }
+}
+
+/// 画一张预览卡：圆角纸 + 文件名 + 正文（Markdown / 图片 / 一句提示）
+unsafe fn pv_render(st: &mut State) {
+    let cs = card_scale();
+    let sm = (PV_SM as f32 * cs).round() as i32;
+    let w = (PVW as f32 * cs).round() as i32 + sm * 2;
+    let h = (PVH as f32 * cs).round() as i32 + sm * 2;
+    if st.pv_w != w || st.pv_h != h || st.pv_dc == 0 {
+        if st.pv_bmp != 0 {
+            let _ = DeleteObject(HGDIOBJ(st.pv_bmp as *mut c_void));
+        }
+        if st.pv_dc != 0 {
+            let _ = DeleteDC(HDC(st.pv_dc as *mut c_void));
+        }
+        let (bits, dc, bmp) = make_dib(w, h);
+        st.pv_bits = bits as isize;
+        st.pv_dc = dc.0 as isize;
+        st.pv_bmp = bmp.0 as isize;
+        st.pv_w = w;
+        st.pv_h = h;
+    }
+    let dc = HDC(st.pv_dc as *mut c_void);
+    let pal = pal_of(st.glass_liquid);
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    let (hw, hh) = ((PVW as f32 * cs * 0.5) - 0.75, (PVH as f32 * cs * 0.5) - 0.75);
+    let rad = PV_RAD as f32 * cs;
+    // ① 圆角纸面 + 细描边 + 一圈很淡的软阴影（SDF 线性衰减，够柔和不糊字）
+    {
+        let n = (w * h * 4) as usize;
+        let buf = std::slice::from_raw_parts_mut(st.pv_bits as *mut u8, n);
+        let edge = mixc(pal.edge, pal.ink, 0.16);
+        // 毛玻璃底和卡片一样：整块当画布，边框/投影只改 alpha 和边缘色
+        let use_bg = st.pv_bg.len() == n;
+        if use_bg {
+            buf.copy_from_slice(&st.pv_bg);
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                let d = sdf_rounded_rect(x as f32 + 0.5 - cx, y as f32 + 0.5 - cy, hw, hh, rad);
+                let cov = cov1(-d);
+                if cov > 0.002 {
+                    let base = if use_bg {
+                        (buf[o + 2], buf[o + 1], buf[o])
+                    } else {
+                        pal.paper
+                    };
+                    let b = cov1(-(d + 0.75));
+                    let c = mixc(base, edge, (cov - b).clamp(0.0, 1.0));
+                    buf[o] = c.2;
+                    buf[o + 1] = c.1;
+                    buf[o + 2] = c.0;
+                    buf[o + 3] = (255.0 * cov) as u8;
+                    continue;
+                }
+                let e = (1.0 + d / (9.0 * cs)).clamp(0.0, 1.0);
+                let a = 0.16 * e * e;
+                if a <= 0.004 {
+                    buf[o] = 0;
+                    buf[o + 1] = 0;
+                    buf[o + 2] = 0;
+                    buf[o + 3] = 0;
+                    continue;
+                }
+                buf[o] = ((SHADOW.2 as f32 * a) as u8).min(255);
+                buf[o + 1] = ((SHADOW.1 as f32 * a) as u8).min(255);
+                buf[o + 2] = ((SHADOW.0 as f32 * a) as u8).min(255);
+                buf[o + 3] = (255.0 * a) as u8;
+            }
+        }
+    }
+    let f = pv_fonts();
+    let ox = sm;
+    let oy = sm;
+    let pad = (PV_PAD as f32 * cs) as i32;
+    let title_top = oy + (9.0 * cs) as i32;
+    let title_h = (28.0 * cs) as i32;
+    // ② 文件名（小、次要色）+ 一条很淡的分隔线
+    {
+        let r = RECT { left: ox + pad, top: title_top, right: w - ox - pad, bottom: title_top + title_h };
+        let _ = SelectObject(dc, HGDIOBJ(f.title as *mut c_void));
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, rgb(mixc(pal.edge, pal.ink, 0.62)));
+        let mut t: Vec<u16> = st.pv_name.encode_utf16().collect();
+        let mut rr = r;
+        if !t.is_empty() {
+            let _ = DrawTextW(dc, &mut t, &mut rr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT | DT_END_ELLIPSIS);
+        }
+        // 关闭按钮：悬停浅底 + 交叉线
+        {
+            let cr = pv_close_rect(st);
+            if st.pv_close_hover {
+                let bg = CreateSolidBrush(rgb(mixc(pal.paper, pal.ink, 0.07)));
+                let op = SelectObject(dc, GetStockObject(NULL_PEN));
+                let ob = SelectObject(dc, HGDIOBJ(bg.0));
+                let _ = RoundRect(dc, cr.left, cr.top, cr.right, cr.bottom, cr.right - cr.left, cr.bottom - cr.top);
+                let _ = SelectObject(dc, op);
+                let _ = SelectObject(dc, ob);
+                let _ = DeleteObject(HGDIOBJ(bg.0));
+            }
+            let col = if st.pv_close_hover {
+                mixc(pal.edge, pal.ink, 0.62)
+            } else {
+                mixc(pal.edge, pal.ink, 0.26)
+            };
+            let pen = CreatePen(PS_SOLID, ((1.4 * cs).round() as i32).max(1), rgb(col));
+            let op = SelectObject(dc, HGDIOBJ(pen.0));
+            let cx = (cr.left + cr.right) / 2;
+            let cy = (cr.top + cr.bottom) / 2;
+            let r = ((cr.right - cr.left) as f32 * 0.22).round() as i32;
+            let _ = MoveToEx(dc, cx - r, cy - r, None);
+            let _ = windows::Win32::Graphics::Gdi::LineTo(dc, cx + r, cy + r);
+            let _ = MoveToEx(dc, cx - r, cy + r, None);
+            let _ = windows::Win32::Graphics::Gdi::LineTo(dc, cx + r, cy - r);
+            let _ = SelectObject(dc, op);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
+        }
+        let y = title_top + title_h + (3.0 * cs) as i32;
+        let sep = CreateSolidBrush(rgb(mixc(pal.edge, pal.paper, 0.22)));
+        let _ = FillRect(dc, &RECT { left: ox + pad, top: y, right: w - ox - pad, bottom: y + (1.0 * cs).max(1.0) as i32 }, sep);
+        let _ = DeleteObject(HGDIOBJ(sep.0));
+    }
+    let body = RECT {
+        left: ox + pad,
+        top: title_top + title_h + (13.0 * cs) as i32,
+        right: w - ox - pad,
+        bottom: h - oy - (14.0 * cs) as i32,
+    };
+    match st.pv_kind {
+        1 => {
+            if let Some((iw, ih, px)) = st.pv_img.as_ref() {
+                let bw = (body.right - body.left) as f32;
+                let bh = (body.bottom - body.top) as f32;
+                let k = (bw / *iw as f32).min(bh / *ih as f32).min(1.0);
+                let dw = (*iw as f32 * k).round().max(1.0) as i32;
+                let dh = (*ih as f32 * k).round().max(1.0) as i32;
+                let x0 = body.left + (body.right - body.left - dw) / 2;
+                let y0 = body.top + (body.bottom - body.top - dh) / 2;
+                let mut bmi = BITMAPINFO::default();
+                bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                bmi.bmiHeader.biWidth = *iw as i32;
+                bmi.bmiHeader.biHeight = -(*ih as i32);
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB.0;
+                let _ = SetStretchBltMode(dc, HALFTONE);
+                let _ = SetBrushOrgEx(dc, 0, 0, None);
+                let _ = StretchDIBits(
+                    dc, x0, y0, dw, dh, 0, 0, *iw as i32, *ih as i32,
+                    Some(px.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY,
+                );
+            }
+        }
+        0 => {
+            // 正文按 pv_scroll 上移，并在卡片正文区内裁剪（滚动时不许画到标题/纸边外）
+            let mut y = body.top - st.pv_scroll;
+            let mut more = false;
+            let saved = SaveDC(dc);
+            let _ = IntersectClipRect(dc, body.left - 8, body.top - 2, body.right + 8, body.bottom + 2);
+            let mut code = String::new();
+            let mut table: Vec<String> = Vec::new();
+            let mut done = 0usize;
+            for ln in st.pv_lines.iter() {
+                done += 1;
+                if y > body.bottom - 6 {
+                    more = true;
+                    break;
+                }
+                if ln.kind == 6 {
+                    if !code.is_empty() {
+                        code.push('\n');
+                    }
+                    code.push_str(&ln.text);
+                    continue;
+                }
+                if !code.is_empty() {
+                    y = pv_draw_code(dc, f.mono, body, &pal, &code, y);
+                    code.clear();
+                    if y > body.bottom - 6 {
+                        more = true;
+                        break;
+                    }
+                }
+                if ln.kind == 9 {
+                    table.push(ln.text.clone());
+                    continue;
+                }
+                if !table.is_empty() {
+                    y = pv_draw_table(dc, f.mono, body, &pal, &table, y, cs);
+                    table.clear();
+                    if y > body.bottom - 6 {
+                        more = true;
+                        break;
+                    }
+                }
+                let mut t: Vec<u16> = ln.text.encode_utf16().collect();
+                match ln.kind {
+                    8 => {
+                        y += (8.0 * cs) as i32;
+                    }
+                    7 => {
+                        let sep = CreateSolidBrush(rgb(mixc(pal.edge, pal.paper, 0.35)));
+                        let yy = y + (5.0 * cs) as i32;
+                        let _ = FillRect(dc, &RECT { left: body.left, top: yy, right: body.right, bottom: yy + (1.0 * cs).max(1.0) as i32 }, sep);
+                        let _ = DeleteObject(HGDIOBJ(sep.0));
+                        y += (14.0 * cs) as i32;
+                    }
+                    1 | 2 | 3 => {
+                        let font = if ln.kind == 1 { f.h1 } else if ln.kind == 2 { f.h2 } else { f.h3 };
+                        let gap = if ln.kind == 1 { 9.0 } else { 6.0 };
+                        let mut r = RECT { left: body.left, top: y, right: body.right, bottom: body.bottom };
+                        let _ = SelectObject(dc, HGDIOBJ(font as *mut c_void));
+                        let _ = SetBkMode(dc, TRANSPARENT);
+                        let _ = SetTextColor(dc, rgb(pal.ink));
+                        if t.is_empty() {
+                            // ⚠️ 空 Vec 的 as_ptr() 是悬垂指针，DrawTextW（哪怕 CALCRECT）会 AV
+                            y += (22.0 * cs) as i32;
+                        } else {
+                            let mut calc = r;
+                            let _ = DrawTextW(dc, &mut t, &mut calc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                            r.bottom = calc.bottom;
+                            let _ = DrawTextW(dc, &mut t, &mut r, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+                            y = calc.bottom + (gap * cs) as i32;
+                        }
+                    }
+                    5 => {
+                        let mut r = RECT { left: body.left + (12.0 * cs) as i32, top: y, right: body.right, bottom: body.bottom };
+                        let _ = SelectObject(dc, HGDIOBJ(f.body as *mut c_void));
+                        let _ = SetBkMode(dc, TRANSPARENT);
+                        let _ = SetTextColor(dc, rgb(mixc(pal.edge, pal.ink, 0.48)));
+                        if t.is_empty() {
+                            y += (19.0 * cs) as i32;
+                        } else {
+                            let mut calc = r;
+                            let _ = DrawTextW(dc, &mut t, &mut calc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                            r.bottom = calc.bottom;
+                            let _ = DrawTextW(dc, &mut t, &mut r, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+                            let bar = CreateSolidBrush(rgb(mixc(pal.edge, pal.paper, 0.55)));
+                            let _ = FillRect(dc, &RECT { left: body.left, top: y + (2.0 * cs) as i32, right: body.left + (2.0 * cs).max(2.0) as i32, bottom: calc.bottom - (2.0 * cs) as i32 }, bar);
+                            let _ = DeleteObject(HGDIOBJ(bar.0));
+                            y = calc.bottom + (5.0 * cs) as i32;
+                        }
+                    }
+                    _ => {
+                        let indent = if ln.kind == 4 { (14.0 * cs) as i32 } else { 0 };
+                        let mut r = RECT { left: body.left + indent, top: y, right: body.right, bottom: body.bottom };
+                        let body_font = if st.pv_mono { f.mono } else { f.body };
+                        let _ = SelectObject(dc, HGDIOBJ(body_font as *mut c_void));
+                        let _ = SetBkMode(dc, TRANSPARENT);
+                        let _ = SetTextColor(dc, rgb(pal.ink));
+                        if t.is_empty() {
+                            y += (19.0 * cs) as i32;
+                        } else {
+                            let mut calc = r;
+                            let _ = DrawTextW(dc, &mut t, &mut calc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                            r.bottom = calc.bottom;
+                            let _ = DrawTextW(dc, &mut t, &mut r, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+                            y = calc.bottom + (5.0 * cs) as i32;
+                        }
+                    }
+                }
+            }
+            if !code.is_empty() && y <= body.bottom - 6 {
+                let _ = pv_draw_code(dc, f.mono, body, &pal, &code, y);
+            }
+            if !table.is_empty() && y <= body.bottom - 6 {
+                let _ = pv_draw_table(dc, f.mono, body, &pal, &table, y, cs);
+            }
+            let _ = RestoreDC(dc, saved);
+            st.pv_more = more;
+            st.pv_content_bottom = y;
+            st.pv_body_bottom = body.bottom;
+            // 滚动条：总高按"已画部分 + 剩余行×平均行高"估，不求像素级准确
+            let visible = (body.bottom - body.top).max(1);
+            let drawn = (st.pv_content_bottom - body.top + st.pv_scroll).max(1);
+            let done_i = done.max(1) as i32;
+            let avg = (drawn / done_i).max((15.0 * cs) as i32);
+            let remaining = (st.pv_lines.len() as i32 - done_i).max(0);
+            st.pv_total_h = drawn + remaining * avg;
+            st.pv_overflow = st.pv_total_h > visible + 2;
+            if st.pv_overflow {
+                let thumb_h = ((visible * visible) / st.pv_total_h)
+                    .max((24.0 * cs) as i32)
+                    .min(visible);
+                let max_scroll = (st.pv_total_h - visible).max(1);
+                let ratio = (st.pv_scroll as f32 / max_scroll as f32).clamp(0.0, 1.0);
+                let ty = body.top + ((visible - thumb_h) as f32 * ratio) as i32;
+                let bw = ((3.5 * cs).round() as i32).max(3);
+                let bx = w - ox - (10.0 * cs) as i32;
+                let br = CreateSolidBrush(rgb(mixc(pal.edge, pal.paper, 0.40)));
+                let op = SelectObject(dc, GetStockObject(NULL_PEN));
+                let ob = SelectObject(dc, HGDIOBJ(br.0));
+                let _ = RoundRect(dc, bx, ty, bx + bw, ty + thumb_h, bw, bw);
+                let _ = SelectObject(dc, op);
+                let _ = SelectObject(dc, ob);
+                let _ = DeleteObject(HGDIOBJ(br.0));
+            }
+        }
+        _ => {
+            let mut t: Vec<u16> = "这种文件不做内嵌预览，双击直接用默认程序打开".encode_utf16().collect();
+            let mut r = RECT {
+                left: body.left,
+                top: body.top + (32.0 * cs) as i32,
+                right: body.right,
+                bottom: body.top + (32.0 * cs) as i32 + (20.0 * cs) as i32,
+            };
+            let _ = SelectObject(dc, HGDIOBJ(f.small as *mut c_void));
+            let _ = SetBkMode(dc, TRANSPARENT);
+            let _ = SetTextColor(dc, rgb(mixc(pal.edge, pal.ink, 0.40)));
+            let _ = DrawTextW(dc, &mut t, &mut r, DT_SINGLELINE | DT_CENTER | DT_NOPREFIX);
+        }
+    }
+    // ③ GDI 会把 alpha 通道写坏 → 按 SDF 重算覆盖率，再预乘（ULW 要求）
+    {
+        let n = (w * h * 4) as usize;
+        let buf = std::slice::from_raw_parts_mut(st.pv_bits as *mut u8, n);
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                let d = sdf_rounded_rect(x as f32 + 0.5 - cx, y as f32 + 0.5 - cy, hw, hh, rad);
+                let cov = cov1(-d);
+                if cov >= 0.998 {
+                    buf[o + 3] = 255;
+                    continue;
+                }
+                let a = if cov > 0.002 {
+                    (255.0 * cov) as u32
+                } else {
+                    let e = (1.0 + d / (9.0 * cs)).clamp(0.0, 1.0);
+                    (255.0 * 0.16 * e * e) as u32
+                };
+                if a == 0 {
+                    buf[o] = 0;
+                    buf[o + 1] = 0;
+                    buf[o + 2] = 0;
+                    buf[o + 3] = 0;
+                    continue;
+                }
+                buf[o] = ((buf[o] as u32 * a + 127) / 255) as u8;
+                buf[o + 1] = ((buf[o + 1] as u32 * a + 127) / 255) as u8;
+                buf[o + 2] = ((buf[o + 2] as u32 * a + 127) / 255) as u8;
+                buf[o + 3] = a as u8;
+            }
+        }
+    }
+}
+
+unsafe fn preview_open(st: &mut State, path: &str) {
+    let h = PV_HWND.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    preview_load(st, path);
+    pv_render(st);
+    let hwnd = HWND(h as *mut c_void);
+    // 贴在检索卡旁边：优先右边，放不下换左边。
+    // ⚠️ 对齐的是**纸面**边、不是窗口边：检索卡窗口带 S_M 投影留白，
+    //    预览窗口带 PV_SM 留白，两边各减掉自己的留白才对得齐（用户 2026-11-26：右边高一点）。
+    let (sw, _sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    let gap = 10;
+    let cs = card_scale();
+    let sm = (PV_SM as f32 * cs).round() as i32;
+    let spm = (S_M as f32 * cs).round() as i32;
+    let mut x = st.sr_x + card_win_w() - spm + gap - sm;
+    if x + st.pv_w > sw - 4 {
+        x = st.sr_x + spm - gap - st.pv_w + sm;
+    }
+    if x < 4 {
+        x = 4;
+    }
+    let y = (st.sr_y + spm - sm).max(0);
+    st.pv_x = x;
+    st.pv_y = y;
+    st.pv_shown = true;
+    st.pv_fg0 = now_s();
+    let _ = SetWindowPos(hwnd, None, x, y, st.pv_w, st.pv_h, SWP_NOZORDER);
+    // 材质和卡片一致：毛玻璃开着就抓一块自己的底（预览卡自己有 pv_bg，绝不碰共享的 card_bg）。
+    // 抓之前先把旧预览藏起来 + DwmFlush，否则会把自己抓进去。
+    st.pv_bg.clear();
+    if st.glass && !capture_dead() {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+        let (bits, mdc, bmp) = make_dib(st.pv_w, st.pv_h);
+        if !bits.is_null() && !mdc.is_invalid() {
+            let sdc = GetDC(None);
+            if !sdc.is_invalid() {
+                let ok = BitBlt(
+                    mdc, 0, 0, st.pv_w, st.pv_h, sdc, x, y,
+                    SRCCOPY | CAPTUREBLT,
+                )
+                .is_ok();
+                let raw = std::slice::from_raw_parts(
+                    bits,
+                    (st.pv_w * st.pv_h * 4) as usize,
+                )
+                .to_vec();
+                let _ = ReleaseDC(None, sdc);
+                if ok && !mostly_black(&raw) {
+                    let mut bg = blur_glass_rect(&raw, st.pv_w as usize, st.pv_h as usize);
+                    clip_frost_tint(st, &mut bg);
+                    st.pv_bg = bg;
+                }
+            }
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mdc);
+        }
+        pv_render(st);
+    }
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    preview_present(st);
+}
+
+unsafe fn preview_close(st: &mut State) {
+    if !st.pv_shown {
+        return;
+    }
+    st.pv_shown = false;
+    st.pv_close_hover = false;
+    st.pv_path.clear();
+    st.pv_lines.clear();
+    st.pv_img = None;
+    st.pv_kind = 0;
+    let h = PV_HWND.load(Ordering::SeqCst);
+    if h != 0 {
+        let _ = ShowWindow(HWND(h as *mut c_void), SW_HIDE);
+    }
+}
+
+/// 滚预览正文（鼠标在预览卡上时滚轮走这里，不动左侧选中）
+unsafe fn preview_scroll(st: &mut State, dir: i32) {
+    if !st.pv_shown || st.pv_kind != 0 {
+        return;
+    }
+    let cs = card_scale();
+    let step = (54.0 * cs).round() as i32;
+    if dir > 0 && !st.pv_more {
+        return;
+    }
+    st.pv_scroll = (st.pv_scroll + dir * step).max(0);
+    pv_render(st);
+    // 往下滚到最后不满一屏 → 回贴底部（没有半截空白）
+    if dir > 0 && !st.pv_more && st.pv_scroll > 0 && st.pv_content_bottom < st.pv_body_bottom {
+        st.pv_scroll = (st.pv_scroll - (st.pv_body_bottom - st.pv_content_bottom)).max(0);
+        pv_render(st);
+    }
+    preview_present(st);
+}
+
+unsafe fn preview_present(st: &mut State) {
+    if !st.pv_shown || st.pv_dc == 0 {
+        return;
+    }
+    let h = PV_HWND.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    let src = POINT::default();
+    let size = SIZE { cx: st.pv_w, cy: st.pv_h };
+    let blend = BLENDFUNCTION { BlendOp: 0u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1u8 };
+    let _ = UpdateLayeredWindow(
+        HWND(h as *mut c_void),
+        HDC(ptr::null_mut()),
+        None,
+        Some(&size),
+        HDC(st.pv_dc as *mut c_void),
+        Some(&src),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+}
+
+/// 离屏出图：把预览卡合成到灰底存 BMP（核对版面 / Markdown 渲染）
+unsafe fn preview_dump(name: &str, dir: &str, st: &State) -> bool {
+    if st.pv_bits == 0 || st.pv_w <= 0 {
+        return false;
+    }
+    let bg = (205u8, 205u8, 208u8);
+    let mut px = std::slice::from_raw_parts(
+        st.pv_bits as *const u8,
+        (st.pv_w * st.pv_h * 4) as usize,
+    ).to_vec();
+    for p in px.chunks_mut(4) {
+        let a = p[3] as f32 / 255.0;
+        let ia = 1.0 - a;
+        p[0] = (p[0] as f32 * a + bg.2 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[1] = (p[1] as f32 * a + bg.1 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[2] = (p[2] as f32 * a + bg.0 as f32 * ia).clamp(0.0, 255.0) as u8;
+        p[3] = 255;
+    }
+    let ok = save_bmp(&format!("{dir}\\{name}.bmp"), &px, st.pv_w, st.pv_h);
+    println!("[preview] {name} {}", if ok { "OK" } else { "FAIL" });
+    ok
+}
+
+unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        let mut ps = PAINTSTRUCT::default();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            let st = state_of(hwnd);
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let cur = if st.pv_shown && st.pv_w > 0 && in_rect(pv_close_rect(st), pt.x, pt.y) {
+                LoadCursorW(None, IDC_HAND).unwrap_or(HCURSOR(ptr::null_mut()))
+            } else {
+                LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR(ptr::null_mut()))
+            };
+            let _ = SetCursor(cur);
+            LRESULT(1)
+        }
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE => {
+            let st = state_of(hwnd);
+            let x = (l.0 & 0xFFFF) as i16 as i32;
+            let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+            let hov = st.pv_shown && st.pv_w > 0 && in_rect(pv_close_rect(st), x, y);
+            if hov != st.pv_close_hover {
+                st.pv_close_hover = hov;
+                pv_render(st);
+                preview_present(st);
+            }
+            use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            let st = state_of(hwnd);
+            if st.pv_close_hover {
+                st.pv_close_hover = false;
+                pv_render(st);
+                preview_present(st);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let st = state_of(hwnd);
+            let x = (l.0 & 0xFFFF) as i16 as i32;
+            let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+            if st.pv_shown && st.pv_w > 0 && in_rect(pv_close_rect(st), x, y) {
+                preview_close(st);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let st = state_of(hwnd);
+            let d = ((w.0 >> 16) & 0xFFFF) as i16 as i32;
+            preview_scroll(st, if d > 0 { -1 } else { 1 });
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
 // ───────────────────── 入口 ─────────────────────
 
 fn main() {
@@ -30975,6 +36084,104 @@ fn main() {
                 eprintln!("读取失败: {e}");
                 std::process::exit(2);
             }
+        }
+        return;
+    }
+    if args.len() >= 3 && args[1] == "--favicon-fetch" {
+        let url = args[2].clone();
+        let host = match url_host(&url) {
+            Some(h) => h,
+            None => {
+                eprintln!("URL 里取不出主机名：{url}");
+                std::process::exit(2);
+            }
+        };
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let mut got: Option<(usize, Vec<u8>)> = None;
+        for u in favicon_candidates(&host, Some(&url)) {
+            match http_get_raw_cb_t(&u, None, 3000, 4000) {
+                Ok((200, body)) if body.len() > 32 => {
+                    let is_svg = body.starts_with(b"<svg") || body.windows(4).any(|w| w == b"<svg");
+                    let dec = if is_svg {
+                        unsafe { decode_svg_bytes(&body) }
+                    } else {
+                        unsafe { decode_favicon_bytes(&body) }
+                    };
+                    if let Some(v) = dec {
+                        println!("OK {} bytes={} px={}", u, body.len(), v.0);
+                        got = Some(v);
+                        break;
+                    } else {
+                        println!("解码失败 {} bytes={}", u, body.len());
+                    }
+                }
+                Ok((st, body)) => println!("HTTP {st} {} bytes={}", u, body.len()),
+                Err(e) => println!("ERR {} {e}", u),
+            }
+        }
+        if let Some((px, d)) = got {
+            fav_cache_save(&host, px, &d);
+            println!("cached host={host} file={}", format!("{}/{}.bin", favicon_dir(), fav_key(&host)));
+            if let Some(out) = args.get(3) {
+                // 白底合成一张 BMP 方便肉眼核对
+                let mut img = Vec::with_capacity(px * px * 4);
+                for c in d.chunks_exact(4) {
+                    let a = c[3] as u32;
+                    let mix = |v: u8| ((v as u32 * a + 255 * (255 - a)) / 255) as u8;
+                    img.extend_from_slice(&[mix(c[0]), mix(c[1]), mix(c[2]), 255]);
+                }
+                let ok = unsafe { save_bmp(out, &img, px as i32, px as i32) };
+                println!("bmp {} {}", out, if ok { "OK" } else { "FAIL" });
+            }
+        } else {
+            eprintln!("没抓到可用图标");
+        }
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--idx-build" {
+        unsafe {
+            let t0 = std::time::Instant::now();
+            let (idx, stats) = idx_build_all();
+            match idx_save(&idx) {
+                Ok(()) => println!(
+                    "索引完成：文件 {} · 目录 {} · 用时 {:.1}s · 体积 {}MB{}",
+                    stats.files,
+                    stats.dirs,
+                    t0.elapsed().as_secs_f32(),
+                    std::fs::metadata(idx_path()).map(|m| m.len() / 1048576).unwrap_or(0),
+                    if stats.truncated { "（已截断）" } else { "" }
+                ),
+                Err(e) => eprintln!("保存失败：{e}"),
+            }
+        }
+        return;
+    }
+    if args.len() >= 3 && args[1] == "--idx-search" {
+        let q = args[2].clone();
+        match idx_load() {
+            Some(idx) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                let t0 = std::time::Instant::now();
+                let hits = idx_search(&idx, &q, 20, now);
+                println!(
+                    "命中 {} 个（{:.1}ms · 索引 {} 条）",
+                    hits.len(),
+                    t0.elapsed().as_secs_f32() * 1000.0,
+                    idx.len()
+                );
+                for h in hits {
+                    println!("{:4}  {}  [{}KB]", h.score, h.path, h.size_kb);
+                }
+            }
+            None => eprintln!("没有索引（先跑 --idx-build）"),
         }
         return;
     }
@@ -31288,7 +36495,64 @@ fn main() {
                 return;
             };
             for hw in windows_of_class("Chrome_WidgetWin_1", true) {
+                let o = omnibox_text(hw);
+                println!("   [omni-main] hw={:x} {:?}", hw.0 as usize, o);
+
+            }
+
+            let edit_cond = ui.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &windows_core::VARIANT::from(50004i32), // UIA_EditControlTypeId
+            );
+            for hw in windows_of_class("Chrome_WidgetWin_1", true) {
                 let Ok(root) = ui.ElementFromHandle(hw) else { continue };
+                let _ = &edit_cond;
+                println!("   [edits] try hw={:x}", hw.0 as usize);
+                if let Ok(ec) = &edit_cond {
+                    match root.FindAll(TreeScope_Descendants, ec) {
+                        Ok(earr) => {
+                        let en = earr.Length().unwrap_or(0);
+                        println!("   [edits] {en} 个");
+                        for ei in 0..en.min(4) {
+                            let Ok(e) = earr.GetElement(ei) else { continue };
+                            let cls = e.CurrentClassName().map(|b| b.to_string()).unwrap_or_default();
+                            let nm = e.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+                            let val = e
+                                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                                .and_then(|p| p.CurrentValue())
+                                .map(|b| b.to_string())
+                                .unwrap_or_default();
+                            println!("     edit[{ei}] cls={cls} name={nm} val={val}");
+                        }
+                        }
+                        Err(e) => println!("   [edits] FindAll err {e:?}"),
+                    }
+                }
+                // Document 元素的 Value 在 MSAA/Chromium 里通常就是 URL
+                if let Ok(dc) = ui.CreatePropertyCondition(
+                    UIA_ControlTypePropertyId,
+                    &windows_core::VARIANT::from(50030i32), // UIA_DocumentControlTypeId
+                ) {
+                    if let Ok(darr) = root.FindAll(TreeScope_Descendants, &dc) {
+                        let dn = darr.Length().unwrap_or(0);
+                        println!("   [docs] {dn} 个");
+                        for di in 0..dn.min(3) {
+                            let Ok(e) = darr.GetElement(di) else { continue };
+                            let nm = e.CurrentName().map(|b| b.to_string()).unwrap_or_default();
+                            let val = e
+                                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                                .and_then(|p| p.CurrentValue())
+                                .map(|b| b.to_string())
+                                .unwrap_or_default();
+                            let lval = e
+                                .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(UIA_LegacyIAccessiblePatternId)
+                                .and_then(|p| p.CurrentValue())
+                                .map(|b| b.to_string())
+                                .unwrap_or_default();
+                            println!("     doc[{di}] name={nm} val={val} lia={lval}");
+                        }
+                    }
+                }
                 let Ok(arr) = root.FindAll(TreeScope_Descendants, &cond) else { continue };
                 let n = arr.Length().unwrap_or(0);
                 println!("窗口 hwnd={:#x} TabItem {n} 个", hw.0 as usize);
@@ -31406,6 +36670,162 @@ fn main() {
     }
 
     // 诊断：把剪贴板历史卡片离屏渲染成 BMP（配 bmp2png.py 核对排版）
+    if args.len() >= 3 && args[1] == "--preview-dump" {
+        let file = args[2].clone();
+        let dir = args.get(3).cloned().unwrap_or_else(|| ".".into());
+        if let Ok(v) = std::env::var("PIPIE_CARD_SCALE") {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                unsafe { set_card_scale(f) };
+            }
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let mut st = State::new();
+            st.ini_path = format!("{}/settings.ini", dir);
+            load_ini(&mut st);
+            preview_load(&mut st, &file);
+            for (name, dark) in [("preview_dark", true), ("preview_light", false)] {
+                st.glass_liquid = dark;
+                pv_render(&mut st);
+                preview_dump(name, &dir, &st);
+            }
+            println!("[preview] kind={} md={} lines={} img={:?}", st.pv_kind, st.pv_md,
+                     st.pv_lines.len(), st.pv_img.as_ref().map(|v| (v.0, v.1)));
+        }
+        return;
+    }
+    // 诊断：抽 Office 正文（docx 走自带解析，doc 走 IFilter）
+    if args.len() >= 3 && args[1] == "--filter-text" {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let ext = pv_ext_of(&args[2]);
+            let got: Option<String> = if matches!(ext.as_str(), "docx" | "docm" | "dotx" | "dotm") {
+                docx_lines(&args[2]).map(|ls| {
+                    ls.iter().take(30).map(|l| format!("[{}] {}", l.kind, l.text)).collect::<Vec<_>>().join("
+")
+                })
+            } else if ext == "doc" {
+                std::fs::read(&args[2])
+                    .ok()
+                    .and_then(|d| word_doc_text(&d, 65536))
+                    .or_else(|| ifilter_text(&args[2], 65536))
+            } else {
+                ifilter_text(&args[2], 65536)
+            };
+            match got {
+                Some(t) => {
+                    println!("[filter] ok chars={}", t.len());
+                    println!("{}", t.chars().take(1500).collect::<String>());
+                }
+                None => println!("[filter] none"),
+            }
+        }
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--search-dump" {
+        let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
+        if let Ok(v) = std::env::var("PIPIE_CARD_SCALE") {
+            if let Ok(f) = v.trim().parse::<f32>() {
+                unsafe { set_card_scale(f) };
+            }
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let mut st = State::new();
+            st.ini_path = format!("{}/settings.ini", dir);
+            load_ini(&mut st);
+            init_fonts(&mut st);
+            st.sr_q = "周报".to_string();
+            // 有真索引就用真的（看排序），没有就给一组演示数据（看排版）
+            if let Some(idx) = idx_load() {
+                st.sr_hits = idx_search(&idx, "周报", SR_LIMIT, unix_now() as u32);
+            }
+            if st.sr_hits.is_empty() {
+                let mk = |n: &str, p: &str, kb: u32, s: i32| FileHit {
+                    score: s,
+                    path: p.to_string(),
+                    name: n.to_string(),
+                    mtime: unix_now() as u32 - 3600 * 30,
+                    size_kb: kb,
+                    is_dir: false,
+                };
+                st.sr_hits = vec![
+                    mk("产品演示&技术支持 工作周报1.13.xlsx", r"E:\xwechat_files\msg\file\2023-01", 12, 70),
+                    mk("人员管理周报-2024年新版-济南市中心医院.xlsx", r"C:\Users\ASUS\Desktop", 20, 35),
+                    mk("1_运管平台项目周报 9.13-9.19.doc", r"E:\xwechat_files\msg\file\2024-09", 35, 35),
+                    mk("周报模板.md", r"D:\工作\模板", 2, 80),
+                    mk("2026-Q3 周报汇总.pptx", r"D:\工作\汇报", 2400, 20),
+                    mk("周报-第38周.docx", r"C:\Users\ASUS\Documents", 128, 40),
+                ];
+            }
+            if let Some(idx) = idx_load() {
+                st.sr_hits = idx_search(&idx, "周报", SR_LIMIT, unix_now() as u32);
+            }
+            st.sr_note = "12ms".to_string();
+            st.sr_sort = 0;
+            sr_rows_fill(&mut st);
+            for (name, dark) in [("search_dark", true), ("search_light", false)] {
+                st.glass_liquid = dark;
+                card_render(&mut st, Card::Search);
+                dump_card_bmp(name, &dir, &st);
+            }
+            if std::env::var("PIPIE_SR_TYPEOPEN").is_ok() {
+                st.sr_type = 1;
+                sr_rows_fill(&mut st);
+                st.sr_type_open = true;
+                st.sr_type_hover = Some(1);
+                st.glass_liquid = false;
+                card_render(&mut st, Card::Search);
+                dump_card_bmp("search_type_light", &dir, &st);
+                st.glass_liquid = true;
+                card_render(&mut st, Card::Search);
+                dump_card_bmp("search_type_dark", &dir, &st);
+                st.sr_type_open = false;
+                st.sr_type = 0;
+                st.sr_type_hover = None;
+                sr_rows_fill(&mut st);
+            }
+            // 目录聚合：折叠态 + 展开第一个目录
+            st.sr_sort = 2;
+            st.sr_dir_open = None;
+            sr_rows_fill(&mut st);
+            st.sr_sel = 0;
+            st.glass_liquid = true;
+            card_render(&mut st, Card::Search);
+            dump_card_bmp("search_dir_dark", &dir, &st);
+            let first_dir = st
+                .sr_rows
+                .iter()
+                .find(|r| r.kind == 1)
+                .map(|r| r.path.clone());
+            if let Some(d) = first_dir {
+                st.sr_dir_open = Some(d);
+                sr_rows_fill(&mut st);
+                st.sr_sel = 1;
+                card_render(&mut st, Card::Search);
+                dump_card_bmp("search_dir_open_dark", &dir, &st);
+            }
+            // 空查询（只有输入框 + 空列表）
+            st.sr_q.clear();
+            st.sr_sort = 0;
+            st.sr_hits.clear();
+            sr_rows_fill(&mut st);
+            st.sr_blink = true;
+            st.glass_liquid = true;
+            card_render(&mut st, Card::Search);
+            dump_card_bmp("search_empty_dark", &dir, &st);
+        }
+        return;
+    }
     if args.len() >= 2 && args[1] == "--clip-dump" {
         let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
         // 离屏核对：允许模拟高 DPI 缩放（真实运行由 init_ui_scale 设，dump 分支走不到）
@@ -31898,6 +37318,65 @@ fn main() {
             open_note(&mut st);
         }
 
+        // 检索卡片：和便签/剪贴板同一套（独立分层窗口、同材质、失焦收起）
+        let scls: Vec<u16> = wide("RLSearch");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(search_proc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(scls.as_ptr()),
+            style: CS_DBLCLKS,
+            ..Default::default()
+        });
+        let shwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0),
+            PCWSTR(scls.as_ptr()),
+            PCWSTR(wide(&format!("PiPieSearch{}", suffix)).as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            card_win_w(),
+            card_win_h(),
+            HWND(ptr::null_mut()),
+            HMENU(ptr::null_mut()),
+            hinst,
+            None,
+        )
+        .unwrap_or(HWND(ptr::null_mut()));
+        SetWindowLongPtrW(shwnd, GWLP_USERDATA, p as isize);
+        SEARCH_HWND.store(shwnd.0 as isize, Ordering::SeqCst);
+        if args.iter().any(|a| a == "--search-show") {
+            open_search(&mut st);
+        }
+
+        // 预览卡片：独立浮层，不抢焦点（检索卡继续收键盘）
+        let pvcls: Vec<u16> = wide("RLPreview");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(preview_proc),
+            hInstance: hinst,
+            lpszClassName: PCWSTR(pvcls.as_ptr()),
+            style: CS_DBLCLKS,
+            ..Default::default()
+        });
+        let pvhwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(
+                WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0,
+            ),
+            PCWSTR(pvcls.as_ptr()),
+            PCWSTR(wide(&format!("PiPiePreview{}", suffix)).as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            card_px(PVW),
+            card_px(PVH),
+            HWND(ptr::null_mut()),
+            HMENU(ptr::null_mut()),
+            hinst,
+            None,
+        )
+        .unwrap_or(HWND(ptr::null_mut()));
+        SetWindowLongPtrW(pvhwnd, GWLP_USERDATA, p as isize);
+        PV_HWND.store(pvhwnd.0 as isize, Ordering::SeqCst);
+
         // --settings：启动后直接把设置页调出来（便于做快捷方式 / 自动化核对）
         if args.iter().any(|a| a == "--settings") {
             open_settings(&mut st);
@@ -31918,6 +37397,8 @@ fn main() {
         let _ = ChangeWindowMessageFilterEx(rhwnd, 0x0049, MSGFLT_ALLOW, None);
 
         add_tray_icon(hwnd);
+        // 老条目补网址（浏览器页签）——只读 UIA，不碰用户的标签页
+        repair_urls_start(&st);
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, 0x52); // Ctrl+Alt+R
         // 剪贴板变化监听挂在**宿主窗口**上：它不可见但一直活着，`WM_CLIPBOARDUPDATE`
         // 才有地方落。开关（`st.cl_on`）判在 `clip_capture` 里 —— 这样托盘勾选即时生效。

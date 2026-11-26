@@ -1,6 +1,6 @@
 [package]
 name = "pipie"
-version = "1.1.8"
+version = "1.2.0"
 edition = "2021"
 description = "A radial (pie-menu) app launcher for Windows with live window previews"
 authors = ["PiPie"]
@@ -16,12 +16,16 @@ name = "PiPie"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1"
 gif = "0.14"
 windows-core = "0.58"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Imaging",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
@@ -49,6 +53,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     "Win32_UI_Accessibility",
     "Win32_Networking_WinInet",
+    "Win32_Storage_IndexServer",
 ] }
 pinyin = "0.11"
 
